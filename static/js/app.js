@@ -157,7 +157,7 @@ $('btnSrt').onclick = async () => {
       path: state.uploaded.path,
       language: $('language').value,
       model: $('model').value,
-      isolate_vocals: $('isolateVocals').checked,
+      isolate_vocals: true, // always isolate vocals before transcribing — no longer user-toggled
     }),
   });
   startJob(await r.json());

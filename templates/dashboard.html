@@ -31,6 +31,51 @@
     .dashboard-backdrop { padding: 16px 8px; }
     .dashboard-panel { padding: 18px 14px 24px; border-radius: 12px; }
   }
+
+  /* ---- Fix for the action-button column collapsing/ballooning while
+     jobs are running (buttons disabled). Root cause: some rule in the
+     theme's own stylesheet distributes flexible/grow height across
+     .actions-col's buttons, and that math broke once the Karaoke/Lyric
+     buttons moved one level deeper (into .btn-pair) instead of being
+     direct children — most visibly once the buttons hit :disabled.
+     Fix: take explicit control of sizing so nothing can ever grow to
+     fill leftover space, regardless of nesting depth or disabled
+     state. Only layout properties are touched here — colors, fonts,
+     borders, and hover/disabled colors are untouched and still come
+     from your existing stylesheet. The descendant selector (space,
+     not >) below deliberately reaches buttons at ANY nesting depth,
+     including inside .btn-pair, so both stay governed by one rule. */
+  .actions-col {
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 8px !important;
+  }
+  .actions-col .btn,
+  .actions-col .btn-pair {
+    flex: 0 0 auto !important;
+    height: auto !important;
+    min-height: 0 !important;
+    max-height: none !important;
+  }
+  .actions-col .btn-pair {
+    display: flex !important;
+    gap: 6px !important;
+    width: 100% !important;
+  }
+  .actions-col .btn-pair .btn {
+    flex: 1 1 0 !important;
+    min-width: 0 !important;
+  }
+  .actions-middle {
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 8px !important;
+  }
+  .actions-middle .gear-decor {
+    flex: 0 0 auto !important;
+    height: auto !important;
+    max-height: none !important;
+  }
 </style>
 
 <div class="dashboard-backdrop">
@@ -117,11 +162,6 @@
               <input type="checkbox" id="useDemucs" checked> Extract Guitar
             </label>
 
-            <label class="inline-check"
-                   title="Removes vocals before transcribing, for cleaner subtitle timing on music with singing. Only affects Generate Subtitles — Karaoke/Lyric Video handle vocals separately and automatically.">
-              <input type="checkbox" id="isolateVocals" checked> Isolate Vocals (for transcription)
-            </label>
-
           </div>
         </section>
 
@@ -149,8 +189,8 @@
           <div class="actions-col">
             <button class="btn accent" id="btnSrt">Generate Subtitles</button>
             <div class="btn-pair" style="display:flex; gap:6px;">
-              <button class="btn" id="btnKaraoke" style="flex:1;" title="Karaoke video without vocals">Karaoke Video</button>
-              <button class="btn" id="btnLyricVideo" style="flex:1;" title="Lyric video with vocals included">Lyric Video</button>
+              <button class="btn" id="btnKaraoke" style="flex:1;" title="Karaoke video without vocals">Create Karaoke Video</button>
+              <button class="btn" id="btnLyricVideo" style="flex:1;" title="Lyric video with vocals included">Create Lyric Video</button>
             </div>
             <button class="btn" id="btnLyrics">Export Lyrics (PDF+MP3)</button>
             <button class="btn" id="btnTab">Export Guitar Solo Tab (PDF)</button>
