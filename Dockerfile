@@ -29,4 +29,6 @@ EXPOSE 5000
 
 # -w 1: single worker because jobs are in-process
 # -t 3600: 1-hour timeout for long Whisper/Demucs runs
-CMD ["gunicorn", "-b", "0.0.0.0:5000", "-w", "1", "-t", "3600", "--threads", "4", "app:app"]
+# Shell form (not exec/bracket form) so $PORT actually expands at container start.
+# Render injects PORT at runtime; :-5000 is a local fallback if PORT isn't set.
+CMD gunicorn -b 0.0.0.0:${PORT:-5000} -w 1 -t 3600 --threads 4 app:app

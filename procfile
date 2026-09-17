@@ -1,2 +1,1 @@
-cd C:\Users\dahab\Music_Studio-webapp
-Set-Content -Path Procfile -Value "web: gunicorn app:app" -NoNewline -Encoding ascii
+web: gunicorn app:app --bind 0.0.0.0:$PORT -w 1 -t 3600 --threads 4
