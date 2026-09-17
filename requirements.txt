@@ -1,0 +1,24 @@
+# ---------- Web framework ----------
+Flask==3.0.3
+Werkzeug==3.0.3
+Flask-Login==0.6.3
+python-dotenv==1.0.1
+gunicorn==22.0.0
+
+# ---------- Audio / ML ----------
+openai-whisper
+torch
+torchaudio
+numpy<2
+scipy
+librosa
+soundfile
+music21
+reportlab
+Pillow
+gunicorn
+# ---------- Source separation ----------
+demucs
+
+# ---------- Optional (chord detection, comment out if not needed) ----------
+# madmom

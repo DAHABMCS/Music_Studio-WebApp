@@ -1,0 +1,6 @@
+{
+  "admin": {
+    "password": "scrypt:32768:8:1$A6zWEJh8eH4mxsYa$2ada70c80013dfd24eb6ee14676825cccc8a7d91b57e21885cd773b356af0d7f5c3326e1f7e7fccc6a81c13716296b2ef4c13c1c8857d9d573e9f87e763af09e",
+    "role": "admin"
+  }
+}

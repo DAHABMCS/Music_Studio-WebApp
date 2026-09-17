@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}Login — Music Studio{% endblock %}
+{% block body_class %}login-body{% endblock %}
+
+{% block content %}
+<div class="login-page">
+  <div class="login-overlay"></div>
+  <div class="login-card">
+    <h1>Music Studio</h1>
+    <p class="muted">Sign in to continue</p>
+
+    {% if error %}
+      <div class="login-error">{{ error }}</div>
+    {% endif %}
+
+    <form method="POST">
+      <label>Username
+        <span class="field">
+          <input type="text" name="username" required autofocus
+                 autocomplete="username" placeholder="Enter your username">
+          <span class="field-icon" aria-hidden="true">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none"
+                 stroke="currentColor" stroke-width="2"
+                 stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="8" r="4"/>
+              <path d="M4 21c0-4.4 3.6-8 8-8s8 3.6 8 8"/>
+            </svg>
+          </span>
+        </span>
+      </label>
+
+      <label>Password
+        <span class="field">
+          <input type="password" name="password" required
+                 autocomplete="current-password" placeholder="Enter your password">
+          <span class="field-icon" aria-hidden="true">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none"
+                 stroke="currentColor" stroke-width="2"
+                 stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="8" cy="15" r="4"/>
+              <path d="M10.85 12.15L19 4"/>
+              <path d="M18 5l2 2"/>
+              <path d="M15 8l2 2"/>
+            </svg>
+          </span>
+        </span>
+      </label>
+
+      <button type="submit" class="btn primary">Sign In</button>
+    </form>
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,24 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Large media (move these to Git LFS or cloud storage if needed)
+*.mp4
+*.wav
+*.mp3
+*.flac
+
+# Outputs
+outputs/
+
+# OS/IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

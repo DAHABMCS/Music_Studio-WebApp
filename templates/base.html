@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>{% block title %}Subtitle-Lyric-Karaoke-Chord - MP3/MP4 to SRT{% endblock %}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body class="{% block body_class %}{% endblock %}">
+
+  {% if session.user %}
+  <header class="app-header">
+    <div class="app-title">
+      <img src="{{ url_for('static', filename='assets/logo.png') }}" alt="logo" class="app-logo">
+      <span class="app-title-text">🎸 Music Studio</span>
+    </div>
+    <div class="app-subtitle">Transcribe MP3 / MP4 audio into perfectly timed .srt subtitles</div>
+    <div class="app-user">
+      <span class="muted">{{ session.user }}</span>
+      <a href="{{ url_for('logout') }}" class="btn ghost small">Logout</a>
+    </div>
+  </header>
+  {% endif %}
+
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for cat, msg in messages %}
+      <div class="flash {{ cat }}">{{ msg }}</div>
+    {% endfor %}
+  {% endwith %}
+
+  {% block content %}{% endblock %}
+
+  {% block scripts %}{% endblock %}
+</body>
+</html>
