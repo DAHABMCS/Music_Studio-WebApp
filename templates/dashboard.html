@@ -2,163 +2,204 @@
 {% block title %}Dashboard{% endblock %}
 {% block content %}
 
-<div class="app-shell">
+<style>
+  /* Full-width backdrop behind the dashboard, so the dashboard itself
+     reads as a centered card/panel instead of stretching edge-to-edge. */
+  body { margin: 0; }
 
-  <!-- ============ LEFT COLUMN ============ -->
-  <div class="left-col">
+  .dashboard-backdrop {
+    width: 100%;
+    min-height: auto;              /* was 100vh — that's what left the big empty gap below */
+    background: #0d1117;           /* dark, distinct from the panel below */
+    padding: 16px 16px 24px;       /* was 36px top — panel now sits higher */
+    box-sizing: border-box;
+    display: flex;
+    justify-content: center;
+  }
 
-    <!-- File Selection -->
-    <section class="lframe">
-      <div class="lframe-title">File Selection</div>
-      <div class="lframe-body">
+  .dashboard-panel {
+    width: 100%;
+    max-width: 1180px;             /* reduced from full viewport width */
+    background: #161b22;           /* lighter than backdrop so it pops */
+    border-radius: 18px;
+    padding: 28px 32px 36px;
+    box-shadow: 0 25px 70px rgba(0, 0, 0, 0.5),
+                0 0 0 1px rgba(255, 255, 255, 0.05);
+  }
 
-        <div class="row">
-          <label class="row-label">Input File:</label>
-          <input type="text" id="inputFilePath" class="row-input" readonly
-                 placeholder="Choose an MP3 / MP4 / WAV file...">
-          <input type="file" id="inputFilePicker" accept=".mp3,.mp4,.wav,.m4a,.flac,.ogg" hidden>
-          <button class="btn" onclick="document.getElementById('inputFilePicker').click()">Browse</button>
+  @media (max-width: 700px) {
+    .dashboard-backdrop { padding: 16px 8px; }
+    .dashboard-panel { padding: 18px 14px 24px; border-radius: 12px; }
+  }
+</style>
+
+<div class="dashboard-backdrop">
+  <div class="dashboard-panel">
+
+    <div class="app-shell">
+
+      <!-- ============ LEFT COLUMN ============ -->
+      <div class="left-col">
+
+        <!-- File Selection -->
+        <section class="lframe">
+          <div class="lframe-title">File Selection</div>
+          <div class="lframe-body">
+
+            <div class="row">
+              <label class="row-label">Input File:</label>
+              <input type="text" id="inputFilePath" class="row-input" readonly
+                     placeholder="Choose an MP3 / MP4 / WAV file...">
+              <input type="file" id="inputFilePicker" accept=".mp3,.mp4,.wav,.m4a,.flac,.ogg" hidden>
+              <button class="btn" onclick="document.getElementById('inputFilePicker').click()">Browse</button>
+            </div>
+
+            <div class="row">
+              <label class="row-label">Output File:</label>
+              <input type="text" id="outputFilePath" class="row-input" readonly
+                     placeholder="Saved automatically as .srt">
+              <button class="btn" onclick="copySrtPath()">Copy Path</button>
+            </div>
+
+            <div class="row">
+              <label class="row-label">Background<br>(image or video, optional):</label>
+              <input type="text" id="backgroundPath" class="row-input" readonly
+                     placeholder="Optional background for karaoke video">
+              <input type="file" id="backgroundPicker" accept=".png,.jpg,.jpeg,.bmp,.mp4,.mov,.mkv,.webm,.avi" hidden>
+              <button class="btn" onclick="document.getElementById('backgroundPicker').click()">Browse</button>
+            </div>
+
+          </div>
+        </section>
+
+        <!-- Settings -->
+        <section class="lframe">
+          <div class="lframe-title">Settings</div>
+          <div class="lframe-body settings-row">
+
+            <label class="inline-label">Language:
+              <select id="language">
+                <option value="auto">auto</option>
+                <option value="en">en</option>
+                <option value="ar">ar</option>
+                <option value="es">es</option>
+                <option value="fr">fr</option>
+                <option value="de">de</option>
+                <option value="it">it</option>
+                <option value="pt">pt</option>
+                <option value="ja">ja</option>
+                <option value="zh">zh</option>
+              </select>
+            </label>
+
+            <label class="inline-label">Model:
+              <select id="model">
+                <option>tiny</option>
+                <option>base</option>
+                <option>small</option>
+                <option>medium</option>
+                <option>large</option>
+                <option>large-v2</option>
+                <option selected>large-v3</option>
+              </select>
+            </label>
+
+            <label class="inline-label">Chords:
+              <select id="chordMethod">
+                <option value="basic">basic</option>
+                <option value="advanced" selected>advanced</option>
+                <option value="madmom">madmom</option>
+                <option value="hybrid">hybrid</option>
+              </select>
+            </label>
+
+            <label class="inline-check">
+              <input type="checkbox" id="useDemucs" checked> Extract Guitar
+            </label>
+
+            <label class="inline-check"
+                   title="Removes vocals before transcribing, for cleaner subtitle timing on music with singing. Only affects Generate Subtitles — Karaoke/Lyric Video handle vocals separately and automatically.">
+              <input type="checkbox" id="isolateVocals" checked> Isolate Vocals (for transcription)
+            </label>
+
+          </div>
+        </section>
+
+        <!-- Status & Progress -->
+        <section class="lframe">
+          <div class="lframe-title">Status &amp; Progress</div>
+          <div class="lframe-body">
+
+            <div class="status-line">
+              <span id="statusText" class="status-text">Ready</span>
+              <span id="elapsedTime" class="status-time">00:00</span>
+            </div>
+
+            <div class="progress">
+              <div id="progressBar"></div>
+            </div>
+
+          </div>
+        </section>
+
+        <!-- Action Buttons Grid -->
+        <section class="actions-grid">
+
+          <!-- column 1 -->
+          <div class="actions-col">
+            <button class="btn accent" id="btnSrt">Generate Subtitles</button>
+            <div class="btn-pair" style="display:flex; gap:6px;">
+              <button class="btn" id="btnKaraoke" style="flex:1;" title="Karaoke video without vocals">Karaoke Video</button>
+              <button class="btn" id="btnLyricVideo" style="flex:1;" title="Lyric video with vocals included">Lyric Video</button>
+            </div>
+            <button class="btn" id="btnLyrics">Export Lyrics (PDF+MP3)</button>
+            <button class="btn" id="btnTab">Export Guitar Solo Tab (PDF)</button>
+            <button class="btn" id="btnFull">Full Transcription (TAB+MIDI)</button>
+          </div>
+
+          <!-- column 2 : Stop / Clear + gear illustration -->
+          <div class="actions-middle">
+            <div class="mini-row">
+              <button class="btn" id="btnStop" disabled>Stop</button>
+              <button class="btn" id="btnClear">Clear</button>
+            </div>
+            <img class="gear-decor"
+                 src="{{ url_for('static', filename='assets/gear_decor.png') }}"
+                 alt="gear decoration">
+          </div>
+
+          <!-- column 3 : browse buttons -->
+          <div class="actions-col">
+            <button class="btn" onclick="browseRemote('srt')">Browse SRT Folder</button>
+            <button class="btn" onclick="browseRemote('karaoke')">Browse Karaoke Folder</button>
+            <button class="btn" onclick="browseRemote('lyrics')">Browse Lyrics Folder</button>
+            <button class="btn" onclick="browseRemote('tabs')">Browse Tabs Folder</button>
+            <button class="btn" onclick="browseRemote('transcription')">Browse Transcription</button>
+          </div>
+
+        </section>
+
+      </div>
+
+      <!-- ============ RIGHT COLUMN ============ -->
+      <div class="right-col">
+
+        <section class="lframe srt-frame">
+          <div class="lframe-title">SRT Preview</div>
+          <div class="lframe-body srt-body">
+            <pre id="srtPreview" class="preview">—</pre>
+          </div>
+        </section>
+
+        <div class="srt-actions">
+          <button class="btn" id="btnEdit">Edit</button>
         </div>
 
-        <div class="row">
-          <label class="row-label">Output File:</label>
-          <input type="text" id="outputFilePath" class="row-input" readonly
-                 placeholder="Saved automatically as .srt">
-          <button class="btn" onclick="copySrtPath()">Copy Path</button>
-        </div>
-
-        <div class="row">
-          <label class="row-label">Background<br>(image or video, optional):</label>
-          <input type="text" id="backgroundPath" class="row-input" readonly
-                 placeholder="Optional background for karaoke video">
-          <input type="file" id="backgroundPicker" accept=".png,.jpg,.jpeg,.bmp,.mp4,.mov,.mkv,.webm,.avi" hidden>
-          <button class="btn" onclick="document.getElementById('backgroundPicker').click()">Browse</button>
-        </div>
-
-      </div>
-    </section>
-
-    <!-- Settings -->
-    <section class="lframe">
-      <div class="lframe-title">Settings</div>
-      <div class="lframe-body settings-row">
-
-        <label class="inline-label">Language:
-          <select id="language">
-            <option value="auto">auto</option>
-            <option value="en">en</option>
-            <option value="ar">ar</option>
-            <option value="es">es</option>
-            <option value="fr">fr</option>
-            <option value="de">de</option>
-            <option value="it">it</option>
-            <option value="pt">pt</option>
-            <option value="ja">ja</option>
-            <option value="zh">zh</option>
-          </select>
-        </label>
-
-        <label class="inline-label">Model:
-          <select id="model">
-            <option>tiny</option>
-            <option>base</option>
-            <option>small</option>
-            <option>medium</option>
-            <option>large</option>
-            <option>large-v2</option>
-            <option selected>large-v3</option>
-          </select>
-        </label>
-
-        <label class="inline-label">Chords:
-          <select id="chordMethod">
-            <option value="basic">basic</option>
-            <option value="advanced" selected>advanced</option>
-            <option value="madmom">madmom</option>
-            <option value="hybrid">hybrid</option>
-          </select>
-        </label>
-
-        <label class="inline-check">
-          <input type="checkbox" id="useDemucs" checked> Extract Guitar
-        </label>
-
-        <label class="inline-check">
-          <input type="checkbox" id="isolateVocals" checked> Isolate Vocals
-        </label>
-
-      </div>
-    </section>
-
-    <!-- Status & Progress -->
-    <section class="lframe">
-      <div class="lframe-title">Status &amp; Progress</div>
-      <div class="lframe-body">
-
-        <div class="status-line">
-          <span id="statusText" class="status-text">Ready</span>
-          <span id="elapsedTime" class="status-time">00:00</span>
-        </div>
-
-        <div class="progress">
-          <div id="progressBar"></div>
-        </div>
-
-      </div>
-    </section>
-
-    <!-- Action Buttons Grid -->
-    <section class="actions-grid">
-
-      <!-- column 1 -->
-      <div class="actions-col">
-        <button class="btn accent" id="btnSrt">Generate Subtitles</button>
-        <button class="btn" id="btnKaraoke">Create Karaoke Video</button>
-        <button class="btn" id="btnLyrics">Export Lyrics (PDF+MP3)</button>
-        <button class="btn" id="btnTab">Export Guitar Solo Tab (PDF)</button>
-        <button class="btn" id="btnFull">Full Transcription (TAB+MIDI)</button>
       </div>
 
-      <!-- column 2 : Stop / Clear + gear illustration -->
-      <div class="actions-middle">
-        <div class="mini-row">
-          <button class="btn" id="btnStop" disabled>Stop</button>
-          <button class="btn" id="btnClear">Clear</button>
-        </div>
-        <img class="gear-decor"
-             src="{{ url_for('static', filename='assets/gear_decor.png') }}"
-             alt="gear decoration">
-      </div>
-
-      <!-- column 3 : browse buttons -->
-      <div class="actions-col">
-        <button class="btn" onclick="browseRemote('srt')">Browse SRT Folder</button>
-        <button class="btn" onclick="browseRemote('karaoke')">Browse Karaoke Folder</button>
-        <button class="btn" onclick="browseRemote('lyrics')">Browse Lyrics Folder</button>
-        <button class="btn" onclick="browseRemote('tabs')">Browse Tabs Folder</button>
-        <button class="btn" onclick="browseRemote('transcription')">Browse Transcription</button>
-      </div>
-
-    </section>
-
-  </div>
-
-  <!-- ============ RIGHT COLUMN ============ -->
-  <div class="right-col">
-
-    <section class="lframe srt-frame">
-      <div class="lframe-title">SRT Preview</div>
-      <div class="lframe-body srt-body">
-        <pre id="srtPreview" class="preview">—</pre>
-      </div>
-    </section>
-
-    <div class="srt-actions">
-      <button class="btn" id="btnEdit">Edit</button>
     </div>
 
   </div>
-
 </div>
 
 {% endblock %}

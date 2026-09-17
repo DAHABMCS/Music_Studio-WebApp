@@ -82,7 +82,7 @@ class SubtitleEngine:
                 try:
                     _p(15, "Isolating vocals with Demucs...")
                     vocals_path, demucs_vocals_dir = self.separate_vocals_stem(
-                        audio_path, status_callback=_p
+                        audio_path, status_callback=lambda msg: _p(18, msg)
                     )
                     transcribe_audio_path = vocals_path
                 except Exception as e:

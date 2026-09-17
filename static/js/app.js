@@ -79,7 +79,7 @@ function setProgress(p)   { $('progressBar').style.width = (p || 0) + '%'; }
 /* ---------- Button locking ---------- */
 function lockButtons(lock) {
   state.isProcessing = lock;
-  ['btnSrt', 'btnKaraoke', 'btnLyrics', 'btnTab', 'btnFull'].forEach(id => {
+  ['btnSrt', 'btnKaraoke', 'btnLyricVideo', 'btnLyrics', 'btnTab', 'btnFull'].forEach(id => {
     const el = $(id);
     if (el) el.disabled = lock;
   });
@@ -138,6 +138,7 @@ function handleResult(result) {
     state.srt = result.srt;
   }
   if (result.video) alert('Karaoke video ready: ' + result.video);
+  if (result.lyric_video) alert('Lyric video ready: ' + result.lyric_video);
   if (result.pdf && result.mp3) alert(`Ready:\n${result.pdf}\n${result.mp3}`);
   else if (result.pdf) alert('PDF ready: ' + result.pdf);
   if (result.folder) {
@@ -165,6 +166,20 @@ $('btnSrt').onclick = async () => {
 $('btnKaraoke').onclick = async () => {
   if (!state.uploaded || !state.srt) return alert('Generate the SRT first');
   const r = await fetch('/api/generate_karaoke', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      path: state.uploaded.path,
+      srt: state.srt,
+      background: state.background ? state.background.path : null,
+    }),
+  });
+  startJob(await r.json());
+};
+
+$('btnLyricVideo').onclick = async () => {
+  if (!state.uploaded || !state.srt) return alert('Generate the SRT first');
+  const r = await fetch('/api/generate_lyric_video', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({

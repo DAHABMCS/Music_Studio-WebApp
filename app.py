@@ -6,6 +6,8 @@ import hmac
 import hashlib
 import shutil
 import threading
+import subprocess
+import tempfile
 from pathlib import Path
 from functools import wraps
 
@@ -467,6 +469,164 @@ def _run_pipeline(job_id, opts):
             JOBS[job_id]["progress"] = 0
 
 
+@app.route("/api/generate_karaoke", methods=["POST"])
+@login_required
+def generate_karaoke():
+    return _generate_video(request, keep_vocals=False)
+
+
+@app.route("/api/generate_lyric_video", methods=["POST"])
+@login_required
+def generate_lyric_video():
+    return _generate_video(request, keep_vocals=True)
+
+
+def _generate_video(req, keep_vocals: bool):
+    """
+    Shared handler for karaoke (no vocals) and lyric video (vocals kept).
+    Confirmed against the real subtitle_engine.py: SubtitleEngine has
+    build_karaoke_video(background_path, audio_path, srt_path,
+    video_output_path, background_is_video, progress_cb) — it does NOT
+    remove vocals itself, it just muxes whatever audio you hand it. So
+    for karaoke we run separate_vocals_stem() first (Demucs) and hand it
+    the resulting no_vocals.wav; for lyric video we hand it the original
+    audio untouched.
+    """
+    data = req.get_json(force=True) or {}
+    updir, outdir = user_dirs(session["user"])
+
+    input_path = updir / data.get("path", "")
+    if not input_path.exists():
+        return jsonify(error="Input file not found"), 404
+
+    srt_name = data.get("srt", "")
+    srt_path = outdir / srt_name
+    if not srt_path.exists():
+        return jsonify(error="SRT not found — generate subtitles first"), 404
+
+    background = data.get("background")
+    background_path = None
+    if background:
+        background_path = updir / background
+        if not background_path.exists():
+            return jsonify(error="Background file not found"), 404
+
+    job_id = uuid.uuid4().hex[:12]
+    with LOCK:
+        JOBS[job_id] = {
+            "progress": 0,
+            "status":   "Ready",
+            "srt":      "",
+            "output":   "",
+            "input":    str(input_path),
+            "user":     session["user"],
+        }
+
+    threading.Thread(
+        target=_run_video_job,
+        args=(job_id, str(input_path), str(srt_path),
+              str(background_path) if background_path else None,
+              keep_vocals),
+        daemon=True,
+    ).start()
+
+    return jsonify(job_id=job_id)
+
+
+def _extract_audio_if_needed(input_path):
+    """Extracts a .wav from a video file via ffmpeg; passes audio files through untouched."""
+    if input_path.lower().endswith(SubtitleEngine.VIDEO_EXTENSIONS):
+        if shutil.which('ffmpeg') is None:
+            raise RuntimeError("ffmpeg is required to extract audio from video.")
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
+        tmp.close()
+        cmd = ['ffmpeg', '-y', '-i', input_path, '-vn',
+               '-acodec', 'pcm_s16le', '-ar', '44100', '-ac', '2', tmp.name]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+            raise RuntimeError(f"ffmpeg failed to extract audio: {proc.stderr[-800:]}")
+        return tmp.name, True
+    return input_path, False
+
+
+def _run_video_job(job_id, input_path, srt_path, background_path, keep_vocals):
+    temp_audio_path = None
+    demucs_out_dir = None
+    try:
+        engine = SubtitleEngine()
+
+        with LOCK:
+            user = JOBS[job_id].get("user", "shared")
+
+        def _p(value, status):
+            with LOCK:
+                JOBS[job_id]["progress"] = float(value)
+                JOBS[job_id]["status"]   = status
+
+        _p(5, "Preparing audio...")
+        audio_path, is_temp = _extract_audio_if_needed(input_path)
+        if is_temp:
+            temp_audio_path = audio_path
+
+        if keep_vocals:
+            audio_for_video = audio_path
+        else:
+            _p(20, "Removing vocals (Demucs)...")
+            # separate_vocals_stem's status_callback takes a single message
+            # string, not (progress, message) — wrap accordingly.
+            vocals_path, demucs_out_dir = engine.separate_vocals_stem(
+                audio_path, status_callback=lambda msg: _p(35, msg)
+            )
+            audio_for_video = str(Path(vocals_path).parent / "no_vocals.wav")
+            if not Path(audio_for_video).exists():
+                raise RuntimeError("Demucs did not produce an instrumental (no_vocals.wav) track.")
+
+        stem = Path(input_path).stem
+        song_folder = OUTPUT_DIR / user / stem
+        sub_folder_name = "Lyric_Video" if keep_vocals else "Karaoke"
+        video_folder = song_folder / sub_folder_name
+        video_folder.mkdir(parents=True, exist_ok=True)
+
+        suffix = "_lyric_video.mp4" if keep_vocals else "_karaoke.mp4"
+        out_path = video_folder / f"{stem}{suffix}"
+
+        _p(60, "Rendering video (ffmpeg)...")
+        engine.build_karaoke_video(
+            background_path=background_path,
+            audio_path=audio_for_video,
+            srt_path=srt_path,
+            video_output_path=str(out_path),
+            progress_cb=_p,
+        )
+
+        with LOCK:
+            JOBS[job_id]["progress"]    = 100
+            JOBS[job_id]["status"]      = "Complete!"
+            JOBS[job_id]["output"]      = str(out_path)
+            JOBS[job_id]["video"]       = str(out_path)
+            JOBS[job_id]["keep_vocals"] = keep_vocals
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        with LOCK:
+            JOBS[job_id]["status"]   = f"Error: {e}"
+            JOBS[job_id]["progress"] = 0
+    finally:
+        if temp_audio_path and os.path.exists(temp_audio_path):
+            try:
+                os.unlink(temp_audio_path)
+            except OSError:
+                pass
+        if demucs_out_dir:
+            shutil.rmtree(demucs_out_dir, ignore_errors=True)
+            JOBS[job_id]["progress"] = 0
+
+
 # ============================================================
 # JOB STATUS / DOWNLOADS
 # ============================================================
@@ -488,6 +648,18 @@ def job_status(job_id):
         job = JOBS.get(job_id)
     if not job:
         return jsonify(error="Unknown job"), 404
+
+    # SRTs are written nested (e.g. "<stem>/SRT/<stem>.srt"), not flat in
+    # outputs/<user>/, so app.js needs that relative path — not just the
+    # bare filename — or the later karaoke/lyric-video lookups will 404.
+    srt_rel = None
+    if job.get("output") and str(job["output"]).endswith(".srt"):
+        try:
+            _, outdir = user_dirs(job.get("user", "shared"))
+            srt_rel = str(Path(job["output"]).resolve().relative_to(outdir.resolve()))
+        except Exception:
+            srt_rel = Path(job["output"]).name  # fallback, better than nothing
+
     # translate to shape app.js expects
     return jsonify(
         id=job_id,
@@ -495,8 +667,12 @@ def job_status(job_id):
                 ("error" if "Error" in job["status"] else "running")),
         progress=job["progress"],
         message=job["status"],
-        result={"srt": Path(job["output"]).name if job["output"] else None,
-                "preview": job.get("srt", "")[:8000]},
+        result={
+            "srt": Path(job["output"]).name if job["output"] and job.get("output", "").endswith(".srt") else None,
+            "preview": job.get("srt", "")[:8000],
+            "video": job["output"] if "video" in job and not job.get("keep_vocals") else None,
+            "lyric_video": job["output"] if "video" in job and job.get("keep_vocals") else None,
+        },
         error=None if "Error" not in job["status"] else job["status"],
     )
 
