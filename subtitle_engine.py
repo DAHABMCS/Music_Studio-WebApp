@@ -773,7 +773,7 @@ class SubtitleEngine:
                 i += 1
 
             ensure_space(LINE_GAP)
-            row_is_ar = any(w and is_ar(w) for _, w, _, _ in word_info if w)
+            row_is_ar = any(w and is_arabic(w) for _, w, _, _ in word_info if w)
             cursor_x = (pw - RIGHT - total_w) if row_is_ar else LEFT
 
             for chord, word, wwidth, is_gap in word_info:

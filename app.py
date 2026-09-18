@@ -5,6 +5,7 @@ import json
 import hmac
 import hashlib
 import shutil
+import socket
 import threading
 import subprocess
 import tempfile
@@ -48,6 +49,47 @@ if not USERS_FILE.exists():
 
 JOBS = {}
 LOCK = threading.Lock()
+
+
+# ============================================================
+# LOCAL-MACHINE / NATIVE-FOLDER HELPERS (for /api/browse/<kind>)
+# ============================================================
+def _local_ip_addresses():
+    """Every IP address this machine can be reached at, so we can tell
+    whether an incoming request originated on this same machine (as
+    opposed to another device on the LAN hitting the server's IP)."""
+    ips = {"127.0.0.1", "::1"}
+    try:
+        hostname = socket.gethostname()
+        ips.add(socket.gethostbyname(hostname))
+        for info in socket.getaddrinfo(hostname, None):
+            ips.add(info[4][0])
+    except Exception:
+        pass
+    return ips
+
+
+_LOCAL_IPS = _local_ip_addresses()
+
+
+def _is_local_request():
+    return request.remote_addr in _LOCAL_IPS
+
+
+def _open_native_folder(path):
+    """Open `path` in the OS's native file explorer on THIS machine.
+    Only ever call this after confirming the request is local — see
+    _is_local_request(). Returns True on success."""
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(str(path))  # noqa: F821 (Windows-only builtin)
+        elif sys.platform == "darwin":
+            subprocess.run(["open", str(path)], check=True)
+        else:
+            subprocess.run(["xdg-open", str(path)], check=True)
+        return True
+    except Exception:
+        return False
 
 
 # ============================================================
@@ -436,11 +478,10 @@ def _run_pipeline(job_id, opts):
             user = JOBS[job_id].get("user", "shared")
 
         stem = Path(input_path).stem
-        song_folder = OUTPUT_DIR / user / stem
-        srt_folder = song_folder / "SRT"
-        srt_folder.mkdir(parents=True, exist_ok=True)
+        song_folder = OUTPUT_DIR / user / "SRT" / stem
+        song_folder.mkdir(parents=True, exist_ok=True)
 
-        out_path = srt_folder / f"{stem}.srt"
+        out_path = song_folder / f"{stem}.srt"
 
         def _p(value, status):
             with LOCK:
@@ -592,8 +633,7 @@ def _run_lyrics_job(job_id, input_path, srt_path, chord_method):
             raise RuntimeError("No cues found in SRT — nothing to export.")
 
         stem = Path(input_path).stem
-        song_folder = OUTPUT_DIR / user / stem
-        lyrics_folder = song_folder / "Lyrics"
+        lyrics_folder = OUTPUT_DIR / user / "Lyrics" / stem
         lyrics_folder.mkdir(parents=True, exist_ok=True)
 
         pdf_path = lyrics_folder / f"{stem}_lyrics.pdf"
@@ -679,8 +719,7 @@ def _run_tab_job(job_id, input_path, start_sec, end_sec, use_demucs):
             resolved_end = engine.get_audio_duration(input_path)
 
         stem = Path(input_path).stem
-        song_folder = OUTPUT_DIR / user / stem
-        tabs_folder = song_folder / "Tabs"
+        tabs_folder = OUTPUT_DIR / user / "Tabs" / stem
         tabs_folder.mkdir(parents=True, exist_ok=True)
 
         pdf_path = tabs_folder / f"{stem}_solo_tab.pdf"
@@ -758,9 +797,14 @@ def _run_video_job(job_id, input_path, srt_path, background_path, keep_vocals):
                 raise RuntimeError("Demucs did not produce an instrumental (no_vocals.wav) track.")
 
         stem = Path(input_path).stem
-        song_folder = OUTPUT_DIR / user / stem
-        sub_folder_name = "Lyric_Video" if keep_vocals else "Karaoke"
-        video_folder = song_folder / sub_folder_name
+        # Both karaoke and lyric videos live under one shared top-level
+        # "Karaoke" folder (per-song subfolders inside it), since the
+        # dashboard only has a single "Browse Karaoke Folder" button —
+        # there's no separate browse button for lyric videos, so keeping
+        # them in a different top-level folder would make them
+        # unreachable from the UI. The filename suffix still tells them
+        # apart.
+        video_folder = OUTPUT_DIR / user / "Karaoke" / stem
         video_folder.mkdir(parents=True, exist_ok=True)
 
         suffix = "_lyric_video.mp4" if keep_vocals else "_karaoke.mp4"
@@ -884,8 +928,9 @@ def save_srt():
     """Save edited SRT content back to the user's outputs folder.
 
     Accepts either a bare filename ("Song.srt") or a path relative to
-    the user's outputs folder ("Song/SRT/Song.srt"), since generated
-    SRTs live in per-song subfolders, not flat in outputs/<user>/.
+    the user's outputs folder ("SRT/Song/Song.srt"), since generated
+    SRTs live under outputs/<user>/SRT/<song>/, not flat in
+    outputs/<user>/.
     """
     data = request.get_json() or {}
     name = data.get("srt")
@@ -924,27 +969,26 @@ def cancel_job(job_id):
 @login_required
 def browse_folder(kind):
     """
-    Return the contents of the user's output subfolder as JSON, so the
-    frontend can render it in the browser (inline modal / new page)
-    instead of opening a native OS file explorer on the SERVER.
+    Show the user's output folder for `kind`.
 
-    IMPORTANT: this route used to call os.startfile()/xdg-open/open,
-    which opens a folder window on the machine running the Flask/
-    Waitress process — not on the client's browser. On a remote
-    production server that just opens (and hangs) a folder on the
-    server's own desktop while the client's request sits there
-    waiting, which is what caused the browser tab to appear to
-    "close". This version never touches the server's GUI.
+    Each kind now has ONE top-level folder — outputs/<user>/<Kind>/ —
+    with a subfolder per song inside it (see _run_pipeline,
+    _run_video_job, _run_lyrics_job, _run_tab_job). That means there's
+    a single, well-defined folder to point at: "the folder to view and
+    its subfolders" is exactly outputs/<user>/<Kind>/.
 
-    NOTE: every "kind" used to map to None, which made `target` always
-    resolve to the bare outputs root (outdir) no matter what button was
-    clicked — so "Browse SRT Folder" and friends were really all
-    browsing the same (usually empty-looking) top level. On top of
-    that, SRT/Karaoke/Lyrics/Tabs files don't live in one flat folder —
-    they're nested per song as outputs/<user>/<song>/<FolderName>/...
-    (see _run_pipeline, _run_video_job, _run_lyrics_job, _run_tab_job).
-    So this now searches every song folder for the matching subfolder
-    name instead of assuming one fixed path.
+    If the request is coming from the same machine that's running this
+    server, we open that folder in the real, native OS file explorer
+    (Explorer/Finder/whatever). The person clicking the button is
+    sitting at this machine, so there's no ambiguity about whose
+    window should pop up.
+
+    If the request comes from a different device on the network, there
+    is no way for a web page to open a native file-explorer window on
+    the REQUESTING device — no browser grants any website that
+    capability, for security reasons, regardless of framework. So for
+    remote requests we fall back to an in-page listing with per-file
+    download links, letting that device pull the files down to itself.
     """
     _, outdir = user_dirs(session["user"])
 
@@ -959,20 +1003,13 @@ def browse_folder(kind):
     if folder_name is None:
         return jsonify(error=f"Unknown browse kind: {kind}"), 400
 
-    if not outdir.exists():
-        return jsonify(ok=True, path=folder_name, files=[])
+    target = outdir / folder_name
+    target.mkdir(parents=True, exist_ok=True)
 
-    found = []
-    for song_dir in outdir.iterdir():
-        if not song_dir.is_dir():
-            continue
-        target = song_dir / folder_name
-        if not target.exists():
-            continue
-        for p in target.rglob("*"):
-            if p.is_file():
-                found.append(p)
+    if _is_local_request() and _open_native_folder(target):
+        return jsonify(ok=True, opened=True, path=folder_name)
 
+    found = [p for p in target.rglob("*") if p.is_file()]
     found.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     files = [{
         "name":    p.name,
@@ -980,7 +1017,7 @@ def browse_folder(kind):
         "size_mb": round(p.stat().st_size / (1024 * 1024), 2),
     } for p in found]
 
-    return jsonify(ok=True, path=folder_name, files=files)
+    return jsonify(ok=True, opened=False, path=folder_name, files=files)
 
 
 # ============================================================

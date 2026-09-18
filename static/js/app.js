@@ -311,6 +311,14 @@ async function browseRemote(kind) {
     alert('Could not load folder: ' + data.error);
     return;
   }
+  // If the server is running on this same machine, /api/browse just
+  // opened the real OS folder window directly — nothing more to show
+  // in the page. Only render the in-page listing when it couldn't
+  // (e.g. this request came from another device on the network).
+  if (data.opened) {
+    setStatus(`Opened ${data.path} folder`);
+    return;
+  }
   openBrowseModal(kind, data);
 }
 
