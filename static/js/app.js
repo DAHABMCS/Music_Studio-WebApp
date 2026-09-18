@@ -255,9 +255,39 @@ $('btnEdit').onclick = () => {
 function copySrtPath() {
   const v = $('outputFilePath').value;
   if (!v) return alert('No output path yet');
-  navigator.clipboard.writeText(v)
-    .then(() => setStatus('SRT path copied'))
-    .catch(() => setStatus('Copy failed'));
+
+  // navigator.clipboard only exists in secure contexts (https, or
+  // localhost). This dashboard is typically opened over plain http on
+  // a LAN IP (see app.py's own startup message), where
+  // navigator.clipboard is undefined — calling .writeText on it throws
+  // synchronously, before any .catch() runs, so the button silently
+  // does nothing. Fall back to a hidden-textarea + execCommand copy
+  // in that case.
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(v)
+      .then(() => setStatus('SRT path copied'))
+      .catch(() => copyViaFallback(v));
+  } else {
+    copyViaFallback(v);
+  }
+}
+
+function copyViaFallback(text) {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.left = '-9999px';
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
+  try {
+    const ok = document.execCommand('copy');
+    setStatus(ok ? 'SRT path copied' : 'Copy failed');
+  } catch (e) {
+    setStatus('Copy failed');
+  } finally {
+    document.body.removeChild(ta);
+  }
 }
 
 /* ---------- Remote folder browser (in-page, no window.open) ----------

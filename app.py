@@ -533,6 +533,178 @@ def _generate_video(req, keep_vocals: bool):
     return jsonify(job_id=job_id)
 
 
+@app.route("/api/export_lyrics", methods=["POST"])
+@login_required
+def generate_lyrics():
+    """Export Lyrics (PDF+MP3): chord-annotated lyrics PDF + an MP3 copy
+    of the track. Needs an existing SRT (for the cues/timing) — same
+    precondition as the karaoke/lyric-video routes."""
+    data = request.get_json(force=True) or {}
+    updir, outdir = user_dirs(session["user"])
+
+    input_path = updir / data.get("path", "")
+    if not input_path.exists():
+        return jsonify(error="Input file not found"), 404
+
+    srt_name = data.get("srt", "")
+    srt_path = outdir / srt_name
+    if not srt_path.exists():
+        return jsonify(error="SRT not found — generate subtitles first"), 404
+
+    chord_method = data.get("chord_method", "advanced")
+
+    job_id = uuid.uuid4().hex[:12]
+    with LOCK:
+        JOBS[job_id] = {
+            "progress": 0,
+            "status":   "Ready",
+            "srt":      "",
+            "output":   "",
+            "input":    str(input_path),
+            "user":     session["user"],
+        }
+
+    threading.Thread(
+        target=_run_lyrics_job,
+        args=(job_id, str(input_path), str(srt_path), chord_method),
+        daemon=True,
+    ).start()
+
+    return jsonify(job_id=job_id)
+
+
+def _run_lyrics_job(job_id, input_path, srt_path, chord_method):
+    try:
+        engine = SubtitleEngine()
+
+        with LOCK:
+            user = JOBS[job_id].get("user", "shared")
+
+        def _p(value, status):
+            with LOCK:
+                JOBS[job_id]["progress"] = float(value)
+                JOBS[job_id]["status"]   = status
+
+        _p(5, "Reading subtitles...")
+        srt_text = Path(srt_path).read_text(encoding="utf-8")
+        cues = SubtitleEngine._parse_srt_cues(srt_text)
+        if not cues:
+            raise RuntimeError("No cues found in SRT — nothing to export.")
+
+        stem = Path(input_path).stem
+        song_folder = OUTPUT_DIR / user / stem
+        lyrics_folder = song_folder / "Lyrics"
+        lyrics_folder.mkdir(parents=True, exist_ok=True)
+
+        pdf_path = lyrics_folder / f"{stem}_lyrics.pdf"
+        mp3_path = lyrics_folder / f"{stem}.mp3"
+
+        detected, total = engine.export_lyrics_and_mp3(
+            input_path, cues, stem,
+            str(pdf_path), str(mp3_path),
+            chord_method=chord_method,
+            status_callback=lambda msg: _p(50, msg),
+        )
+
+        with LOCK:
+            JOBS[job_id]["progress"]   = 100
+            JOBS[job_id]["status"]     = "Complete!"
+            JOBS[job_id]["output"]     = str(pdf_path)
+            JOBS[job_id]["pdf"]        = str(pdf_path)
+            JOBS[job_id]["mp3"]        = str(mp3_path)
+            JOBS[job_id]["chords_detected"] = f"{detected}/{total}"
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        with LOCK:
+            JOBS[job_id]["status"]   = f"Error: {e}"
+            JOBS[job_id]["progress"] = 0
+
+
+@app.route("/api/export_guitar_tab", methods=["POST"])
+@login_required
+def generate_tab():
+    """Export Guitar Solo Tab (PDF). Optional start_sec/end_sec select the
+    solo range; omitted end_sec means 'to the end of the track'. Honors
+    the dashboard's Extract Guitar checkbox, sent by app.js as
+    use_demucs, to decide whether Demucs isolates the guitar stem first."""
+    data = request.get_json(force=True) or {}
+    updir, outdir = user_dirs(session["user"])
+
+    input_path = updir / data.get("path", "")
+    if not input_path.exists():
+        return jsonify(error="Input file not found"), 404
+
+    start_sec = float(data.get("start_sec", 0.0))
+    end_sec = data.get("end_sec")
+    end_sec = float(end_sec) if end_sec is not None else None
+    use_demucs = bool(data.get("use_demucs", True))
+
+    job_id = uuid.uuid4().hex[:12]
+    with LOCK:
+        JOBS[job_id] = {
+            "progress": 0,
+            "status":   "Ready",
+            "srt":      "",
+            "output":   "",
+            "input":    str(input_path),
+            "user":     session["user"],
+        }
+
+    threading.Thread(
+        target=_run_tab_job,
+        args=(job_id, str(input_path), start_sec, end_sec, use_demucs),
+        daemon=True,
+    ).start()
+
+    return jsonify(job_id=job_id)
+
+
+def _run_tab_job(job_id, input_path, start_sec, end_sec, use_demucs):
+    try:
+        engine = SubtitleEngine()
+
+        with LOCK:
+            user = JOBS[job_id].get("user", "shared")
+
+        def _p(value, status):
+            with LOCK:
+                JOBS[job_id]["progress"] = float(value)
+                JOBS[job_id]["status"]   = status
+
+        resolved_end = end_sec
+        if resolved_end is None:
+            _p(2, "Checking track length...")
+            resolved_end = engine.get_audio_duration(input_path)
+
+        stem = Path(input_path).stem
+        song_folder = OUTPUT_DIR / user / stem
+        tabs_folder = song_folder / "Tabs"
+        tabs_folder.mkdir(parents=True, exist_ok=True)
+
+        pdf_path = tabs_folder / f"{stem}_solo_tab.pdf"
+
+        engine.export_guitar_tab_pipeline(
+            input_path, start_sec, resolved_end, stem, str(pdf_path),
+            use_demucs=use_demucs,
+            progress_cb=_p,
+        )
+
+        with LOCK:
+            JOBS[job_id]["progress"] = 100
+            JOBS[job_id]["status"]   = "Complete!"
+            JOBS[job_id]["output"]   = str(pdf_path)
+            JOBS[job_id]["pdf"]      = str(pdf_path)
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        with LOCK:
+            JOBS[job_id]["status"]   = f"Error: {e}"
+            JOBS[job_id]["progress"] = 0
+
+
 def _extract_audio_if_needed(input_path):
     """Extracts a .wav from a video file via ffmpeg; passes audio files through untouched."""
     if input_path.lower().endswith(SubtitleEngine.VIDEO_EXTENSIONS):
@@ -668,10 +840,12 @@ def job_status(job_id):
         progress=job["progress"],
         message=job["status"],
         result={
-            "srt": Path(job["output"]).name if job["output"] and job.get("output", "").endswith(".srt") else None,
+            "srt": srt_rel,
             "preview": job.get("srt", "")[:8000],
             "video": job["output"] if "video" in job and not job.get("keep_vocals") else None,
             "lyric_video": job["output"] if "video" in job and job.get("keep_vocals") else None,
+            "pdf": job.get("pdf"),
+            "mp3": job.get("mp3"),
         },
         error=None if "Error" not in job["status"] else job["status"],
     )
@@ -761,36 +935,52 @@ def browse_folder(kind):
     server's own desktop while the client's request sits there
     waiting, which is what caused the browser tab to appear to
     "close". This version never touches the server's GUI.
+
+    NOTE: every "kind" used to map to None, which made `target` always
+    resolve to the bare outputs root (outdir) no matter what button was
+    clicked — so "Browse SRT Folder" and friends were really all
+    browsing the same (usually empty-looking) top level. On top of
+    that, SRT/Karaoke/Lyrics/Tabs files don't live in one flat folder —
+    they're nested per song as outputs/<user>/<song>/<FolderName>/...
+    (see _run_pipeline, _run_video_job, _run_lyrics_job, _run_tab_job).
+    So this now searches every song folder for the matching subfolder
+    name instead of assuming one fixed path.
     """
     _, outdir = user_dirs(session["user"])
 
-    subfolders = {
-        "srt":           None,
-        "karaoke":       None,
-        "lyrics":        None,
-        "tabs":          None,
-        "transcription": None,
+    folder_name_for_kind = {
+        "srt":           "SRT",
+        "karaoke":       "Karaoke",
+        "lyrics":        "Lyrics",
+        "tabs":          "Tabs",
+        "transcription": "Transcription",
     }
-    sub = subfolders.get(kind)
-    target = outdir if sub is None else (outdir / sub)
+    folder_name = folder_name_for_kind.get(kind)
+    if folder_name is None:
+        return jsonify(error=f"Unknown browse kind: {kind}"), 400
 
-    if not target.exists():
-        return jsonify(ok=True, path=str(target.relative_to(outdir)) if target != outdir else "",
-                        files=[])
+    if not outdir.exists():
+        return jsonify(ok=True, path=folder_name, files=[])
 
-    files = []
-    for p in sorted(target.rglob("*"),
-                     key=lambda x: x.stat().st_mtime, reverse=True):
-        if p.is_file():
-            files.append({
-                "name":    p.name,
-                "rel":     str(p.relative_to(outdir)),   # for /api/download_output/<rel>
-                "size_mb": round(p.stat().st_size / (1024 * 1024), 2),
-            })
+    found = []
+    for song_dir in outdir.iterdir():
+        if not song_dir.is_dir():
+            continue
+        target = song_dir / folder_name
+        if not target.exists():
+            continue
+        for p in target.rglob("*"):
+            if p.is_file():
+                found.append(p)
 
-    return jsonify(ok=True,
-                    path=str(target.relative_to(outdir)) if target != outdir else "",
-                    files=files)
+    found.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    files = [{
+        "name":    p.name,
+        "rel":     str(p.relative_to(outdir)),   # for /api/download_output/<rel>
+        "size_mb": round(p.stat().st_size / (1024 * 1024), 2),
+    } for p in found]
+
+    return jsonify(ok=True, path=folder_name, files=files)
 
 
 # ============================================================

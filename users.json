@@ -7,12 +7,12 @@
     "password": "scrypt:32768:8:1$L1uBBqjyMWWfcJGZ$7242d66c4e43e63f88b03324931b590bee1cbed4bcc10cc20ff6402fedc5e420b4788210fca45bf6a60b321674844f0ede4086ca2693f917dc0dbae967bbf175",
     "role": "user"
   },
-  "admin": {
-    "password": "scrypt:32768:8:1$rbIlorYoJiirjF6a$fa2b59704546c11b6da4865d5b68c7cab690c0afd0176e38ce4c422cd14053d36ca181165d0b5e85851b475ef8a814968fa9c9d231903f48b105a57dce84043b",
-    "role": "admin"
-  },
   "user": {
     "password": "scrypt:32768:8:1$p4qhhfHmGO64Itwd$a6bd6f4e304d1782ef04c99336322384d24e4ef360c74521e5def992c9f8e5460299fedc609e58b7fb5d9ac17b814a9b1183dfc8dcb43bf2b4fbd43418be2b0c",
     "role": "user"
+  },
+  "admin": {
+    "password": "scrypt:32768:8:1$tu9Yi7AfVEWHQAqC$ad81ebc5928c6885c8315905861e7422a683139ba75644b1a31b1abc7e47ab62bc980fc2e72460e9bc37478f62b64f55b01263e7ed4b93f6729880c576cf87ca",
+    "role": "admin"
   }
 }
