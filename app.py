@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import uuid
 import json
 import hmac
@@ -27,13 +28,18 @@ app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 app.config["TEMPLATES_AUTO_RELOAD"] = True
 app.jinja_env.auto_reload = True
 
+# Keep the user logged in across browser restarts.
+from datetime import timedelta
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=7)
+
 BASE_DIR   = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
 OUTPUT_DIR = BASE_DIR / "outputs"
 ASSETS_DIR = BASE_DIR / "assets"
 USERS_FILE = BASE_DIR / "users.json"
+JOBS_DIR   = BASE_DIR / "jobs"
 
-for d in (UPLOAD_DIR, OUTPUT_DIR, ASSETS_DIR):
+for d in (UPLOAD_DIR, OUTPUT_DIR, ASSETS_DIR, JOBS_DIR):
     d.mkdir(exist_ok=True)
 
 # Create a default user file if none exists.
@@ -47,8 +53,73 @@ if not USERS_FILE.exists():
         }
     }, indent=2))
 
-JOBS = {}
 LOCK = threading.Lock()
+
+
+# ============================================================
+# JOB PERSISTENCE
+# ------------------------------------------------------------
+# JOBS used to live only in memory, so a server restart wiped every
+# in-flight job. It's now persisted so a resumed browser session (or
+# a server restart) can pick a job back up.
+#
+# IMPORTANT: this used to write the ENTIRE JOBS dict — every job from
+# every user over the last 24h — to one shared jobs.json file, on
+# every single progress checkpoint (see the old _p() callbacks: every
+# 10% they called _save_jobs()). Two problems with that:
+#   1. One job's checkpoint write re-serialized ALL other jobs' data
+#      too, so writes got slower and slower the longer the server had
+#      been running and the more job history had piled up — which is
+#      exactly the "it didn't used to take this long" symptom.
+#   2. The persisted data included the FULL generated SRT transcript
+#      text inline (JOBS[job_id]["srt"]), which is pure dead weight on
+#      disk — app.js's restoreSession() already re-reads the real SRT
+#      file from disk via /api/output_preview, it never reads this
+#      field back out of the snapshot.
+#
+# Fix: each job gets its own small file (jobs/<job_id>.json), so a
+# checkpoint only ever writes that one job's small metadata blob —
+# writes stay cheap and constant-time regardless of how much job
+# history has accumulated. The bulky "srt" text field is stripped
+# before writing to disk (still kept in the in-memory JOBS dict for
+# the live polling preview during the current process's lifetime).
+# ============================================================
+_PERSIST_EXCLUDE_KEYS = {"srt"}  # bulky, and not needed on disk — see note above
+
+
+def _load_jobs():
+    jobs = {}
+    cutoff = time.time() - 86400
+    for f in JOBS_DIR.glob("*.json"):
+        try:
+            v = json.loads(f.read_text())
+            if isinstance(v, dict) and v.get("_ts", 0) > cutoff:
+                jobs[f.stem] = v
+            else:
+                f.unlink(missing_ok=True)  # stale — clean it up
+        except Exception as e:
+            print(f"[jobs] failed to load {f.name}: {e}")
+    return jobs
+
+
+def _save_job(job_id):
+    """Persist ONLY this one job's metadata to its own small file.
+    Caller must hold LOCK. O(1) in the size of job history, unlike the
+    old whole-dict-every-time approach."""
+    try:
+        job = JOBS.get(job_id)
+        if job is None:
+            return
+        to_write = {k: v for k, v in job.items() if k not in _PERSIST_EXCLUDE_KEYS}
+        target = JOBS_DIR / f"{job_id}.json"
+        tmp = target.with_suffix(".tmp")
+        tmp.write_text(json.dumps(to_write, default=str))
+        tmp.replace(target)
+    except Exception as e:
+        print(f"[jobs] failed to persist {job_id}: {e}")
+
+
+JOBS = _load_jobs()
 
 
 # ============================================================
@@ -179,6 +250,14 @@ def user_dirs(username: str):
     return u, o
 
 
+def _owns_job(job: dict) -> bool:
+    """A user may only see their own jobs (admins see everything)."""
+    if session.get("role") == "admin":
+        return True
+    owner = job.get("user")
+    return owner is None or owner == session.get("user")
+
+
 # ============================================================
 # AUTH ROUTES
 # ============================================================
@@ -191,6 +270,7 @@ def login():
 
         user = load_users().get(u)
         if user is not None and verify_password(p, user):
+            session.permanent = True          # survive browser restart
             session["user"] = u
             session["role"] = get_role(user)
             return redirect(url_for("index"))
@@ -413,7 +493,9 @@ def generate():
             "output": "",
             "input": input_path,
             "user": session["user"],
+            "_ts": time.time(),
         }
+        _save_job(job_id)
 
     opts = {
         "language":       data.get("language", "auto"),
@@ -449,7 +531,9 @@ def generate_srt_alias():
             "output":   "",
             "input":    input_path,
             "user":     session["user"],
+            "_ts":      time.time(),
         }
+        _save_job(job_id)
     opts = {
         "language":       data.get("language", "auto"),
         "model":          data.get("model", "large-v3"),
@@ -487,6 +571,10 @@ def _run_pipeline(job_id, opts):
             with LOCK:
                 JOBS[job_id]["progress"] = float(value)
                 JOBS[job_id]["status"]   = status
+                JOBS[job_id]["_ts"]      = time.time()
+                # persist every 10% to avoid disk thrash
+                if int(value) % 10 == 0:
+                    _save_job(job_id)
 
         srt_text = engine.generate_srt(
             str(input_path), str(out_path),
@@ -501,6 +589,8 @@ def _run_pipeline(job_id, opts):
             JOBS[job_id]["progress"] = 100
             JOBS[job_id]["status"]   = "Complete!"
             JOBS[job_id]["output"]   = str(out_path)
+            JOBS[job_id]["_ts"]      = time.time()
+            _save_job(job_id)
 
     except Exception as e:
         import traceback
@@ -508,6 +598,8 @@ def _run_pipeline(job_id, opts):
         with LOCK:
             JOBS[job_id]["status"]   = f"Error: {e}"
             JOBS[job_id]["progress"] = 0
+            JOBS[job_id]["_ts"]      = time.time()
+            _save_job(job_id)
 
 
 @app.route("/api/generate_karaoke", methods=["POST"])
@@ -561,7 +653,9 @@ def _generate_video(req, keep_vocals: bool):
             "output":   "",
             "input":    str(input_path),
             "user":     session["user"],
+            "_ts":      time.time(),
         }
+        _save_job(job_id)
 
     threading.Thread(
         target=_run_video_job,
@@ -603,7 +697,9 @@ def generate_lyrics():
             "output":   "",
             "input":    str(input_path),
             "user":     session["user"],
+            "_ts":      time.time(),
         }
+        _save_job(job_id)
 
     threading.Thread(
         target=_run_lyrics_job,
@@ -625,6 +721,9 @@ def _run_lyrics_job(job_id, input_path, srt_path, chord_method):
             with LOCK:
                 JOBS[job_id]["progress"] = float(value)
                 JOBS[job_id]["status"]   = status
+                JOBS[job_id]["_ts"]      = time.time()
+                if int(value) % 10 == 0:
+                    _save_job(job_id)
 
         _p(5, "Reading subtitles...")
         srt_text = Path(srt_path).read_text(encoding="utf-8")
@@ -653,6 +752,8 @@ def _run_lyrics_job(job_id, input_path, srt_path, chord_method):
             JOBS[job_id]["pdf"]        = str(pdf_path)
             JOBS[job_id]["mp3"]        = str(mp3_path)
             JOBS[job_id]["chords_detected"] = f"{detected}/{total}"
+            JOBS[job_id]["_ts"]        = time.time()
+            _save_job(job_id)
 
     except Exception as e:
         import traceback
@@ -660,6 +761,8 @@ def _run_lyrics_job(job_id, input_path, srt_path, chord_method):
         with LOCK:
             JOBS[job_id]["status"]   = f"Error: {e}"
             JOBS[job_id]["progress"] = 0
+            JOBS[job_id]["_ts"]      = time.time()
+            _save_job(job_id)
 
 
 @app.route("/api/export_guitar_tab", methods=["POST"])
@@ -690,7 +793,9 @@ def generate_tab():
             "output":   "",
             "input":    str(input_path),
             "user":     session["user"],
+            "_ts":      time.time(),
         }
+        _save_job(job_id)
 
     threading.Thread(
         target=_run_tab_job,
@@ -712,6 +817,9 @@ def _run_tab_job(job_id, input_path, start_sec, end_sec, use_demucs):
             with LOCK:
                 JOBS[job_id]["progress"] = float(value)
                 JOBS[job_id]["status"]   = status
+                JOBS[job_id]["_ts"]      = time.time()
+                if int(value) % 10 == 0:
+                    _save_job(job_id)
 
         resolved_end = end_sec
         if resolved_end is None:
@@ -735,6 +843,8 @@ def _run_tab_job(job_id, input_path, start_sec, end_sec, use_demucs):
             JOBS[job_id]["status"]   = "Complete!"
             JOBS[job_id]["output"]   = str(pdf_path)
             JOBS[job_id]["pdf"]      = str(pdf_path)
+            JOBS[job_id]["_ts"]      = time.time()
+            _save_job(job_id)
 
     except Exception as e:
         import traceback
@@ -742,6 +852,8 @@ def _run_tab_job(job_id, input_path, start_sec, end_sec, use_demucs):
         with LOCK:
             JOBS[job_id]["status"]   = f"Error: {e}"
             JOBS[job_id]["progress"] = 0
+            JOBS[job_id]["_ts"]      = time.time()
+            _save_job(job_id)
 
 
 def _extract_audio_if_needed(input_path):
@@ -777,6 +889,9 @@ def _run_video_job(job_id, input_path, srt_path, background_path, keep_vocals):
             with LOCK:
                 JOBS[job_id]["progress"] = float(value)
                 JOBS[job_id]["status"]   = status
+                JOBS[job_id]["_ts"]      = time.time()
+                if int(value) % 10 == 0:
+                    _save_job(job_id)
 
         _p(5, "Preparing audio...")
         audio_path, is_temp = _extract_audio_if_needed(input_path)
@@ -825,6 +940,8 @@ def _run_video_job(job_id, input_path, srt_path, background_path, keep_vocals):
             JOBS[job_id]["output"]      = str(out_path)
             JOBS[job_id]["video"]       = str(out_path)
             JOBS[job_id]["keep_vocals"] = keep_vocals
+            JOBS[job_id]["_ts"]         = time.time()
+            _save_job(job_id)
 
     except Exception as e:
         import traceback
@@ -832,6 +949,8 @@ def _run_video_job(job_id, input_path, srt_path, background_path, keep_vocals):
         with LOCK:
             JOBS[job_id]["status"]   = f"Error: {e}"
             JOBS[job_id]["progress"] = 0
+            JOBS[job_id]["_ts"]      = time.time()
+            _save_job(job_id)
     finally:
         if temp_audio_path and os.path.exists(temp_audio_path):
             try:
@@ -840,7 +959,9 @@ def _run_video_job(job_id, input_path, srt_path, background_path, keep_vocals):
                 pass
         if demucs_out_dir:
             shutil.rmtree(demucs_out_dir, ignore_errors=True)
-            JOBS[job_id]["progress"] = 0
+            with LOCK:
+                JOBS[job_id]["_ts"] = time.time()
+                _save_job(job_id)
 
 
 # ============================================================
@@ -853,6 +974,8 @@ def status(job_id):
         job = JOBS.get(job_id)
     if not job:
         return jsonify(error="Unknown job"), 404
+    if not _owns_job(job):
+        return jsonify(error="Forbidden"), 403
     return jsonify(**job)
 
 
@@ -864,6 +987,8 @@ def job_status(job_id):
         job = JOBS.get(job_id)
     if not job:
         return jsonify(error="Unknown job"), 404
+    if not _owns_job(job):
+        return jsonify(error="Forbidden"), 403
 
     # SRTs are written nested (e.g. "<stem>/SRT/<stem>.srt"), not flat in
     # outputs/<user>/, so app.js needs that relative path — not just the
@@ -902,6 +1027,8 @@ def download(job_id):
         job = JOBS.get(job_id)
     if not job or not job["output"]:
         return jsonify(error="No output"), 404
+    if not _owns_job(job):
+        return jsonify(error="Forbidden"), 403
 
     p = Path(job["output"])
     return send_from_directory(p.parent, p.name, as_attachment=True)
@@ -951,6 +1078,28 @@ def save_srt():
     return jsonify(ok=True, file=str(target.relative_to(outdir_resolved)))
 
 
+@app.route("/api/output_preview")
+@login_required
+def output_preview():
+    """Return the raw text of a user's output file — used by app.js to
+    restore the SRT preview after a browser reload."""
+    rel = request.args.get("path", "")
+    if not rel:
+        return "", 400
+
+    _, outdir = user_dirs(session["user"])
+    outdir_resolved = outdir.resolve()
+    target = (outdir / rel).resolve()
+    if outdir_resolved not in target.parents and target != outdir_resolved:
+        return "", 400
+    if not target.exists() or not target.is_file():
+        return "", 404
+
+    return (target.read_text(encoding="utf-8"),
+            200,
+            {"Content-Type": "text/plain; charset=utf-8"})
+
+
 @app.route("/api/job/<job_id>/cancel", methods=["POST"])
 @login_required
 def cancel_job(job_id):
@@ -959,9 +1108,13 @@ def cancel_job(job_id):
         job = JOBS.get(job_id)
     if not job:
         return jsonify(error="Job not found"), 404
+    if not _owns_job(job):
+        return jsonify(error="Forbidden"), 403
     with LOCK:
         JOBS[job_id]["status"]   = "Cancelled"
         JOBS[job_id]["progress"] = 0
+        JOBS[job_id]["_ts"]      = time.time()
+        _save_job(job_id)
     return jsonify(ok=True)
 
 

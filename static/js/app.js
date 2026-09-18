@@ -10,9 +10,188 @@ const state = {
   timerStart: null,
   timerInterval: null,
   isProcessing: false,
+  activeButtonId: null,   // which action button started the current/last job
+  reviewed: {             // has the matching Browse button been clicked
+    srt: false, karaoke: false, lyrics: false, tabs: false, transcription: false,
+  },
 };
 
 const $ = (id) => document.getElementById(id);
+
+/* ============================================================
+   ACTION-BUTTON STATUS COLORS
+   ------------------------------------------------------------
+   Every job-triggering button starts red (.btn-ready), turns yellow
+   (.btn-processing) while its job runs, then green (.btn-done) once
+   it finishes.
+
+   Each of the 5 "Browse ... Folder" buttons is paired with one (or
+   two, for Karaoke/Lyric Video sharing one folder) action button and
+   mirrors its red/yellow — but its OWN green only ever comes from
+   actually being clicked to review that folder (see browseRemote),
+   not automatically from the job finishing. That green then persists
+   until the paired job is run again.
+   ============================================================ */
+const ACTION_TO_KIND = {
+  btnSrt:        'srt',
+  btnKaraoke:    'karaoke',
+  btnLyricVideo: 'karaoke',
+  btnLyrics:     'lyrics',
+  btnTab:        'tabs',
+  btnFull:       'transcription',
+};
+const ACTION_BUTTON_IDS = Object.keys(ACTION_TO_KIND);
+
+const KIND_TO_BROWSE_BTN = {
+  srt:           'browseSrtBtn',
+  karaoke:       'browseKaraokeBtn',
+  lyrics:        'browseLyricsBtn',
+  tabs:          'browseTabsBtn',
+  transcription: 'browseTranscriptionBtn',
+};
+
+function setButtonState(id, cls) {
+  const el = $(id);
+  if (!el) return;
+  el.classList.remove('btn-ready', 'btn-processing', 'btn-done');
+  el.classList.add(cls);
+}
+
+function resetAllButtonStates() {
+  ACTION_BUTTON_IDS.forEach(id => setButtonState(id, 'btn-ready'));
+  Object.values(KIND_TO_BROWSE_BTN).forEach(id => setButtonState(id, 'btn-ready'));
+}
+
+/* ============================================================
+   SESSION PERSISTENCE
+   ------------------------------------------------------------
+   Keeps the user's place across browser closes / tab reloads.
+   - localStorage snapshot: uploaded file, background, srt, jobId,
+     form field values. Restored on load.
+   - If a job was running, we resume polling /api/job/<id>.
+   ============================================================ */
+const STORAGE_KEY = 'musicStudio.session.v1';
+
+function saveSession() {
+  const snapshot = {
+    uploaded:  state.uploaded,
+    background: state.background,
+    srt:       state.srt,
+    jobId:     state.jobId,
+    activeButtonId: state.activeButtonId,
+    reviewed:  state.reviewed,
+    timestamp: Date.now(),
+    form: {
+      language:    $('language')?.value,
+      model:       $('model')?.value,
+      chordMethod: $('chordMethod')?.value,
+      useDemucs:   $('useDemucs')?.checked,
+      outputPath:  $('outputFilePath')?.value,
+      bgPath:      $('backgroundPath')?.value,
+      inputPath:   $('inputFilePath')?.value,
+    },
+  };
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
+  } catch (e) { /* quota / private mode — ignore */ }
+}
+
+function clearSession() {
+  try { localStorage.removeItem(STORAGE_KEY); } catch (e) {}
+}
+
+async function restoreSession() {
+  let snap;
+  try {
+    snap = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null');
+  } catch { snap = null; }
+  if (!snap) return;
+
+  // 1. Restore in-memory state
+  state.uploaded   = snap.uploaded   || null;
+  state.background = snap.background || null;
+  state.srt        = snap.srt        || null;
+  state.jobId      = snap.jobId      || null;
+  state.activeButtonId = snap.activeButtonId || null;
+  state.reviewed   = Object.assign(
+    { srt: false, karaoke: false, lyrics: false, tabs: false, transcription: false },
+    snap.reviewed || {}
+  );
+
+  // Re-apply button colors from the restored state: everything starts
+  // ready(red), a Browse button goes green if it was already reviewed,
+  // and — if a job turns out to still be running below — the relevant
+  // pair goes yellow.
+  resetAllButtonStates();
+  Object.entries(state.reviewed).forEach(([kind, isReviewed]) => {
+    if (isReviewed) setButtonState(KIND_TO_BROWSE_BTN[kind], 'btn-done');
+  });
+
+  // 2. Restore form fields
+  const f = snap.form || {};
+  if (f.language     && $('language'))           $('language').value = f.language;
+  if (f.model        && $('model'))              $('model').value = f.model;
+  if (f.chordMethod  && $('chordMethod'))        $('chordMethod').value = f.chordMethod;
+  if (f.useDemucs !== undefined && $('useDemucs')) $('useDemucs').checked = f.useDemucs;
+  if (f.outputPath   && $('outputFilePath'))     $('outputFilePath').value = f.outputPath;
+  if (f.bgPath       && $('backgroundPath'))     $('backgroundPath').value = f.bgPath;
+  if (f.inputPath    && $('inputFilePath'))      $('inputFilePath').value = f.inputPath;
+
+  // 3. If a job was running, resume polling or show final result
+  if (state.jobId) {
+    const kind = ACTION_TO_KIND[state.activeButtonId];
+    try {
+      const r = await fetch(`/api/job/${state.jobId}`);
+      const j = await r.json();
+      if (j.status === 'running') {
+        lockButtons(true);
+        startTimer();
+        setProgress(j.progress || 0);
+        setStatus(j.message || 'Resuming…');
+        if (state.activeButtonId) setButtonState(state.activeButtonId, 'btn-processing');
+        if (kind) setButtonState(KIND_TO_BROWSE_BTN[kind], 'btn-processing');
+        pollJob();
+        setStatus('Resumed previous job');
+        return;
+      }
+      if (j.status === 'done') {
+        handleResult(j.result);
+        setStatus('Previous job finished while you were away');
+        if (state.activeButtonId) setButtonState(state.activeButtonId, 'btn-done');
+        if (kind && !state.reviewed[kind]) setButtonState(KIND_TO_BROWSE_BTN[kind], 'btn-ready');
+        state.jobId = null;
+        saveSession();
+      } else if (j.status === 'error') {
+        setStatus('Previous job failed: ' + (j.error || ''));
+        if (state.activeButtonId) setButtonState(state.activeButtonId, 'btn-ready');
+        if (kind && !state.reviewed[kind]) setButtonState(KIND_TO_BROWSE_BTN[kind], 'btn-ready');
+        state.jobId = null;
+        saveSession();
+      } else {
+        // cancelled / unknown — drop it
+        if (state.activeButtonId) setButtonState(state.activeButtonId, 'btn-ready');
+        if (kind && !state.reviewed[kind]) setButtonState(KIND_TO_BROWSE_BTN[kind], 'btn-ready');
+        state.jobId = null;
+        saveSession();
+      }
+    } catch (e) {
+      // Server lost the job (restart) — clear it
+      state.jobId = null;
+      saveSession();
+    }
+  }
+
+  // 4. Restore the SRT preview if we had one on screen
+  if (state.srt) {
+    try {
+      const r = await fetch(`/api/output_preview?path=${encodeURIComponent(state.srt)}`);
+      if (r.ok) {
+        const t = await r.text();
+        $('srtPreview').textContent = t.slice(0, 8000);
+      }
+    } catch { /* ignore */ }
+  }
+}
 
 /* ---------- Input file picker ---------- */
 $('inputFilePicker').addEventListener('change', async (e) => {
@@ -29,6 +208,7 @@ $('backgroundPicker').addEventListener('change', async (e) => {
   $('backgroundPath').value = f.name;
   const r = await uploadFile(f, 'background');
   if (r) state.background = r;
+  saveSession();
 });
 
 /* ---------- Upload helper ---------- */
@@ -47,6 +227,7 @@ async function uploadFile(file, kind = 'input') {
       $('outputFilePath').value = j.srt_path || (file.name.replace(/\.[^.]+$/, '') + '.srt');
       state.srt = null;
     }
+    saveSession();
     return j;
   } catch (err) {
     alert('Upload failed: ' + err.message);
@@ -100,14 +281,25 @@ async function pollJob() {
       state.jobId = null;
       lockButtons(false);
       stopTimer();
+      const kind = ACTION_TO_KIND[state.activeButtonId];
+      if (state.activeButtonId) setButtonState(state.activeButtonId, 'btn-done');
+      // The Browse button's green is earned by actually reviewing the
+      // folder (see browseRemote), not just by the job finishing —
+      // so it drops back to ready(red) here unless already reviewed.
+      if (kind && !state.reviewed[kind]) setButtonState(KIND_TO_BROWSE_BTN[kind], 'btn-ready');
       handleResult(j.result);
+      saveSession();
       return;
     }
     if (j.status === 'error') {
       state.jobId = null;
       lockButtons(false);
       stopTimer();
+      const kind = ACTION_TO_KIND[state.activeButtonId];
+      if (state.activeButtonId) setButtonState(state.activeButtonId, 'btn-ready');
+      if (kind && !state.reviewed[kind]) setButtonState(KIND_TO_BROWSE_BTN[kind], 'btn-ready');
       alert('Error: ' + j.error);
+      saveSession();
       return;
     }
     setTimeout(pollJob, 800);
@@ -116,16 +308,26 @@ async function pollJob() {
   }
 }
 
-function startJob(res) {
+function startJob(res, buttonId) {
   if (!res || res.error) {
     alert(res && res.error ? res.error : 'Unknown error');
     return;
   }
   state.jobId = res.job_id;
+  state.activeButtonId = buttonId || null;
+  const kind = ACTION_TO_KIND[buttonId];
+  if (kind) {
+    // A fresh run invalidates any earlier "reviewed" green for this
+    // kind's Browse button — the folder is about to change.
+    state.reviewed[kind] = false;
+    setButtonState(KIND_TO_BROWSE_BTN[kind], 'btn-processing');
+  }
+  if (buttonId) setButtonState(buttonId, 'btn-processing');
   lockButtons(true);
   startTimer();
   setProgress(0);
   setStatus('Starting…');
+  saveSession();
   pollJob();
 }
 
@@ -145,6 +347,7 @@ function handleResult(result) {
     alert(`Transcription ready in folder: ${result.folder}\n\n` +
           (result.files || []).join('\n'));
   }
+  saveSession();
 }
 
 /* ---------- Actions ---------- */
@@ -160,7 +363,7 @@ $('btnSrt').onclick = async () => {
       isolate_vocals: true, // always isolate vocals before transcribing — no longer user-toggled
     }),
   });
-  startJob(await r.json());
+  startJob(await r.json(), 'btnSrt');
 };
 
 $('btnKaraoke').onclick = async () => {
@@ -174,7 +377,7 @@ $('btnKaraoke').onclick = async () => {
       background: state.background ? state.background.path : null,
     }),
   });
-  startJob(await r.json());
+  startJob(await r.json(), 'btnKaraoke');
 };
 
 $('btnLyricVideo').onclick = async () => {
@@ -188,7 +391,7 @@ $('btnLyricVideo').onclick = async () => {
       background: state.background ? state.background.path : null,
     }),
   });
-  startJob(await r.json());
+  startJob(await r.json(), 'btnLyricVideo');
 };
 
 $('btnLyrics').onclick = async () => {
@@ -202,7 +405,7 @@ $('btnLyrics').onclick = async () => {
       chord_method: $('chordMethod').value,
     }),
   });
-  startJob(await r.json());
+  startJob(await r.json(), 'btnLyrics');
 };
 
 $('btnTab').onclick = async () => {
@@ -215,7 +418,7 @@ $('btnTab').onclick = async () => {
       use_demucs: $('useDemucs').checked,
     }),
   });
-  startJob(await r.json());
+  startJob(await r.json(), 'btnTab');
 };
 
 $('btnFull').onclick = async () => {
@@ -225,7 +428,7 @@ $('btnFull').onclick = async () => {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ path: state.uploaded.path }),
   });
-  startJob(await r.json());
+  startJob(await r.json(), 'btnFull');
 };
 
 $('btnStop').onclick = async () => {
@@ -237,6 +440,7 @@ $('btnStop').onclick = async () => {
   lockButtons(false);
   stopTimer();
   setStatus('Stopped');
+  saveSession();
 };
 
 $('btnClear').onclick = () => {
@@ -244,6 +448,10 @@ $('btnClear').onclick = () => {
   setProgress(0);
   setStatus('Ready');
   stopTimer();
+  state.activeButtonId = null;
+  state.reviewed = { srt: false, karaoke: false, lyrics: false, tabs: false, transcription: false };
+  resetAllButtonStates();
+  clearSession();
 };
 
 $('btnEdit').onclick = () => {
@@ -311,6 +519,15 @@ async function browseRemote(kind) {
     alert('Could not load folder: ' + data.error);
     return;
   }
+
+  // Reviewing the folder is what "confirms" it — the Browse button
+  // turns green right here and stays green (surviving reloads, via
+  // saveSession) until this kind's job is run again, regardless of
+  // what the paired action button is doing at that moment.
+  state.reviewed[kind] = true;
+  setButtonState(KIND_TO_BROWSE_BTN[kind], 'btn-done');
+  saveSession();
+
   // If the server is running on this same machine, /api/browse just
   // opened the real OS folder window directly — nothing more to show
   // in the page. Only render the in-page listing when it couldn't
@@ -388,6 +605,7 @@ function openEditor(text) {
     if (j.error) return alert('Save failed: ' + j.error);
     $('srtPreview').textContent = newText;
     setStatus('SRT saved');
+    saveSession();
     modal.remove();
   };
 }
@@ -395,3 +613,13 @@ function openEditor(text) {
 /* ---------- Init ---------- */
 setStatus('Ready');
 lockButtons(false);
+resetAllButtonStates();
+
+// Persist setting changes so they survive reloads
+['language', 'model', 'chordMethod', 'useDemucs'].forEach(id => {
+  const el = $(id);
+  if (el) el.addEventListener('change', saveSession);
+});
+
+// Restore whatever the user was doing before they closed the browser
+restoreSession();

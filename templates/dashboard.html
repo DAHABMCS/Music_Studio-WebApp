@@ -76,6 +76,35 @@
     height: auto !important;
     max-height: none !important;
   }
+
+  /* ---- Action-button status colors. Only the six job-triggering
+     buttons (Generate Subtitles, Karaoke, Lyric Video, Export Lyrics,
+     Export Guitar Solo Tab, Full Transcription) get these — Stop,
+     Clear, Browse and Edit don't have a "processing" lifecycle of
+     their own, so they keep the theme's normal button styling.
+     States are toggled by app.js: .btn-ready is the default/idle
+     look, .btn-processing while its job is running, .btn-done once
+     that job completes (until the button is used again or Clear is
+     pressed). !important overrides the theme's own .btn/.accent
+     colors so the status is always clearly visible. */
+  .btn-ready {
+    background: #b3261e !important;
+    border-color: #8c1d17 !important;
+    color: #ffffff !important;
+  }
+  .btn-ready:hover:not(:disabled) {
+    background: #c62d24 !important;
+  }
+  .btn-processing {
+    background: #e8b100 !important;
+    border-color: #b98900 !important;
+    color: #1a1a1a !important;
+  }
+  .btn-done {
+    background: #1e8e3e !important;
+    border-color: #14672d !important;
+    color: #ffffff !important;
+  }
 </style>
 
 <div class="dashboard-backdrop">
@@ -187,14 +216,14 @@
 
           <!-- column 1 -->
           <div class="actions-col">
-            <button class="btn accent" id="btnSrt">Generate Subtitles</button>
+            <button class="btn accent btn-ready" id="btnSrt">Generate Subtitles</button>
             <div class="btn-pair" style="display:flex; gap:6px;">
-              <button class="btn" id="btnKaraoke" style="flex:1;" title="Karaoke video without vocals">Karaoke</button>
-              <button class="btn" id="btnLyricVideo" style="flex:1;" title="Lyric video with vocals included">Lyric Video</button>
+              <button class="btn btn-ready" id="btnKaraoke" style="flex:1;" title="Karaoke video without vocals">Karaoke</button>
+              <button class="btn btn-ready" id="btnLyricVideo" style="flex:1;" title="Lyric video with vocals included">Lyric Video</button>
             </div>
-            <button class="btn" id="btnLyrics">Export Lyrics (PDF+MP3)</button>
-            <button class="btn" id="btnTab">Export Guitar Solo Tab (PDF)</button>
-            <button class="btn" id="btnFull">Full Transcription (TAB+MIDI)</button>
+            <button class="btn btn-ready" id="btnLyrics">Export Lyrics (PDF+MP3)</button>
+            <button class="btn btn-ready" id="btnTab">Export Guitar Solo Tab (PDF)</button>
+            <button class="btn btn-ready" id="btnFull">Full Transcription (TAB+MIDI)</button>
           </div>
 
           <!-- column 2 : Stop / Clear + gear illustration -->
@@ -210,11 +239,11 @@
 
           <!-- column 3 : browse buttons -->
           <div class="actions-col">
-            <button class="btn" onclick="browseRemote('srt')">Browse SRT Folder</button>
-            <button class="btn" onclick="browseRemote('karaoke')">Browse Karaoke Folder</button>
-            <button class="btn" onclick="browseRemote('lyrics')">Browse Lyrics Folder</button>
-            <button class="btn" onclick="browseRemote('tabs')">Browse Tabs Folder</button>
-            <button class="btn" onclick="browseRemote('transcription')">Browse Transcription</button>
+            <button class="btn btn-ready" id="browseSrtBtn" onclick="browseRemote('srt')">Browse SRT Folder</button>
+            <button class="btn btn-ready" id="browseKaraokeBtn" onclick="browseRemote('karaoke')">Browse Karaoke Folder</button>
+            <button class="btn btn-ready" id="browseLyricsBtn" onclick="browseRemote('lyrics')">Browse Lyrics Folder</button>
+            <button class="btn btn-ready" id="browseTabsBtn" onclick="browseRemote('tabs')">Browse Tabs Folder</button>
+            <button class="btn btn-ready" id="browseTranscriptionBtn" onclick="browseRemote('transcription')">Browse Transcription</button>
           </div>
 
         </section>
