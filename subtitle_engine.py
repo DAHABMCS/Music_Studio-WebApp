@@ -14,6 +14,25 @@ from pathlib import Path
 
 import whisper
 
+# stable-ts (pip install stable-ts) wraps openai-whisper and specifically
+# refines word-level timestamp accuracy — including re-segmenting cue
+# boundaries via DTW-based backtracking — which is exactly the class of
+# problem behind "words from the wrong phrase"/"not synced with the vocal"
+# in karaoke output. Plain openai-whisper's word timestamps are known to
+# drift on sung audio (melisma, pitch bends, repeated choruses); stable-ts
+# is the standard fix for that without pulling in a much heavier stack
+# like WhisperX's separate alignment models.
+#
+# Kept optional (falls back to plain whisper) so this file doesn't hard-
+# fail on a machine that hasn't installed it yet — but until it IS
+# installed, karaoke sync quality is unchanged from before. Install with:
+#   pip install stable-ts
+try:
+    import stable_whisper
+    _HAVE_STABLE_WHISPER = True
+except ImportError:
+    _HAVE_STABLE_WHISPER = False
+
 
 class SubtitleEngine:
     # ---------- constants (copied from original) ----------
@@ -52,7 +71,13 @@ class SubtitleEngine:
                 progress_cb(p, m)
 
         _p(5, "Loading Whisper model (first run downloads it)...")
-        model = whisper.load_model(model_size)
+        if _HAVE_STABLE_WHISPER:
+            model = stable_whisper.load_model(model_size)
+        else:
+            model = whisper.load_model(model_size)
+            _p(5, "Note: stable-ts is not installed, so word timestamps use "
+                  "plain Whisper (less accurate on sung vocals). "
+                  "For better karaoke sync, run: pip install stable-ts")
 
         _p(10, "Preparing audio...")
         temp_audio_path = None
@@ -110,8 +135,26 @@ class SubtitleEngine:
             )
 
             _p(85, "Formatting subtitles...")
+            if _HAVE_STABLE_WHISPER:
+                # stable-ts's own regrouping pass re-derives cleaner cue/word
+                # boundaries from the refined timestamps — this is the actual
+                # fix, not just using stable-ts as a drop-in loader. Wrapped
+                # in try/except since it's a best-effort refinement: if it
+                # errors on some edge-case input, falling back to its
+                # un-regrouped (but still stable-ts-refined) timestamps is
+                # still strictly better than plain Whisper, and definitely
+                # better than crashing the whole job over it.
+                try:
+                    result.regroup()
+                except Exception as regroup_err:
+                    print(f"[subtitle_engine] stable-ts regroup() failed, "
+                          f"continuing without it: {regroup_err}")
+                segments = result.to_dict()["segments"]
+            else:
+                segments = result["segments"]
+
             total_duration = self.get_audio_duration(audio_path)
-            srt_content = self.create_srt(result["segments"], total_duration=total_duration)
+            srt_content = self.create_srt(segments, total_duration=total_duration)
 
             os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
             with open(output_path, 'w', encoding='utf-8') as f:

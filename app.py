@@ -856,6 +856,235 @@ def _run_tab_job(job_id, input_path, start_sec, end_sec, use_demucs):
             _save_job(job_id)
 
 
+# ============================================================
+# FULL TRANSCRIPTION  (TAB + MIDI + Chords via MUSIC.py)
+# ------------------------------------------------------------
+# Ported from the desktop app's run_full_music_transcription /
+# _process_full_music_transcription. Same 8-stage MUSIC.py pipeline,
+# re-plumbed onto the JOBS dict + _p(progress, status) pattern used by
+# every other job in this file.
+#
+# Output layout:
+#   outputs/<user>/Transcription/<song>/
+#       01_INPUT_AUDIO.wav
+#       02_INSTRUMENTAL_STEM.wav
+#       01_GUITAR_SOLO_TAB.pdf
+#       02_RHYTHM_CHORDS.pdf
+#       03_GUITAR_SOLO.mid
+#       04_RHYTHM_CHORDS.mid
+#       TRANSCRIPTION_REPORT.txt
+#
+# Matches the "Browse Transcription" button in dashboard.html, which
+# already requests /api/browse/transcription and looks in the
+# Transcription/ folder.
+# ============================================================
+
+@app.route("/api/full_transcription", methods=["POST"])
+@login_required
+def full_transcription():
+    data = request.get_json(force=True) or {}
+    updir, _ = user_dirs(session["user"])
+
+    input_path = updir / data.get("path", "")
+    if not input_path.exists():
+        return jsonify(error="Input file not found"), 404
+
+    # Fail fast with a clear message if MUSIC.py is missing or the
+    # optional deps it needs aren't installed — otherwise the worker
+    # thread dies after the UI has already gone into "processing".
+    music_py = BASE_DIR / "MUSIC.py"
+    if not music_py.exists():
+        return jsonify(error=(
+            "MUSIC.py not found next to app.py. "
+            "Full transcription requires it."
+        )), 500
+
+    missing = []
+    for mod in ("numpy", "librosa", "soundfile", "music21", "reportlab"):
+        try:
+            __import__(mod)
+        except ImportError:
+            missing.append(mod)
+    if missing:
+        return jsonify(error=(
+            "Full transcription requires these packages: "
+            + ", ".join(missing)
+            + ". Install with: pip install " + " ".join(missing)
+        )), 500
+
+    if shutil.which("ffmpeg") is None:
+        return jsonify(error=(
+            "ffmpeg is required for full transcription and wasn't found on PATH."
+        )), 500
+
+    job_id = uuid.uuid4().hex[:12]
+    with LOCK:
+        JOBS[job_id] = {
+            "progress": 0,
+            "status":   "Ready",
+            "srt":      "",
+            "output":   "",
+            "input":    str(input_path),
+            "user":     session["user"],
+            "_ts":      time.time(),
+        }
+        _save_job(job_id)
+
+    threading.Thread(
+        target=_run_full_transcription_job,
+        args=(job_id, str(input_path)),
+        daemon=True,
+    ).start()
+
+    return jsonify(job_id=job_id)
+
+
+def _run_full_transcription_job(job_id, input_path):
+    """
+    Worker for /api/full_transcription. Mirrors the desktop app's
+    _process_full_music_transcription: dynamic-imports MUSIC.py from
+    the project root and runs its 8 stages, reporting progress into
+    JOBS the same way every other job here does.
+    """
+    import importlib.util
+
+    music_py = BASE_DIR / "MUSIC.py"
+
+    try:
+        spec = importlib.util.spec_from_file_location("music_pipeline", str(music_py))
+        music_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(music_module)
+
+        with LOCK:
+            user = JOBS[job_id].get("user", "shared")
+
+        def _p(value, status):
+            with LOCK:
+                JOBS[job_id]["progress"] = float(value)
+                JOBS[job_id]["status"]   = status
+                JOBS[job_id]["_ts"]      = time.time()
+                if int(value) % 10 == 0:
+                    _save_job(job_id)
+
+        stem = Path(input_path).stem
+        out_dir = OUTPUT_DIR / user / "Transcription" / stem
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        input_path_obj = Path(input_path)
+
+        # --- Stage 1: convert to WAV -----------------------------
+        _p(5, "Converting input to WAV...")
+        wav_file = out_dir / "01_INPUT_AUDIO.wav"
+        music_module.convert_input_to_wav(input_path_obj, wav_file)
+
+        # --- Stage 2: source separation (optional) ---------------
+        _p(15, "Separating instruments with Demucs...")
+        try:
+            separated = music_module.separate_sources(wav_file, out_dir)
+        except Exception as sep_err:
+            print(f"[full_transcription] source separation failed, "
+                  f"continuing with full mix: {sep_err}")
+            separated = None
+
+        analysis_audio = separated if separated else wav_file
+        stem_copy = out_dir / "02_INSTRUMENTAL_STEM.wav"
+        try:
+            shutil.copy2(analysis_audio, stem_copy)
+        except Exception:
+            pass
+
+        # --- Stage 3: tempo + duration ---------------------------
+        _p(30, "Detecting tempo...")
+        tempo_bpm = music_module.detect_tempo(analysis_audio)
+        total_duration_seconds = music_module.get_audio_duration_seconds(analysis_audio)
+
+        # --- Stage 4: melody -> TAB ------------------------------
+        # extract_melody's librosa.pyin call is a single, long, opaque
+        # blocking call — it can take several minutes on a full song with
+        # no way to report progress from inside it. Previously the status
+        # text just sat frozen on "Extracting guitar melody..." the whole
+        # time, which is indistinguishable from having actually hung. A
+        # lightweight heartbeat thread updates elapsed time in the status
+        # text every few seconds while it runs, so it's visibly alive.
+        _p(45, "Extracting guitar melody (can take several minutes)...")
+        _heartbeat_stop = threading.Event()
+
+        def _melody_heartbeat():
+            start = time.time()
+            while not _heartbeat_stop.wait(5):
+                elapsed = int(time.time() - start)
+                mm, ss = divmod(elapsed, 60)
+                _p(45, f"Extracting guitar melody... ({mm}m {ss:02d}s elapsed)")
+
+        _hb_thread = threading.Thread(target=_melody_heartbeat, daemon=True)
+        _hb_thread.start()
+        try:
+            raw_notes = music_module.extract_melody(analysis_audio)
+        finally:
+            _heartbeat_stop.set()
+            _hb_thread.join(timeout=1)
+
+        melody_notes = music_module.smooth_melody(raw_notes)
+        tab_notes    = music_module.make_tab_notes(melody_notes)
+
+        # --- Stage 5: chords -------------------------------------
+        _p(60, "Detecting chords...")
+        chords = music_module.detect_chords(analysis_audio, tempo_bpm)
+
+        # --- Stage 6: MIDIs --------------------------------------
+        _p(70, "Writing guitar MIDI...")
+        guitar_midi = out_dir / "03_GUITAR_SOLO.mid"
+        music_module.create_guitar_midi(
+            tab_notes, tempo_bpm, guitar_midi,
+            total_duration_seconds=total_duration_seconds,
+        )
+
+        _p(75, "Writing chord MIDI...")
+        chord_midi = out_dir / "04_RHYTHM_CHORDS.mid"
+        music_module.create_chord_midi(
+            chords, tempo_bpm, chord_midi,
+            total_duration_seconds=total_duration_seconds,
+        )
+
+        # --- Stage 7: PDFs ---------------------------------------
+        _p(85, "Generating guitar TAB PDF...")
+        guitar_pdf = out_dir / "01_GUITAR_SOLO_TAB.pdf"
+        music_module.draw_guitar_tab_pdf(tab_notes, tempo_bpm, guitar_pdf)
+
+        _p(92, "Generating chord/rhythm PDF...")
+        chord_pdf = out_dir / "02_RHYTHM_CHORDS.pdf"
+        music_module.draw_chord_pdf(chords, tempo_bpm, chord_pdf)
+
+        # --- Stage 8: text report --------------------------------
+        _p(97, "Writing report...")
+        report_file = out_dir / "TRANSCRIPTION_REPORT.txt"
+        music_module.create_report(
+            report_file, input_path_obj, tempo_bpm, tab_notes, chords,
+            total_duration_seconds=total_duration_seconds,
+        )
+
+        # --- Done ------------------------------------------------
+        with LOCK:
+            JOBS[job_id]["progress"] = 100
+            JOBS[job_id]["status"]   = "Complete!"
+            JOBS[job_id]["output"]   = str(out_dir)
+            JOBS[job_id]["folder"]   = str(out_dir)
+            JOBS[job_id]["files"]    = [
+                p.name for p in sorted(out_dir.iterdir()) if p.is_file()
+            ]
+            JOBS[job_id]["_ts"]      = time.time()
+            _save_job(job_id)
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        with LOCK:
+            JOBS[job_id]["status"]   = f"Error: {e}"
+            JOBS[job_id]["progress"] = 0
+            JOBS[job_id]["_ts"]      = time.time()
+            _save_job(job_id)
+
+
 def _extract_audio_if_needed(input_path):
     """Extracts a .wav from a video file via ffmpeg; passes audio files through untouched."""
     if input_path.lower().endswith(SubtitleEngine.VIDEO_EXTENSIONS):
@@ -1015,6 +1244,8 @@ def job_status(job_id):
             "lyric_video": job["output"] if "video" in job and job.get("keep_vocals") else None,
             "pdf": job.get("pdf"),
             "mp3": job.get("mp3"),
+            "folder": job.get("folder"),
+            "files":  job.get("files"),
         },
         error=None if "Error" not in job["status"] else job["status"],
     )

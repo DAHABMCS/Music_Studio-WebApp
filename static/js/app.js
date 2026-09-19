@@ -11,6 +11,10 @@ const state = {
   timerInterval: null,
   isProcessing: false,
   activeButtonId: null,   // which action button started the current/last job
+  buttonStatus: {         // 'ready' | 'processing' | 'done' — persisted so a
+    btnSrt: 'ready', btnKaraoke: 'ready', btnLyricVideo: 'ready',
+    btnLyrics: 'ready', btnTab: 'ready', btnFull: 'ready',
+  },
   reviewed: {             // has the matching Browse button been clicked
     srt: false, karaoke: false, lyrics: false, tabs: false, transcription: false,
   },
@@ -23,7 +27,13 @@ const $ = (id) => document.getElementById(id);
    ------------------------------------------------------------
    Every job-triggering button starts red (.btn-ready), turns yellow
    (.btn-processing) while its job runs, then green (.btn-done) once
-   it finishes.
+   it finishes. That status is kept in state.buttonStatus AND applied
+   to the DOM together (see setActionButtonState) — previously only
+   the DOM class was set, with nothing persisted, so a page reload had
+   no way to know a button had finished successfully and it silently
+   fell back to red every time (see resetAllButtonStates in
+   restoreSession). Persisting it here and re-applying it in
+   restoreSession fixes that.
 
    Each of the 5 "Browse ... Folder" buttons is paired with one (or
    two, for Karaoke/Lyric Video sharing one folder) action button and
@@ -58,8 +68,52 @@ function setButtonState(id, cls) {
 }
 
 function resetAllButtonStates() {
-  ACTION_BUTTON_IDS.forEach(id => setButtonState(id, 'btn-ready'));
+  ACTION_BUTTON_IDS.forEach(id => {
+    state.buttonStatus[id] = 'ready';
+    setButtonState(id, 'btn-ready');
+  });
   Object.values(KIND_TO_BROWSE_BTN).forEach(id => setButtonState(id, 'btn-ready'));
+}
+
+/* Sets one action button's status in BOTH the DOM and state.buttonStatus
+   (so it can be persisted/restored), then re-derives its paired Browse
+   button's color from the current situation. */
+function setActionButtonState(buttonId, statusWord) {
+  state.buttonStatus[buttonId] = statusWord;
+  setButtonState(buttonId, 'btn-' + statusWord);
+  const kind = ACTION_TO_KIND[buttonId];
+  if (kind) refreshBrowseButtonColor(kind);
+}
+
+/* A Browse button mirrors "processing" from whichever of its paired
+   action button(s) is currently running; otherwise it's green if
+   already reviewed, or red/ready otherwise. Called any time a paired
+   action button's status changes, or reviewed[] changes. */
+function refreshBrowseButtonColor(kind) {
+  const browseBtnId = KIND_TO_BROWSE_BTN[kind];
+  if (!browseBtnId) return;
+
+  const pairedButtonIds = ACTION_BUTTON_IDS.filter(id => ACTION_TO_KIND[id] === kind);
+  const anyProcessing = pairedButtonIds.some(id => state.buttonStatus[id] === 'processing');
+
+  if (anyProcessing) {
+    setButtonState(browseBtnId, 'btn-processing');
+  } else if (state.reviewed[kind]) {
+    setButtonState(browseBtnId, 'btn-done');
+  } else {
+    setButtonState(browseBtnId, 'btn-ready');
+  }
+}
+
+/* Re-applies every persisted color from state.buttonStatus/reviewed —
+   used right after restoring a snapshot on page load, so a page
+   reload shows exactly what was true before it closed instead of
+   resetting everything to red. */
+function applyPersistedButtonColors() {
+  ACTION_BUTTON_IDS.forEach(id => {
+    setButtonState(id, 'btn-' + (state.buttonStatus[id] || 'ready'));
+  });
+  Object.keys(KIND_TO_BROWSE_BTN).forEach(refreshBrowseButtonColor);
 }
 
 /* ============================================================
@@ -79,6 +133,7 @@ function saveSession() {
     srt:       state.srt,
     jobId:     state.jobId,
     activeButtonId: state.activeButtonId,
+    buttonStatus: state.buttonStatus,
     reviewed:  state.reviewed,
     timestamp: Date.now(),
     form: {
@@ -113,19 +168,23 @@ async function restoreSession() {
   state.srt        = snap.srt        || null;
   state.jobId      = snap.jobId      || null;
   state.activeButtonId = snap.activeButtonId || null;
+  state.buttonStatus = Object.assign(
+    { btnSrt: 'ready', btnKaraoke: 'ready', btnLyricVideo: 'ready',
+      btnLyrics: 'ready', btnTab: 'ready', btnFull: 'ready' },
+    snap.buttonStatus || {}
+  );
   state.reviewed   = Object.assign(
     { srt: false, karaoke: false, lyrics: false, tabs: false, transcription: false },
     snap.reviewed || {}
   );
 
-  // Re-apply button colors from the restored state: everything starts
-  // ready(red), a Browse button goes green if it was already reviewed,
-  // and — if a job turns out to still be running below — the relevant
-  // pair goes yellow.
-  resetAllButtonStates();
-  Object.entries(state.reviewed).forEach(([kind, isReviewed]) => {
-    if (isReviewed) setButtonState(KIND_TO_BROWSE_BTN[kind], 'btn-done');
-  });
+  // Re-apply every button's persisted color exactly as it was before
+  // the browser closed — previously this called resetAllButtonStates()
+  // here, which forced every action button back to red regardless of
+  // whether its job had actually finished successfully; only the
+  // Browse buttons' green ("reviewed") survived a reload. Using the
+  // restored buttonStatus map instead fixes that.
+  applyPersistedButtonColors();
 
   // 2. Restore form fields
   const f = snap.form || {};
@@ -139,7 +198,6 @@ async function restoreSession() {
 
   // 3. If a job was running, resume polling or show final result
   if (state.jobId) {
-    const kind = ACTION_TO_KIND[state.activeButtonId];
     try {
       const r = await fetch(`/api/job/${state.jobId}`);
       const j = await r.json();
@@ -148,29 +206,26 @@ async function restoreSession() {
         startTimer();
         setProgress(j.progress || 0);
         setStatus(j.message || 'Resuming…');
-        if (state.activeButtonId) setButtonState(state.activeButtonId, 'btn-processing');
-        if (kind) setButtonState(KIND_TO_BROWSE_BTN[kind], 'btn-processing');
+        if (state.activeButtonId) setActionButtonState(state.activeButtonId, 'processing');
         pollJob();
         setStatus('Resumed previous job');
+        saveSession();
         return;
       }
       if (j.status === 'done') {
         handleResult(j.result);
         setStatus('Previous job finished while you were away');
-        if (state.activeButtonId) setButtonState(state.activeButtonId, 'btn-done');
-        if (kind && !state.reviewed[kind]) setButtonState(KIND_TO_BROWSE_BTN[kind], 'btn-ready');
+        if (state.activeButtonId) setActionButtonState(state.activeButtonId, 'done');
         state.jobId = null;
         saveSession();
       } else if (j.status === 'error') {
         setStatus('Previous job failed: ' + (j.error || ''));
-        if (state.activeButtonId) setButtonState(state.activeButtonId, 'btn-ready');
-        if (kind && !state.reviewed[kind]) setButtonState(KIND_TO_BROWSE_BTN[kind], 'btn-ready');
+        if (state.activeButtonId) setActionButtonState(state.activeButtonId, 'ready');
         state.jobId = null;
         saveSession();
       } else {
         // cancelled / unknown — drop it
-        if (state.activeButtonId) setButtonState(state.activeButtonId, 'btn-ready');
-        if (kind && !state.reviewed[kind]) setButtonState(KIND_TO_BROWSE_BTN[kind], 'btn-ready');
+        if (state.activeButtonId) setActionButtonState(state.activeButtonId, 'ready');
         state.jobId = null;
         saveSession();
       }
@@ -191,6 +246,54 @@ async function restoreSession() {
       }
     } catch { /* ignore */ }
   }
+}
+
+/* ---------- Non-blocking notifications ----------
+   Replaces alert()/confirm()-style popups. Those are native, blocking
+   dialogs — the whole page (including the running-job status/progress
+   updates) is frozen until someone clicks OK, which is disruptive for
+   messages that don't need a decision (e.g. "Karaoke video ready").
+   These toasts show the same information but never block input and
+   dismiss themselves automatically; clicking one dismisses it early. */
+let _noticeContainer = null;
+function _ensureNoticeContainer() {
+  if (_noticeContainer && document.body.contains(_noticeContainer)) return _noticeContainer;
+  _noticeContainer = document.createElement('div');
+  _noticeContainer.id = 'noticeContainer';
+  Object.assign(_noticeContainer.style, {
+    position: 'fixed', top: '16px', right: '16px', zIndex: '9999',
+    display: 'flex', flexDirection: 'column', gap: '8px',
+    maxWidth: '380px',
+  });
+  document.body.appendChild(_noticeContainer);
+  return _noticeContainer;
+}
+
+function showNotice(message, type = 'info', opts = {}) {
+  const container = _ensureNoticeContainer();
+  const palette = {
+    info:    { bg: '#262a33', border: '#2b303b', fg: '#e1e4ea' },
+    success: { bg: '#14321a', border: '#2b8a3e', fg: '#b8e6c1' },
+    warn:    { bg: '#3a2f14', border: '#c98a1f', fg: '#ffe3b0' },
+    error:   { bg: '#3a1a1a', border: '#ff3b30', fg: '#ffcfcc' },
+  };
+  const c = palette[type] || palette.info;
+
+  const el = document.createElement('div');
+  Object.assign(el.style, {
+    background: c.bg, border: `1px solid ${c.border}`, color: c.fg,
+    padding: '10px 14px', borderRadius: '8px', fontSize: '13px',
+    lineHeight: '1.4', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+    boxShadow: '0 8px 22px rgba(0,0,0,0.35)', cursor: 'pointer',
+    fontFamily: 'inherit', pointerEvents: 'auto',
+  });
+  el.textContent = message;
+  el.title = 'Click to dismiss';
+  el.onclick = () => el.remove();
+  container.appendChild(el);
+
+  const duration = opts.duration || (type === 'error' ? 8000 : type === 'warn' ? 4000 : 5000);
+  setTimeout(() => { if (el.parentNode) el.remove(); }, duration);
 }
 
 /* ---------- Input file picker ---------- */
@@ -219,7 +322,7 @@ async function uploadFile(file, kind = 'input') {
     const res = await fetch('/api/upload', { method: 'POST', body: fd });
     const j = await res.json();
     if (j.error) {
-      alert('Upload failed: ' + j.error);
+      showNotice('Upload failed: ' + j.error, 'error');
       return null;
     }
     if (kind === 'input') {
@@ -230,7 +333,7 @@ async function uploadFile(file, kind = 'input') {
     saveSession();
     return j;
   } catch (err) {
-    alert('Upload failed: ' + err.message);
+    showNotice('Upload failed: ' + err.message, 'error');
     return null;
   }
 }
@@ -281,12 +384,7 @@ async function pollJob() {
       state.jobId = null;
       lockButtons(false);
       stopTimer();
-      const kind = ACTION_TO_KIND[state.activeButtonId];
-      if (state.activeButtonId) setButtonState(state.activeButtonId, 'btn-done');
-      // The Browse button's green is earned by actually reviewing the
-      // folder (see browseRemote), not just by the job finishing —
-      // so it drops back to ready(red) here unless already reviewed.
-      if (kind && !state.reviewed[kind]) setButtonState(KIND_TO_BROWSE_BTN[kind], 'btn-ready');
+      if (state.activeButtonId) setActionButtonState(state.activeButtonId, 'done');
       handleResult(j.result);
       saveSession();
       return;
@@ -295,10 +393,8 @@ async function pollJob() {
       state.jobId = null;
       lockButtons(false);
       stopTimer();
-      const kind = ACTION_TO_KIND[state.activeButtonId];
-      if (state.activeButtonId) setButtonState(state.activeButtonId, 'btn-ready');
-      if (kind && !state.reviewed[kind]) setButtonState(KIND_TO_BROWSE_BTN[kind], 'btn-ready');
-      alert('Error: ' + j.error);
+      if (state.activeButtonId) setActionButtonState(state.activeButtonId, 'ready');
+      showNotice('Error: ' + j.error, 'error');
       saveSession();
       return;
     }
@@ -310,7 +406,7 @@ async function pollJob() {
 
 function startJob(res, buttonId) {
   if (!res || res.error) {
-    alert(res && res.error ? res.error : 'Unknown error');
+    showNotice(res && res.error ? res.error : 'Unknown error', 'error');
     return;
   }
   state.jobId = res.job_id;
@@ -320,9 +416,8 @@ function startJob(res, buttonId) {
     // A fresh run invalidates any earlier "reviewed" green for this
     // kind's Browse button — the folder is about to change.
     state.reviewed[kind] = false;
-    setButtonState(KIND_TO_BROWSE_BTN[kind], 'btn-processing');
   }
-  if (buttonId) setButtonState(buttonId, 'btn-processing');
+  if (buttonId) setActionButtonState(buttonId, 'processing');
   lockButtons(true);
   startTimer();
   setProgress(0);
@@ -339,12 +434,12 @@ function handleResult(result) {
   if (result.srt) {
     state.srt = result.srt;
   }
-  if (result.video) alert('Karaoke video ready: ' + result.video);
-  if (result.lyric_video) alert('Lyric video ready: ' + result.lyric_video);
-  if (result.pdf && result.mp3) alert(`Ready:\n${result.pdf}\n${result.mp3}`);
-  else if (result.pdf) alert('PDF ready: ' + result.pdf);
+  if (result.video) showNotice('Karaoke video ready: ' + result.video, 'success');
+  if (result.lyric_video) showNotice('Lyric video ready: ' + result.lyric_video, 'success');
+  if (result.pdf && result.mp3) showNotice(`Ready:\n${result.pdf}\n${result.mp3}`, 'success');
+  else if (result.pdf) showNotice('PDF ready: ' + result.pdf, 'success');
   if (result.folder) {
-    alert(`Transcription ready in folder: ${result.folder}\n\n` +
+    showNotice(`Transcription ready in folder: ${result.folder}\n\n` +
           (result.files || []).join('\n'));
   }
   saveSession();
@@ -352,7 +447,7 @@ function handleResult(result) {
 
 /* ---------- Actions ---------- */
 $('btnSrt').onclick = async () => {
-  if (!state.uploaded) return alert('Choose an input file first');
+  if (!state.uploaded) { showNotice('Choose an input file first', 'warn'); return; }
   const r = await fetch('/api/generate_srt', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -367,7 +462,7 @@ $('btnSrt').onclick = async () => {
 };
 
 $('btnKaraoke').onclick = async () => {
-  if (!state.uploaded || !state.srt) return alert('Generate the SRT first');
+  if (!state.uploaded || !state.srt) { showNotice('Generate the SRT first', 'warn'); return; }
   const r = await fetch('/api/generate_karaoke', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -381,7 +476,7 @@ $('btnKaraoke').onclick = async () => {
 };
 
 $('btnLyricVideo').onclick = async () => {
-  if (!state.uploaded || !state.srt) return alert('Generate the SRT first');
+  if (!state.uploaded || !state.srt) { showNotice('Generate the SRT first', 'warn'); return; }
   const r = await fetch('/api/generate_lyric_video', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -395,7 +490,7 @@ $('btnLyricVideo').onclick = async () => {
 };
 
 $('btnLyrics').onclick = async () => {
-  if (!state.uploaded || !state.srt) return alert('Generate the SRT first');
+  if (!state.uploaded || !state.srt) { showNotice('Generate the SRT first', 'warn'); return; }
   const r = await fetch('/api/export_lyrics', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -409,7 +504,7 @@ $('btnLyrics').onclick = async () => {
 };
 
 $('btnTab').onclick = async () => {
-  if (!state.uploaded) return alert('Choose an input file first');
+  if (!state.uploaded) { showNotice('Choose an input file first', 'warn'); return; }
   const r = await fetch('/api/export_guitar_tab', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -422,7 +517,7 @@ $('btnTab').onclick = async () => {
 };
 
 $('btnFull').onclick = async () => {
-  if (!state.uploaded) return alert('Choose an input file first');
+  if (!state.uploaded) { showNotice('Choose an input file first', 'warn'); return; }
   const r = await fetch('/api/full_transcription', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -456,13 +551,13 @@ $('btnClear').onclick = () => {
 
 $('btnEdit').onclick = () => {
   const srt = $('srtPreview').textContent;
-  if (!srt || srt === '—') return alert('Nothing to edit yet');
+  if (!srt || srt === '—') { showNotice('Nothing to edit yet', 'warn'); return; }
   openEditor(srt);
 };
 
 function copySrtPath() {
   const v = $('outputFilePath').value;
-  if (!v) return alert('No output path yet');
+  if (!v) { showNotice('No output path yet', 'warn'); return; }
 
   // navigator.clipboard only exists in secure contexts (https, or
   // localhost). This dashboard is typically opened over plain http on
@@ -512,11 +607,11 @@ async function browseRemote(kind) {
     const r = await fetch(`/api/browse/${kind}`);
     data = await r.json();
   } catch (e) {
-    alert('Could not load folder: ' + e.message);
+    showNotice('Could not load folder: ' + e.message, 'error');
     return;
   }
   if (data.error) {
-    alert('Could not load folder: ' + data.error);
+    showNotice('Could not load folder: ' + data.error, 'error');
     return;
   }
 
@@ -602,7 +697,7 @@ function openEditor(text) {
       body: JSON.stringify({ srt: state.srt, content: newText }),
     });
     const j = await r.json();
-    if (j.error) return alert('Save failed: ' + j.error);
+    if (j.error) { showNotice('Save failed: ' + j.error, 'error'); return; }
     $('srtPreview').textContent = newText;
     setStatus('SRT saved');
     saveSession();
