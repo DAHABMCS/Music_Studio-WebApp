@@ -30,7 +30,7 @@ body {
 }
 
 /* Only the dashboard locks scrolling to the viewport; other pages
-   (e.g. the login screen) are unaffected. *
+   (e.g. the login screen) are unaffected. */
 body:has(.app-shell) {
   height: 100vh;
   overflow: hidden;
@@ -171,12 +171,11 @@ body:has(.app-shell) .app-header {
    Dashboard shell — 2-column layout
    ============================================================ */
 
-/* Update the outer shell padding to 5px on the sides */
 .app-shell {
   display: grid;
   grid-template-columns: 600px 350px;
   gap: 14px;
-  padding: 12px 14px; /* Changed horizontal padding to 5px */
+  padding: 12px 14px;
   align-items: stretch;
   flex: 1 1 auto;
   min-height: 0;
@@ -185,10 +184,21 @@ body:has(.app-shell) .app-header {
   width: max-content;
   margin-left: auto;
   margin-right: auto;
-
 }
+
 .left-col  { display: flex; flex-direction: column; gap: 10px; min-width: 0; min-height: 0; }
-.right-col { display: flex; flex-direction: column; gap: 6px; min-height: 0; }
+
+/* The right column now gets an explicit height and hides its own
+   overflow, so its children (the SRT frame + the action button row)
+   can be distributed by flexbox without pushing the page taller. */
+.right-col {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+}
 
 /* Tkinter "Labelframe" imitation */
 .lframe {
@@ -364,12 +374,19 @@ body:has(.app-shell) .app-header {
   opacity: .9;
 }
 
-/* SRT Preview panel */
+/* SRT Preview panel
+   ------------------------------------------------------------
+   The frame fills whatever height the right column has, but the
+   preview box inside it gets an explicit fixed height (see .preview
+   below). That means the box scrolls internally when the SRT text
+   is longer than the box, instead of stretching the frame (and the
+   whole page) taller to fit it. */
 .srt-frame {
   display: flex;
   flex-direction: column;
   flex: 1 1 auto;
-  min-height: 0;
+
+  height: 0;              /* lets flex:1 compute from parent height */
 }
 
 .srt-body {
@@ -387,7 +404,7 @@ body:has(.app-shell) .app-header {
   flex: 1;
   min-height: 0;
   max-height: none;
-  overflow: auto;
+  overflow: auto;         /* internal scrollbar kicks in on overflow */
   font-family: Consolas, "Courier New", monospace;
   font-size: 13px;
   line-height: 1.55;
@@ -642,13 +659,11 @@ body.login-body .flash {
   body:has(.app-shell) { overflow: auto; height: auto; }
   .app-shell { grid-template-columns: 1fr; height: auto; overflow: visible; }
   .left-col, .right-col { height: auto; }
-  /* min-height alone let this box grow without limit to fit whatever
-     SRT content was loaded, pushing the rest of the page down instead
-     of scrolling internally — exactly backwards from a "preview" box.
-     Capping it with max-height (equal to min-height, so it's really a
-     fixed height here) forces .preview's own overflow-y: auto (set in
-     the base .preview rule above) to actually kick in and scroll. */
-  .preview { min-height: 300px; max-height: 300px; overflow-y: auto; }
+
+  /* Lock the SRT preview to a fixed height so it always scrolls
+     internally rather than expanding to fit the whole transcript. */
+  .srt-frame { height: auto; }
+  .preview   { height: 300px; max-height: 300px; overflow-y: auto; }
   .right-col { position: static; }
   .actions-grid { grid-template-columns: 1fr 1fr; }
 }
