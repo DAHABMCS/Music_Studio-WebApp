@@ -173,7 +173,7 @@ body:has(.app-shell) .app-header {
 
 .app-shell {
   display: grid;
-  grid-template-columns: 600px 350px;
+  grid-template-columns: 600px 300px;
   gap: 14px;
   padding: 12px 14px;
   align-items: stretch;
@@ -653,7 +653,7 @@ body.login-body .flash {
    Responsive
    ============================================================ */
 
-@media (max-width: 1100px) {
+@media (max-width: 1180px) {
   /* Two columns no longer fit side by side, so this is the one case
      where we allow the page itself to scroll again. */
   body:has(.app-shell) { overflow: auto; height: auto; }
