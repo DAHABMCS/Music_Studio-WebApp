@@ -1051,9 +1051,49 @@ def _run_full_transcription_job(job_id, input_path):
         guitar_pdf = out_dir / "01_GUITAR_SOLO_TAB.pdf"
         music_module.draw_guitar_tab_pdf(tab_notes, tempo_bpm, guitar_pdf)
 
-        _p(92, "Generating chord/rhythm PDF...")
+        _p(88, "Generating chord/rhythm PDF...")
         chord_pdf = out_dir / "02_RHYTHM_CHORDS.pdf"
         music_module.draw_chord_pdf(chords, tempo_bpm, chord_pdf)
+
+        # --- Stage 7b: piano sheet (needs MuseScore installed) ---
+        # Wrapped in try/except and allowed to fail without failing the
+        # whole job: MuseScore is an external dependency the person may
+        # not have installed yet (see find_musescore_executable()'s
+        # clear error message), and a full transcription without a
+        # piano sheet is still a useful result — better to hand back
+        # everything else than lose the whole job over one missing PDF.
+        piano_pdf = out_dir / "05_PIANO_SHEET.pdf"
+        piano_pdf_ok = False
+        try:
+            _p(91, "Generating piano sheet music (via MuseScore)...")
+            music_module.create_piano_sheet_pdf(
+                tab_notes, chords, tempo_bpm, piano_pdf,
+                total_duration_seconds=total_duration_seconds,
+                title=f"{stem} — Piano Arrangement",
+            )
+            piano_pdf_ok = True
+        except Exception as piano_err:
+            print(f"[full_transcription] piano sheet PDF failed, "
+                  f"continuing without it: {piano_err}")
+            _p(91, f"Piano sheet skipped: {piano_err}")
+
+        # --- Stage 7c: fingerstyle (Travis picking) guitar TAB ----
+        fingerstyle_pdf = out_dir / "06_FINGERSTYLE_GUITAR_TAB.pdf"
+        fingerstyle_pdf_ok = False
+        try:
+            _p(95, "Generating fingerstyle guitar TAB...")
+            fingerstyle_events = music_module.build_fingerstyle_arrangement(
+                tab_notes, chords, tempo_bpm,
+            )
+            music_module.draw_fingerstyle_tab_pdf(
+                fingerstyle_events, tempo_bpm, fingerstyle_pdf,
+                title=f"{stem} — Fingerstyle Guitar TAB (Travis Picking)",
+            )
+            fingerstyle_pdf_ok = True
+        except Exception as fs_err:
+            print(f"[full_transcription] fingerstyle TAB PDF failed, "
+                  f"continuing without it: {fs_err}")
+            _p(95, f"Fingerstyle TAB skipped: {fs_err}")
 
         # --- Stage 8: text report --------------------------------
         _p(97, "Writing report...")
@@ -1064,9 +1104,16 @@ def _run_full_transcription_job(job_id, input_path):
         )
 
         # --- Done ------------------------------------------------
+        skipped = []
+        if not piano_pdf_ok:
+            skipped.append("piano sheet")
+        if not fingerstyle_pdf_ok:
+            skipped.append("fingerstyle guitar TAB")
+        final_status = "Complete!" if not skipped else f"Complete (skipped: {', '.join(skipped)})"
+
         with LOCK:
             JOBS[job_id]["progress"] = 100
-            JOBS[job_id]["status"]   = "Complete!"
+            JOBS[job_id]["status"]   = final_status
             JOBS[job_id]["output"]   = str(out_dir)
             JOBS[job_id]["folder"]   = str(out_dir)
             JOBS[job_id]["files"]    = [

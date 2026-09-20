@@ -32,6 +32,7 @@ import sys
 import subprocess
 import shutil
 import math
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -1048,6 +1049,376 @@ def draw_chord_pdf(
 # ============================================================
 # TEXT REPORT
 # ============================================================
+
+# ============================================================
+# CHORD-NAME PARSING (shared by piano LH and fingerstyle bass)
+# ------------------------------------------------------------
+# NOTE: the existing create_chord_midi() only ever plays a chord's
+# ROOT pitch (chord.Chord(root_name) with a single pitch name is just
+# a one-note "chord") — it silently discards the detected quality
+# (m, 7, maj7, etc). The two features below need the FULL chord
+# (root + all its intervals from CHORD_TEMPLATES), so this parses the
+# chord name properly instead of reusing that limited pattern.
+# ============================================================
+def _parse_chord_name(name):
+    """Returns (root_pitch_class 0-11, suffix) for a detected chord
+    name like 'C', 'F#m', 'Bb7' — or None for 'N' (no chord) / a name
+    that can't be parsed at all."""
+    if not name or name == "N":
+        return None
+
+    root_name = name[0]
+    idx = 1
+    if len(name) > 1 and name[1] in ("#", "b"):
+        root_name += name[1]
+        idx = 2
+    suffix = name[idx:]
+    if suffix not in CHORD_TEMPLATES:
+        suffix = ""  # unrecognized quality -> fall back to a plain major triad
+
+    flat_to_sharp = {"Db": "C#", "Eb": "D#", "Gb": "F#", "Ab": "G#", "Bb": "A#"}
+    root_name = flat_to_sharp.get(root_name, root_name)
+    try:
+        root_pc = NOTE_NAMES.index(root_name)
+    except ValueError:
+        return None
+
+    return root_pc, suffix
+
+
+# ============================================================
+# PIANO SHEET MUSIC (RIGHT HAND MELODY + LEFT HAND CHORDS)
+# ------------------------------------------------------------
+# music21 can build the underlying musical data (notes, chords,
+# clefs, a proper Score) but it can NOT render that into an actual
+# readable page of sheet music by itself — that needs a real
+# notation engine. This hands the built Score off to MuseScore's
+# command-line export, the same "shell out to an external tool"
+# pattern already used for ffmpeg/demucs via run_command() above.
+# ============================================================
+def find_musescore_executable():
+    """Looks for a MuseScore 4 (or 3) command-line executable in the
+    common Windows install locations, then falls back to whatever
+    resolves on PATH. Returns a path/command string, or None if
+    nothing was found anywhere."""
+    candidates = [
+        r"C:\Program Files\MuseScore 4\bin\MuseScore4.exe",
+        r"C:\Program Files (x86)\MuseScore 4\bin\MuseScore4.exe",
+        r"C:\Program Files\MuseScore 3\bin\MuseScore3.exe",
+        r"C:\Program Files (x86)\MuseScore 3\bin\MuseScore3.exe",
+    ]
+    for candidate in candidates:
+        if Path(candidate).exists():
+            return candidate
+
+    for cmd in ("MuseScore4", "MuseScore4.exe", "mscore4portable",
+                "MuseScore3", "mscore"):
+        if check_program(cmd):
+            return cmd
+
+    return None
+
+
+def render_score_to_pdf_via_musescore(score, output_pdf_path):
+    """Writes `score` (a music21 Score) to a temporary MusicXML file,
+    then calls MuseScore's CLI export to turn it into a real,
+    professionally-engraved PDF."""
+    musescore_exe = find_musescore_executable()
+    if not musescore_exe:
+        raise RuntimeError(
+            "MuseScore was not found on this machine, so the piano sheet "
+            "PDF can't be rendered. Install MuseScore 4 (free): "
+            "https://musescore.org/ — then try Full Transcription again. "
+            "Checked the common install locations and PATH; found nothing."
+        )
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        xml_path = Path(tmp_dir) / "score.musicxml"
+        score.write("musicxml", fp=str(xml_path))
+        run_command([musescore_exe, str(xml_path), "-o", str(output_pdf_path)])
+
+    return output_pdf_path
+
+
+def build_piano_score(tab_notes, chords, tempo_bpm, total_duration_seconds=None,
+                       title="Full Song — Piano Arrangement"):
+    """Builds a two-staff piano arrangement:
+      - Right hand (treble clef): the extracted melody, note-for-note
+        the same notes already used for the guitar tab.
+      - Left hand (bass clef): a sustained block chord per detected
+        chord segment, using the FULL chord (all intervals from
+        CHORD_TEMPLATES) voiced in a low-piano register.
+
+    This is a simple, honest "cocktail piano" style accompaniment —
+    the left hand holds each chord for its full duration rather than
+    an elaborate broken/arpeggiated pattern. A real arranger would
+    make different voicing choices; this is a reasonable, readable
+    starting point built from what the pipeline actually detects."""
+    from music21 import clef, layout, metadata
+
+    score = stream.Score()
+    score.metadata = metadata.Metadata()
+    score.metadata.title = title
+
+    # ---- Right hand: melody ----
+    rh = stream.Part()
+    rh.partName = "Right Hand"
+    rh.clef = clef.TrebleClef()
+    rh.append(tempo.MetronomeMark(number=tempo_bpm))
+    rh.append(meter.TimeSignature("4/4"))
+
+    cursor = 0.0
+    for n in tab_notes:
+        gap = n["start"] - cursor
+        if gap > 0.05:
+            r = note.Rest()
+            r.duration.quarterLength = max(0.05, gap * tempo_bpm / 60.0)
+            rh.append(r)
+        dur = max(0.10, n["end"] - n["start"])
+        nn = note.Note(n["midi"])
+        nn.duration.quarterLength = max(0.125, dur * tempo_bpm / 60.0)
+        rh.append(nn)
+        cursor = n["start"] + dur
+
+    if total_duration_seconds and total_duration_seconds - cursor > 0.05:
+        r = note.Rest()
+        r.duration.quarterLength = max(0.05, (total_duration_seconds - cursor) * tempo_bpm / 60.0)
+        rh.append(r)
+
+    # ---- Left hand: block chords ----
+    lh = stream.Part()
+    lh.partName = "Left Hand"
+    lh.clef = clef.BassClef()
+    lh.append(tempo.MetronomeMark(number=tempo_bpm))
+    lh.append(meter.TimeSignature("4/4"))
+
+    cursor = 0.0
+    BASS_REGISTER_BASE = 48  # roughly C3 — a natural low-piano LH register
+
+    for item in chords:
+        dur = max(0.05, item["end"] - item["start"])
+        qlen = max(0.25, dur * tempo_bpm / 60.0)
+        parsed = _parse_chord_name(item["chord"])
+
+        if parsed is None:
+            r = note.Rest()
+            r.duration.quarterLength = qlen
+            lh.append(r)
+            cursor = item["end"]
+            continue
+
+        root_pc, suffix = parsed
+        intervals = CHORD_TEMPLATES.get(suffix, CHORD_TEMPLATES[""])
+        pitches = [BASS_REGISTER_BASE + root_pc + iv for iv in intervals]
+        try:
+            ch = chord.Chord(pitches)
+            ch.duration.quarterLength = qlen
+            lh.append(ch)
+        except Exception:
+            r = note.Rest()
+            r.duration.quarterLength = qlen
+            lh.append(r)
+        cursor = item["end"]
+
+    if total_duration_seconds and total_duration_seconds - cursor > 0.05:
+        r = note.Rest()
+        r.duration.quarterLength = max(0.05, (total_duration_seconds - cursor) * tempo_bpm / 60.0)
+        lh.append(r)
+
+    score.append(rh)
+    score.append(lh)
+
+    try:
+        score.insert(0, layout.StaffGroup([rh, lh], symbol="brace", barTogether=True))
+    except Exception:
+        pass  # cosmetic grouping only — shouldn't fail the whole export
+
+    return score
+
+
+def create_piano_sheet_pdf(tab_notes, chords, tempo_bpm, output_file,
+                            total_duration_seconds=None,
+                            title="Full Song — Piano Arrangement"):
+    print("\nCreating piano sheet music PDF (via MuseScore)...")
+    score = build_piano_score(tab_notes, chords, tempo_bpm,
+                               total_duration_seconds, title=title)
+    render_score_to_pdf_via_musescore(score, output_file)
+    return output_file
+
+
+# ============================================================
+# FINGERSTYLE (TRAVIS PICKING / CHET ATKINS STYLE) GUITAR TAB
+# ------------------------------------------------------------
+# A rule-based approximation, not a note-for-note transcription of
+# how a real fingerstyle arranger would voice the song: the thumb
+# plays a classic alternating bass (root on beats 1 & 3, fifth on
+# beats 2 & 4 — the standard "boom-chick" Travis pattern) while the
+# fingers play the already-extracted melody on top at its original
+# pitches/timing. A human arranger would vary the pattern, add
+# passing tones, and adapt it to the song's actual feel; this gives a
+# musically reasonable, playable starting point instead.
+# ============================================================
+def _bass_position_for_pitch_class(pitch_class, previous_position=None):
+    """Finds a fret (0-9) on one of the bottom three strings (E/A/D —
+    strings 6, 5, 4) for `pitch_class`, keeping the thumb's bass line
+    in a natural low register rather than letting it wander onto a
+    treble string the way find_best_guitar_position() might."""
+    best, best_cost = None, None
+    for string_number in (6, 5, 4):
+        open_midi = GUITAR_TUNING[string_number]
+        for fret in range(0, 10):
+            midi_number = open_midi + fret
+            if midi_number % 12 == pitch_class % 12:
+                cost = fret
+                if previous_position:
+                    cost += abs(string_number - previous_position[0]) * 1.5
+                if best_cost is None or cost < best_cost:
+                    best_cost = cost
+                    best = (string_number, fret, midi_number)
+    return best
+
+
+def build_fingerstyle_arrangement(tab_notes, chords, tempo_bpm):
+    """Merges a rule-based alternating-bass line (from `chords`) with
+    the extracted melody (`tab_notes`) into one time-sorted list of
+    note events, each tagged with voice='bass' or voice='melody', for
+    draw_fingerstyle_tab_pdf() to render as a two-voice TAB."""
+    beat_length = 60.0 / tempo_bpm
+    events = []
+    previous_bass_position = None
+
+    for item in chords:
+        parsed = _parse_chord_name(item["chord"])
+        if parsed is None:
+            continue
+        root_pc, suffix = parsed
+        intervals = CHORD_TEMPLATES.get(suffix, CHORD_TEMPLATES[""])
+        fifth_interval = intervals[2] if len(intervals) > 2 else 7
+        fifth_pc = (root_pc + fifth_interval) % 12
+
+        t = item["start"]
+        beat_index = 0
+        while t < item["end"] - 1e-6:
+            pitch_class = root_pc if beat_index % 2 == 0 else fifth_pc
+            position = _bass_position_for_pitch_class(pitch_class, previous_bass_position)
+            if position:
+                string_number, fret, midi_number = position
+                events.append({
+                    "start": t,
+                    "end": min(t + beat_length, item["end"]),
+                    "midi": midi_number,
+                    "string": string_number,
+                    "fret": fret,
+                    "note_name": midi_to_note_name(midi_number),
+                    "voice": "bass",
+                })
+                previous_bass_position = (string_number, fret)
+            t += beat_length
+            beat_index += 1
+
+    for n in tab_notes:
+        event = dict(n)
+        event["voice"] = "melody"
+        events.append(event)
+
+    events.sort(key=lambda e: e["start"])
+    return events
+
+
+def draw_fingerstyle_tab_pdf(
+    events,
+    tempo_bpm,
+    output_file,
+    title="Full Song — Fingerstyle Guitar TAB (Travis Picking)",
+    beats_per_row=16,
+):
+    """Renders a two-voice (bass + melody) guitar TAB using a real
+    TIME-proportional x-axis within each row — unlike
+    draw_guitar_tab_pdf()'s fixed-notes-per-row layout (which spaces
+    purely by note COUNT and would misalign simultaneous bass/melody
+    notes). Rows are split by a fixed number of beats instead, so a
+    bass note and a melody note happening at the same instant land in
+    the same column — essential for a two-voice tab to actually read
+    correctly as one piece of music rather than two unrelated lines."""
+    print("\nCreating fingerstyle guitar TAB PDF...")
+
+    page_width, page_height = A4
+    c = canvas.Canvas(str(output_file), pagesize=A4)
+    margin = 40
+    c.setTitle(title)
+
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(margin, page_height - 45, title)
+
+    if not events:
+        c.setFont("Helvetica", 12)
+        c.drawString(margin, page_height - 100,
+                     "No reliable melody/chords were detected.")
+        c.save()
+        return output_file
+
+    c.setFont("Helvetica", 9)
+    c.drawString(
+        margin, page_height - 60,
+        f"Detected tempo: {tempo_bpm:.1f} BPM    Standard tuning: E A D G B E    "
+        f"Shaded box = thumb (bass)    White box = fingers (melody)"
+    )
+
+    beat_length = 60.0 / tempo_bpm
+    row_duration = beats_per_row * beat_length
+    total_end = max(e["end"] for e in events)
+    num_rows = max(1, math.ceil(total_end / row_duration))
+
+    line_spacing = 12
+    y = page_height - 100
+
+    for row_index in range(num_rows):
+        row_start = row_index * row_duration
+        row_end = row_start + row_duration
+
+        if y < 140:
+            c.showPage()
+            y = page_height - 60
+            c.setFont("Helvetica-Bold", 16)
+            c.drawString(margin, y, title + " — continued")
+            y -= 45
+
+        tab_top = y
+
+        for string_number in range(1, 7):
+            yy = tab_top - (string_number - 1) * line_spacing
+            c.line(margin, yy, page_width - margin, yy)
+            c.setFont("Helvetica-Bold", 7)
+            c.drawString(margin - 20, yy - 3, STRING_NAMES[string_number])
+
+        x_start = margin + 20
+        x_end = page_width - margin - 5
+        usable_width = x_end - x_start
+
+        row_events = [e for e in events if e["start"] < row_end and e["end"] > row_start]
+        for e in row_events:
+            frac = (e["start"] - row_start) / row_duration
+            frac = min(max(frac, 0.0), 1.0)
+            x = x_start + frac * usable_width
+            string_number = e["string"]
+            fret = e["fret"]
+            yy = tab_top - (string_number - 1) * line_spacing
+
+            c.setFillColor(colors.lightgrey if e.get("voice") == "bass" else colors.white)
+            c.rect(x - 5, yy - 4, 10, 8, stroke=1, fill=1)
+
+            c.setFillColor(colors.black)
+            c.setFont("Helvetica-Bold", 8)
+            c.drawCentredString(x, yy - 3, str(fret))
+
+        c.setFont("Helvetica", 7)
+        c.drawString(page_width - 70, tab_top - 90, f"Line {row_index + 1}")
+
+        y = tab_top - 100
+
+    c.save()
+    return output_file
+
 
 def create_report(
     output_file,
