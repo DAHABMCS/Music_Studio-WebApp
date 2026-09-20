@@ -4,14 +4,14 @@
 
 :root {
   --bg: #15171c;
-  --panel: #1d2026;
+  --panel: #2d2e2f;
   --fg: #e1e4ea;
   --muted: #7a8290;
   --accent: #ff3b30;
   --accent-h: #ff5d54;
   --field: #262a33;
   --input: #121418;
-  --border: #2b303b;
+  --border: #730d30;
 }
 
 * { box-sizing: border-box; }
