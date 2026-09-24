@@ -78,8 +78,8 @@
   }
 
   /* ---- Action-button status colors. Only the six job-triggering
-     buttons (Generate Subtitles, Karaoke, Lyric Video, Export Lyrics,
-     Export Guitar Solo Tab, Full Transcription) get these — Stop,
+     buttons (Generate Subtitles, Karaoke, Lyric Video, Create Song,
+     Export Lyrics & Tab, Full Transcription) get these — Stop,
      Clear, Browse and Edit don't have a "processing" lifecycle of
      their own, so they keep the theme's normal button styling.
      States are toggled by app.js: .btn-ready is the default/idle
@@ -221,9 +221,9 @@
               <button class="btn btn-ready" id="btnKaraoke" style="flex:1;" title="Karaoke video without vocals">Karaoke</button>
               <button class="btn btn-ready" id="btnLyricVideo" style="flex:1;" title="Lyric video with vocals included">Lyric Video</button>
             </div>
-            <button class="btn btn-ready" id="btnLyrics">Export Lyrics (PDF+MP3)</button>
-            <button class="btn btn-ready" id="btnTab">Export Guitar Solo Tab (PDF)</button>
-            <button class="btn btn-ready" id="btnFull">Full Transcription (TAB+MIDI)</button>
+            <button class="btn btn-ready" id="btnCreateSong">AI Music Generation</button>
+            <button class="btn btn-ready" id="btnLyricsTab">Lyrics, Guitar Tabs &amp; MP3</button>
+            <button class="btn btn-ready" id="btnFull">Full Transcription </button>
           </div>
 
           <!-- column 2 : Stop / Clear + gear illustration -->
@@ -239,10 +239,10 @@
 
           <!-- column 3 : browse buttons -->
           <div class="actions-col">
-            <button class="btn btn-ready" id="browseSrtBtn" onclick="browseRemote('srt')">Browse SRT Folder</button>
-            <button class="btn btn-ready" id="browseKaraokeBtn" onclick="browseRemote('karaoke')">Browse Karaoke Folder</button>
-            <button class="btn btn-ready" id="browseLyricsBtn" onclick="browseRemote('lyrics')">Browse Lyrics Folder</button>
-            <button class="btn btn-ready" id="browseTabsBtn" onclick="browseRemote('tabs')">Browse Tabs Folder</button>
+            <button class="btn btn-ready" id="browseSrtBtn" onclick="browseRemote('srt')">Browse SRT</button>
+            <button class="btn btn-ready" id="browseKaraokeBtn" onclick="browseRemote('karaoke')">Browse Karaoke</button>
+            <button class="btn btn-ready" id="browseSongsBtn" onclick="browseRemote('songs')">Browse Music</button>
+            <button class="btn btn-ready" id="browseLyricsTabBtn" onclick="browseRemote('lyrics_tab')">Browse Lyrics, Tab &amp; MP3</button>
             <button class="btn btn-ready" id="browseTranscriptionBtn" onclick="browseRemote('transcription')">Browse Transcription</button>
           </div>
 

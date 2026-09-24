@@ -22,3 +22,7 @@ outputs/
 Thumbs.db
 .vscode/
 .idea/
+ACE-Step/
+ACE-Step-1.5/
+.venv/
+.venv-old/

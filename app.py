@@ -263,6 +263,10 @@ def _owns_job(job: dict) -> bool:
 # ============================================================
 @app.route("/login", methods=["GET", "POST"])
 def login():
+    # Already logged in? Go straight to the dashboard.
+    if session.get("user"):
+        return redirect(url_for("dashboard"))
+
     error = None
     if request.method == "POST":
         u = request.form.get("username", "").strip()
@@ -273,7 +277,7 @@ def login():
             session.permanent = True          # survive browser restart
             session["user"] = u
             session["role"] = get_role(user)
-            return redirect(url_for("index"))
+            return redirect(url_for("dashboard"))
 
         error = "Invalid username or password"
 
@@ -372,11 +376,20 @@ def admin_reset_password(username):
 
 
 # ============================================================
-# MAIN PAGE
+# MAIN PAGES
 # ============================================================
 @app.route("/")
+def landing():
+    """Public landing page. If already logged in, skip to dashboard."""
+    if session.get("user"):
+        return redirect(url_for("dashboard"))
+    return render_template("index.html")
+
+
+@app.route("/dashboard")
 @login_required
-def index():
+def dashboard():
+    """Protected app — where the actual work happens."""
     return render_template("dashboard.html", user=session["user"])
 
 
@@ -856,6 +869,138 @@ def _run_tab_job(job_id, input_path, start_sec, end_sec, use_demucs):
             _save_job(job_id)
 
 
+@app.route("/api/export_lyrics_and_tab", methods=["POST"])
+@login_required
+def generate_lyrics_and_tab():
+    """Export Lyrics & Tab (PDF+MP3): the dashboard's "Export Lyrics"
+    and "Export Guitar Solo Tab" buttons were merged into one, so this
+    runs both pipelines back-to-back as a single job. Needs an
+    existing SRT (for the lyrics half), same precondition as the old
+    /api/export_lyrics. Honors the Extract Guitar checkbox for the tab
+    half, same as the old /api/export_guitar_tab."""
+    data = request.get_json(force=True) or {}
+    updir, outdir = user_dirs(session["user"])
+
+    input_path = updir / data.get("path", "")
+    if not input_path.exists():
+        return jsonify(error="Input file not found"), 404
+
+    srt_name = data.get("srt", "")
+    srt_path = outdir / srt_name
+    if not srt_path.exists():
+        return jsonify(error="SRT not found — generate subtitles first"), 404
+
+    chord_method = data.get("chord_method", "advanced")
+    start_sec = float(data.get("start_sec", 0.0))
+    end_sec = data.get("end_sec")
+    end_sec = float(end_sec) if end_sec is not None else None
+    use_demucs = bool(data.get("use_demucs", True))
+
+    job_id = uuid.uuid4().hex[:12]
+    with LOCK:
+        JOBS[job_id] = {
+            "progress": 0,
+            "status":   "Ready",
+            "srt":      "",
+            "output":   "",
+            "input":    str(input_path),
+            "user":     session["user"],
+            "_ts":      time.time(),
+        }
+        _save_job(job_id)
+
+    threading.Thread(
+        target=_run_lyrics_and_tab_job,
+        args=(job_id, str(input_path), str(srt_path), chord_method,
+              start_sec, end_sec, use_demucs),
+        daemon=True,
+    ).start()
+
+    return jsonify(job_id=job_id)
+
+
+def _run_lyrics_and_tab_job(job_id, input_path, srt_path, chord_method,
+                             start_sec, end_sec, use_demucs):
+    """Runs the lyrics export (0-50% of the progress bar) then the
+    guitar tab export (50-100%). Outputs still land in their original,
+    separate folders — Lyrics/<stem>/ and Tabs/<stem>/ — so the
+    combined "Browse Lyrics & Tab Folder" button can just list both
+    (see browse_folder's 'lyrics_tab' kind)."""
+    try:
+        engine = SubtitleEngine()
+
+        with LOCK:
+            user = JOBS[job_id].get("user", "shared")
+
+        def _p(value, status):
+            with LOCK:
+                JOBS[job_id]["progress"] = float(value)
+                JOBS[job_id]["status"]   = status
+                JOBS[job_id]["_ts"]      = time.time()
+                if int(value) % 10 == 0:
+                    _save_job(job_id)
+
+        stem = Path(input_path).stem
+
+        # ---- Part 1: Export Lyrics (PDF + MP3) — 0% to 50% ----
+        _p(2, "Reading subtitles...")
+        srt_text = Path(srt_path).read_text(encoding="utf-8")
+        cues = SubtitleEngine._parse_srt_cues(srt_text)
+        if not cues:
+            raise RuntimeError("No cues found in SRT — nothing to export.")
+
+        lyrics_folder = OUTPUT_DIR / user / "Lyrics" / stem
+        lyrics_folder.mkdir(parents=True, exist_ok=True)
+        lyrics_pdf = lyrics_folder / f"{stem}_lyrics.pdf"
+        lyrics_mp3 = lyrics_folder / f"{stem}.mp3"
+
+        detected, total = engine.export_lyrics_and_mp3(
+            input_path, cues, stem,
+            str(lyrics_pdf), str(lyrics_mp3),
+            chord_method=chord_method,
+            status_callback=lambda msg: _p(25, msg),
+        )
+        _p(50, "Lyrics done — starting guitar solo tab...")
+
+        # ---- Part 2: Export Guitar Solo Tab (PDF) — 50% to 100% ----
+        resolved_end = end_sec
+        if resolved_end is None:
+            _p(52, "Checking track length...")
+            resolved_end = engine.get_audio_duration(input_path)
+
+        tabs_folder = OUTPUT_DIR / user / "Tabs" / stem
+        tabs_folder.mkdir(parents=True, exist_ok=True)
+        tab_pdf = tabs_folder / f"{stem}_solo_tab.pdf"
+
+        engine.export_guitar_tab_pipeline(
+            input_path, start_sec, resolved_end, stem, str(tab_pdf),
+            use_demucs=use_demucs,
+            # engine calls this with its own 0-100 scale for the tab
+            # stage alone — rescale it into the 50-100 half we own.
+            progress_cb=lambda value, status: _p(50 + float(value) / 2, status),
+        )
+
+        with LOCK:
+            JOBS[job_id]["progress"]   = 100
+            JOBS[job_id]["status"]     = "Complete!"
+            JOBS[job_id]["output"]     = str(lyrics_pdf)
+            JOBS[job_id]["pdf"]        = str(lyrics_pdf)
+            JOBS[job_id]["mp3"]        = str(lyrics_mp3)
+            JOBS[job_id]["tab_pdf"]    = str(tab_pdf)
+            JOBS[job_id]["chords_detected"] = f"{detected}/{total}"
+            JOBS[job_id]["_ts"]        = time.time()
+            _save_job(job_id)
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        with LOCK:
+            JOBS[job_id]["status"]   = f"Error: {e}"
+            JOBS[job_id]["progress"] = 0
+            JOBS[job_id]["_ts"]      = time.time()
+            _save_job(job_id)
+
+
 # ============================================================
 # FULL TRANSCRIPTION  (TAB + MIDI + Chords via MUSIC.py)
 # ------------------------------------------------------------
@@ -1291,8 +1436,10 @@ def job_status(job_id):
             "lyric_video": job["output"] if "video" in job and job.get("keep_vocals") else None,
             "pdf": job.get("pdf"),
             "mp3": job.get("mp3"),
+            "tab_pdf": job.get("tab_pdf"),
             "folder": job.get("folder"),
             "files":  job.get("files"),
+            "song":   job.get("song"),
         },
         error=None if "Error" not in job["status"] else job["status"],
     )
@@ -1321,6 +1468,591 @@ def download_output(rel):
     if outdir.resolve() not in target.parents and target != outdir.resolve():
         return jsonify(error="Invalid path"), 400
     return send_from_directory(outdir, rel, as_attachment=True)
+
+
+# ============================================================
+# CREATE SONG  (lyrics + style -> generated song audio)
+# ------------------------------------------------------------
+# The "Create Song" button opens a two-panel modal in the dashboard
+# (Lyrics / Style) and posts both here. This is plumbed onto the same
+# JOBS + _p(progress, status) pattern as every other action button, so
+# app.js's existing polling/status/Stop/Browse machinery works for it
+# unchanged.
+#
+# generate_song_audio() below routes to one of two free, open-source,
+# no-API-key backends, selected by the Backend dropdown in the Create
+# Song modal:
+#
+#   ACE-Step 1.5 (https://github.com/ace-step/ACE-Step-1.5) — lyrics IN,
+#   sung vocals OUT. Matches everything the Lyrics/Style/Singer panels
+#   ask for. It now runs as a SEPARATE REST API server that this app
+#   calls over HTTP (so it can live on this PC, or on a free Colab GPU).
+#   This is the default / recommended choice.
+#
+#   MusicGen (Meta, via Hugging Face transformers) — INSTRUMENTAL ONLY.
+#   It has no lyrics or vocals input at all — text style description
+#   in, instrumental music out. Included as a second option because
+#   it's smaller/faster/more mature than ACE-Step, for quick style/
+#   instrument testing where you don't need the vocals yet.
+#
+# ---- ONE-TIME SETUP (do this on the machine running app.py) ----
+#   # ACE-Step 1.5 (run in its OWN folder/terminal, not this app's venv):
+#   powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+#   git clone https://github.com/ACE-Step/ACE-Step-1.5.git
+#   cd ACE-Step-1.5
+#   uv sync
+#   uv run acestep-api          # serves http://127.0.0.1:8001
+#   # first run auto-downloads the models (several GB).
+#   # Then start this app as usual. To point at a different server
+#   # (e.g. a Colab tunnel URL), set before starting app.py:
+#   #   set ACE_STEP_API_URL=https://xxxx.ngrok-free.app
+#   #   set ACE_STEP_API_KEY=...    (only if you enabled a key on the server)
+#
+#   # MusicGen:
+#   pip install transformers torch            # CPU build of torch is fine
+#   pip install scipy                          # used to write the .wav
+#   # first generation call auto-downloads facebook/musicgen-small
+#   # (~1.2GB) from Hugging Face — needs internet on that first run only.
+#
+# SubtitleEngine (subtitle_engine.py) is unrelated to either of these —
+# it only ANALYZES existing audio (transcribing, stems, chords); it has
+# no generation capability, so Create Song doesn't touch it.
+# ============================================================
+
+# ACE-Step 1.5 runs as its own REST API server (see setup notes above).
+# Override the address with the ACE_STEP_API_URL environment variable —
+# e.g. to a Colab/ngrok URL — without editing this file.
+ACE_STEP_API_URL = os.environ.get("ACE_STEP_API_URL", "http://127.0.0.1:8001").rstrip("/")
+ACE_STEP_API_KEY = os.environ.get("ACE_STEP_API_KEY", "")
+
+# Kept short on purpose — CPU inference time scales with this. Raise it
+# once you've confirmed timing/quality on your machine.
+ACE_STEP_DURATION_SECONDS = float(os.environ.get("ACE_STEP_DURATION_SECONDS", "0") or 0)
+# ^ 0 = automatic: picked from how much lyric text there is (30s..360s).
+#   Set ACE_STEP_DURATION_SECONDS=45 (etc.) to force a fixed length.
+ACE_STEP_INFER_STEPS = 8            # turbo model: 8 is the recommended value
+ACE_STEP_TIMEOUT_SECONDS = 90 * 60  # give up waiting after this long
+ACE_STEP_POLL_SECONDS = 3
+
+
+def generate_song_audio(lyrics, style, instruments, singer, out_path,
+                         backend="ace", progress_cb=None):
+    """Generate a song and write it to out_path. `backend` selects which
+    engine does the work — routed here from the dashboard's Backend
+    dropdown in the Create Song modal:
+
+      "ace"      -> generate_song_audio_ace(...)       lyrics + vocals
+      "musicgen" -> generate_song_audio_musicgen(...)  instrumental only
+    """
+    if backend == "musicgen":
+        return generate_song_audio_musicgen(style, instruments, out_path,
+                                             progress_cb=progress_cb)
+    return generate_song_audio_ace(lyrics, style, instruments, singer, out_path,
+                                    progress_cb=progress_cb)
+
+
+def _ace_http(method, path, payload=None, timeout=60):
+    """Tiny stdlib HTTP helper for the ACE-Step API. Returns raw bytes."""
+    import urllib.request
+    import urllib.error
+
+    headers = {
+        "Content-Type": "application/json",
+        "ngrok-skip-browser-warning": "1",   # harmless unless behind free ngrok
+    }
+    if ACE_STEP_API_KEY:
+        headers["Authorization"] = f"Bearer {ACE_STEP_API_KEY}"
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = urllib.request.Request(ACE_STEP_API_URL + path, data=data,
+                                 headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")[:300]
+        raise RuntimeError(f"ACE-Step server returned HTTP {e.code}: {body}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(
+            f"Can't reach the ACE-Step server at {ACE_STEP_API_URL} ({e.reason}). "
+            "Start it in its own terminal with: cd ACE-Step-1.5 && uv run acestep-api "
+            "(see the comment block above generate_song_audio() for setup)."
+        )
+
+
+import re as _re
+
+
+def _clean_lyrics_for_ace(lyrics):
+    """Reshape typed lyrics into what ACE-Step sings well:
+      * section tags on their own line ([verse], [chorus] ...)
+      * short sung lines (~7 words) instead of one long blob
+      * an "[Instrumental]"-style tag that has lyrics under it is really
+        a sung section, so it becomes [verse]/[chorus] — leaving it as
+        instrumental tells the model NOT to sing those words.
+    """
+    tag_re = _re.compile(r"^\s*\[(.+?)\]\s*$")
+    sections = []          # [tag_or_None, [text pieces]]
+    for line in lyrics.replace("\r", "").split("\n"):
+        m = tag_re.match(line)
+        if m:
+            sections.append([m.group(1).strip(), []])
+        elif line.strip():
+            if not sections:
+                sections.append([None, []])
+            sections[-1][1].append(line.strip())
+
+    known_sung = {"verse", "chorus", "pre-chorus", "prechorus", "bridge", "outro", "hook"}
+    cycle = ["verse", "chorus"]
+    n_sung = 0
+    out = []
+    for tag, pieces in sections:
+        text = " ".join(pieces).strip()
+        low = (tag or "").lower()
+        # "Chorus - Group vocals" / "Verse 2: soft" -> head word "chorus"/"verse"
+        head = _re.split(r"\s*[-:–—]\s*", low, maxsplit=1)[0]
+        base = _re.sub(r"[\s\d]+$", "", head)          # "verse 2" -> "verse"
+        if text:
+            if base in known_sung:
+                final = tag
+            else:                                       # None / instrumental / unknown
+                final = cycle[n_sung % 2]
+            n_sung += 1
+            # Keep the user's own short lines as they are; only re-wrap
+            # over-long lines (a blob of text on one line can't be sung).
+            lines = []
+            for piece in pieces:
+                pw = piece.split()
+                if len(pw) <= 10:
+                    lines.append(piece)
+                    continue
+                cur = []
+                for w in pw:
+                    cur.append(w)
+                    if len(cur) >= 7 or (len(cur) >= 3 and w[-1] in ",.;:!?"):
+                        lines.append(" ".join(cur)); cur = []
+                if cur:
+                    lines.append(" ".join(cur))
+            out.append(f"[{final}]\n" + "\n".join(lines))
+        else:
+            if tag is not None:
+                out.append(f"[{tag}]")
+    return "\n\n".join(out) if out else lyrics
+
+
+def _needed_seconds(lyrics_for_model):
+    """Rough song length (seconds) so the words actually fit. Too short a
+    duration for the amount of text = rushed, garbled or missing vocals."""
+    words = 0
+    empty_inst = 0
+    for line in lyrics_for_model.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("["):
+            if "inst" in line.lower() or "intro" in line.lower():
+                empty_inst += 1
+            continue
+        words += len(line.split())
+    return float(round(words * 0.9 + 12 + empty_inst * 10))
+
+
+def _auto_duration(lyrics_for_model):
+    """Needed time, kept inside the 30s..360s range the server allows."""
+    return float(max(30, min(360, _needed_seconds(lyrics_for_model))))
+
+
+def _guess_vocal_language(text):
+    """Pick ACE-Step's vocal_language from the script the lyrics are
+    written in. Wrong language = weak or missing vocals, so this matters.
+    Override with the ACE_STEP_VOCAL_LANGUAGE env var (e.g. "ar")."""
+    forced = os.environ.get("ACE_STEP_VOCAL_LANGUAGE", "").strip()
+    if forced:
+        return forced
+    counts = {"ar": 0, "zh": 0, "ja": 0, "ko": 0, "ru": 0}
+    for ch in text:
+        o = ord(ch)
+        if 0x0600 <= o <= 0x06FF or 0x0750 <= o <= 0x077F:
+            counts["ar"] += 1
+        elif 0x4E00 <= o <= 0x9FFF:
+            counts["zh"] += 1
+        elif 0x3040 <= o <= 0x30FF:
+            counts["ja"] += 1
+        elif 0xAC00 <= o <= 0xD7AF:
+            counts["ko"] += 1
+        elif 0x0400 <= o <= 0x04FF:
+            counts["ru"] += 1
+    best = max(counts, key=counts.get)
+    if counts["ja"]:            # Japanese mixes kanji with kana
+        return "ja"
+    return best if counts[best] >= 3 else "en"
+
+
+def generate_song_audio_ace(lyrics, style, instruments, singer, out_path, progress_cb=None):
+    """Generate a song from lyrics + style and write it to out_path, by
+    calling a running ACE-Step 1.5 REST API server (local or remote)."""
+
+    warn_prefix = ""
+
+    def _p(value, status):
+        if progress_cb:
+            progress_cb(value, warn_prefix + status)
+
+    # Fold instruments + singer into ACE-Step's single "prompt" field —
+    # it doesn't have separate instrument/singer inputs, just one style
+    # description string plus the lyrics block.
+    tags_parts = [style.strip()] if style.strip() else []
+    # Vocals go FIRST (right after the genre) so a long instrument list
+    # can't drown them out. "auto" still asks for a singer.
+    if singer != "instrumental":
+        if singer and singer != "auto":
+            tags_parts.append(f"{singer} vocals, lead vocals, singing")
+        else:
+            tags_parts.append("vocals, lead vocals, singing")
+    if instruments:
+        tags_parts.append(", ".join(instruments))
+    tags = ", ".join(p for p in tags_parts if p) or "pop"
+
+    # ACE-Step's own convention for "no vocals" is a literal [instrumental]
+    # lyrics block rather than a separate flag.
+    if singer == "instrumental":
+        lyrics_for_model = "[instrumental]"
+    else:
+        lyrics_for_model = _clean_lyrics_for_ace(lyrics)
+    vocal_language = _guess_vocal_language(lyrics_for_model)
+    duration = ACE_STEP_DURATION_SECONDS or _auto_duration(lyrics_for_model)
+    needed = _needed_seconds(lyrics_for_model)
+    if singer != "instrumental" and needed > duration + 5:
+        warn_prefix = (f"WARNING: these lyrics need about {needed / 60:.1f} min but this song is "
+                       f"limited to {duration / 60:.1f} min, so the end may be rushed or cut off. "
+                       "Shorten the lyrics or remove repeated sections. | ")
+        print("[ACE-Step] " + warn_prefix, flush=True)
+    print(f"[ACE-Step] sending: prompt={tags!r} vocal_language={vocal_language} "
+          f"duration={duration}s\n--- lyrics sent ---\n{lyrics_for_model}\n-------------------",
+          flush=True)
+
+    _p(18, f"Connecting to ACE-Step server at {ACE_STEP_API_URL}...")
+    _ace_http("GET", "/health", timeout=15)
+
+    _p(25, f"Submitting ~{int(duration)}s song to ACE-Step "
+           "(first run downloads models on the server — can take a while)...")
+    submit = json.loads(_ace_http("POST", "/release_task", {
+        "prompt": tags,
+        "lyrics": lyrics_for_model,
+        "audio_duration": duration,
+        "inference_steps": ACE_STEP_INFER_STEPS,
+        "batch_size": 1,
+        "vocal_language": vocal_language,
+        "audio_format": "wav",
+        # LM features off: faster and lighter, esp. on CPU / small GPUs.
+        "thinking": False,
+        "use_cot_caption": False,
+        "use_cot_language": False,
+    }).decode("utf-8"))
+    task_id = ((submit or {}).get("data") or {}).get("task_id")
+    if not task_id:
+        raise RuntimeError(f"ACE-Step did not accept the task: {submit!r}")
+
+    # Poll until the task is done or failed. The reply shape is checked
+    # loosely on purpose (status as int/str, data as list/dict, result as
+    # JSON string or list) and the raw reply is logged to the console so a
+    # mismatch is visible right away instead of after a long timeout.
+    def _parse_result(raw):
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                return []
+        if isinstance(raw, dict):
+            raw = [raw]
+        return raw if isinstance(raw, list) else []
+
+    started = time.time()
+    last_log = -999.0
+    file_path = None
+    while True:
+        elapsed = time.time() - started
+        if elapsed > ACE_STEP_TIMEOUT_SECONDS:
+            raise RuntimeError(
+                f"ACE-Step took longer than {ACE_STEP_TIMEOUT_SECONDS // 60} minutes "
+                "— giving up. Try a shorter duration or a faster machine."
+            )
+        reply = json.loads(_ace_http("POST", "/query_result",
+                                     {"task_id_list": [task_id]}).decode("utf-8"))
+        if elapsed - last_log >= 30:
+            last_log = elapsed
+            print(f"[ACE-Step] query_result after {int(elapsed)}s: {str(reply)[:700]}", flush=True)
+
+        rows = (reply or {}).get("data")
+        if isinstance(rows, dict):
+            rows = [rows]
+        entry = (rows or [None])[0] or {}
+        status = entry.get("status")
+        items = _parse_result(entry.get("result"))
+
+        for item in items:
+            if isinstance(item, dict) and item.get("file"):
+                file_path = item["file"]
+                break
+        if file_path:
+            break
+        if str(status).lower() in ("1", "succeeded", "success", "completed", "done"):
+            raise RuntimeError(f"ACE-Step reports success but returned no audio file: {entry!r}")
+        if str(status).lower() in ("2", "failed", "error"):
+            raise RuntimeError(f"ACE-Step failed to generate the song: {entry.get('result')!r}")
+
+        # Creep progress from 30 -> 85 while we wait (no real % from the API).
+        _p(min(85, 30 + elapsed / 20),
+           f"Generating song... {int(elapsed)}s elapsed (CPU can be slow, sit tight)")
+        time.sleep(ACE_STEP_POLL_SECONDS)
+
+    _p(90, "Downloading generated audio...")
+    audio = _ace_http("GET", file_path if file_path.startswith("/") else "/" + file_path,
+                      timeout=300)
+    if not audio:
+        raise RuntimeError("ACE-Step returned an empty audio file.")
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(out_path).write_bytes(audio)
+
+
+# Populated on first use by generate_song_audio_musicgen() — same reasoning
+# as the ACE-Step singleton above: load once, reuse for the life of the
+# process. MusicGen has NO lyrics/vocals input at all — it only takes a
+# text style description — so `lyrics` and `singer` are intentionally not
+# passed to it; the dashboard shows a note about this when MusicGen is
+# selected (see the Backend dropdown handling in app.js).
+_MUSICGEN_MODEL = None
+_MUSICGEN_PROCESSOR = None
+_MUSICGEN_LOCK = threading.Lock()
+
+MUSICGEN_MODEL_ID = "facebook/musicgen-small"   # smallest checkpoint = fastest on CPU
+MUSICGEN_MAX_NEW_TOKENS = 512                    # roughly ~10s of audio at 50 tokens/sec
+
+
+def generate_song_audio_musicgen(style, instruments, out_path, progress_cb=None):
+    """Generate INSTRUMENTAL audio (no vocals, lyrics ignored) from a style
+    description, using Meta's MusicGen via Hugging Face transformers
+    (CPU-capable, no GPU required)."""
+    global _MUSICGEN_MODEL, _MUSICGEN_PROCESSOR
+
+    def _p(value, status):
+        if progress_cb:
+            progress_cb(value, status)
+
+    try:
+        from transformers import AutoProcessor, MusicgenForConditionalGeneration
+    except ImportError:
+        raise RuntimeError(
+            "MusicGen isn't installed. On the machine running app.py: "
+            "pip install transformers torch (the CPU build of torch is fine)."
+        )
+
+    with _MUSICGEN_LOCK:
+        if _MUSICGEN_MODEL is None:
+            _p(18, f"Loading {MUSICGEN_MODEL_ID} (first run downloads it "
+                    "from Hugging Face)...")
+            _MUSICGEN_PROCESSOR = AutoProcessor.from_pretrained(MUSICGEN_MODEL_ID)
+            _MUSICGEN_MODEL = MusicgenForConditionalGeneration.from_pretrained(MUSICGEN_MODEL_ID)
+
+    prompt_parts = [style.strip()] if style.strip() else []
+    if instruments:
+        prompt_parts.append(", ".join(instruments))
+    prompt = ", ".join(p for p in prompt_parts if p) or "instrumental music"
+
+    _p(30, "Generating instrumental audio with MusicGen (no vocals — "
+            "lyrics aren't used by this backend)...")
+
+    inputs = _MUSICGEN_PROCESSOR(text=[prompt], padding=True, return_tensors="pt")
+    audio_values = _MUSICGEN_MODEL.generate(**inputs, max_new_tokens=MUSICGEN_MAX_NEW_TOKENS)
+    sampling_rate = _MUSICGEN_MODEL.config.audio_encoder.sampling_rate
+
+    _p(90, "Saving generated audio...")
+    import scipy.io.wavfile
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    scipy.io.wavfile.write(str(out_path), rate=sampling_rate,
+                            data=audio_values[0, 0].cpu().numpy())
+
+
+@app.route("/api/create_song", methods=["POST"])
+@login_required
+def create_song():
+    data = request.get_json(force=True) or {}
+
+    lyrics = (data.get("lyrics") or "").strip()
+    if not lyrics:
+        return jsonify(error="Lyrics can't be empty"), 400
+
+    title = (data.get("title") or "").strip() or "Untitled Song"
+    style = (data.get("style") or "").strip()
+    singer = data.get("singer") or "auto"
+    instruments = data.get("instruments") or []
+    if not isinstance(instruments, list):
+        instruments = [str(instruments)]
+    instruments = [str(i) for i in instruments]
+
+    backend = data.get("backend") or "ace"
+    if backend not in ("ace", "musicgen"):
+        return jsonify(error=f"Unknown backend: {backend}"), 400
+
+    job_id = uuid.uuid4().hex[:12]
+    with LOCK:
+        JOBS[job_id] = {
+            "progress": 0,
+            "status":   "Ready",
+            "srt":      "",
+            "output":   "",
+            "input":    "",
+            "user":     session["user"],
+            "_ts":      time.time(),
+        }
+        _save_job(job_id)
+
+    threading.Thread(
+        target=_run_create_song_job,
+        args=(job_id, title, lyrics, style, instruments, singer, backend),
+        daemon=True,
+    ).start()
+
+    return jsonify(job_id=job_id)
+
+
+def _run_create_song_job(job_id, title, lyrics, style, instruments, singer, backend="ace"):
+    try:
+        with LOCK:
+            user = JOBS[job_id].get("user", "shared")
+
+        def _p(value, status):
+            with LOCK:
+                JOBS[job_id]["progress"] = float(value)
+                JOBS[job_id]["status"]   = status
+                JOBS[job_id]["_ts"]      = time.time()
+                if int(value) % 10 == 0:
+                    _save_job(job_id)
+
+        _p(5, "Preparing song request...")
+
+        stem = secure_filename(title) or "song"
+        songs_folder = OUTPUT_DIR / user / "Songs" / f"{stem}_{int(time.time())}"
+        songs_folder.mkdir(parents=True, exist_ok=True)
+
+        # Write the request metadata first, so it's browsable even if
+        # generation below fails partway through (see generate_song_audio).
+        (songs_folder / "lyrics.txt").write_text(lyrics, encoding="utf-8")
+        (songs_folder / "song_request.json").write_text(json.dumps({
+            "title": title,
+            "style": style,
+            "singer": singer,
+            "instruments": instruments,
+            "backend": backend,
+        }, indent=2), encoding="utf-8")
+
+        _p(15, f"Generating song with {backend}...")
+        # .wav, not .mp3 — both backends output WAV audio.
+        out_path = songs_folder / f"{stem}.wav"
+        generate_song_audio(lyrics, style, instruments, singer,
+                             str(out_path), backend=backend, progress_cb=_p)
+
+        with LOCK:
+            JOBS[job_id]["progress"] = 100
+            JOBS[job_id]["status"]   = "Complete!"
+            JOBS[job_id]["output"]   = str(out_path)
+            JOBS[job_id]["song"]     = str(out_path)
+            JOBS[job_id]["folder"]   = str(songs_folder)
+            JOBS[job_id]["files"]    = [p.name for p in songs_folder.iterdir() if p.is_file()]
+            JOBS[job_id]["_ts"]      = time.time()
+            _save_job(job_id)
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        with LOCK:
+            JOBS[job_id]["status"]   = f"Error: {e}"
+            JOBS[job_id]["progress"] = 0
+            JOBS[job_id]["_ts"]      = time.time()
+            _save_job(job_id)
+
+
+# ============================================================
+# SAVED AI SETUPS ("presets") — save / list / load / delete
+# Stored per user in outputs/<user>/Presets/<name>.json
+# ============================================================
+
+PRESET_KEYS = ("title", "style", "singer", "instruments", "backend", "lyrics")
+PRESET_MAX_BYTES = 200_000
+
+
+def _preset_dir():
+    _, outdir = user_dirs(session["user"])
+    d = outdir / "Presets"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _preset_path(name):
+    stem = secure_filename((name or "").strip())
+    if not stem:
+        return None, None
+    return stem, _preset_dir() / f"{stem}.json"
+
+
+@app.route("/api/song_presets", methods=["GET"])
+@login_required
+def list_song_presets():
+    items = []
+    for f in sorted(_preset_dir().glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        items.append({"name": f.stem, "saved": int(f.stat().st_mtime)})
+    return jsonify(presets=items)
+
+
+@app.route("/api/song_presets", methods=["POST"])
+@login_required
+def save_song_preset():
+    data = request.get_json(force=True, silent=True) or {}
+    stem, path = _preset_path(data.get("name"))
+    if not stem:
+        return jsonify(error="Give the setup a name"), 400
+    settings = data.get("settings") or {}
+    if not isinstance(settings, dict):
+        return jsonify(error="Invalid settings"), 400
+
+    clean = {}
+    for k in PRESET_KEYS:
+        if k in settings:
+            v = settings[k]
+            if k == "instruments":
+                v = v if isinstance(v, list) else [v]
+                v = [str(i) for i in v]
+            else:
+                v = str(v)
+            clean[k] = v
+    if not clean:
+        return jsonify(error="Nothing to save"), 400
+    blob = json.dumps({"name": stem, "settings": clean}, indent=2, ensure_ascii=False)
+    if len(blob.encode("utf-8")) > PRESET_MAX_BYTES:
+        return jsonify(error="Setup is too large to save"), 400
+    path.write_text(blob, encoding="utf-8")
+    return jsonify(ok=True, name=stem)
+
+
+@app.route("/api/song_presets/<name>", methods=["GET"])
+@login_required
+def load_song_preset(name):
+    stem, path = _preset_path(name)
+    if not stem or not path.exists():
+        return jsonify(error="Saved setup not found"), 404
+    try:
+        return jsonify(json.loads(path.read_text(encoding="utf-8")))
+    except Exception:
+        return jsonify(error="That saved setup is damaged"), 500
+
+
+@app.route("/api/song_presets/<name>", methods=["DELETE"])
+@login_required
+def delete_song_preset(name):
+    stem, path = _preset_path(name)
+    if not stem or not path.exists():
+        return jsonify(error="Saved setup not found"), 404
+    path.unlink()
+    return jsonify(ok=True)
 
 
 # ============================================================
@@ -1400,16 +2132,19 @@ def cancel_job(job_id):
 @login_required
 def browse_folder(kind):
     """
-    Show the user's output folder for `kind`.
+    Show the user's output folder(s) for `kind`.
 
-    Each kind now has ONE top-level folder — outputs/<user>/<Kind>/ —
+    Most kinds have ONE top-level folder — outputs/<user>/<Kind>/ —
     with a subfolder per song inside it (see _run_pipeline,
-    _run_video_job, _run_lyrics_job, _run_tab_job). That means there's
-    a single, well-defined folder to point at: "the folder to view and
-    its subfolders" is exactly outputs/<user>/<Kind>/.
+    _run_video_job, _run_lyrics_and_tab_job, _run_create_song_job).
+    The "lyrics_tab" kind is the exception: the dashboard's "Export
+    Lyrics" and "Export Guitar Solo Tab" buttons were merged into one
+    ("Export Lyrics & Tab"), but their outputs still live in the two
+    separate folders they always did (Lyrics/ and Tabs/), so its one
+    Browse button here just lists/opens both.
 
     If the request is coming from the same machine that's running this
-    server, we open that folder in the real, native OS file explorer
+    server, we open the folder(s) in the real, native OS file explorer
     (Explorer/Finder/whatever). The person clicking the button is
     sitting at this machine, so there's no ambiguity about whose
     window should pop up.
@@ -1418,29 +2153,42 @@ def browse_folder(kind):
     is no way for a web page to open a native file-explorer window on
     the REQUESTING device — no browser grants any website that
     capability, for security reasons, regardless of framework. So for
-    remote requests we fall back to an in-page listing with per-file
-    download links, letting that device pull the files down to itself.
+    remote requests we fall back to an in-page listing (merged across
+    all of this kind's folders) with per-file download links, letting
+    that device pull the files down to itself.
     """
     _, outdir = user_dirs(session["user"])
 
-    folder_name_for_kind = {
-        "srt":           "SRT",
-        "karaoke":       "Karaoke",
-        "lyrics":        "Lyrics",
-        "tabs":          "Tabs",
-        "transcription": "Transcription",
+    folder_names_for_kind = {
+        "srt":           ["SRT"],
+        "karaoke":       ["Karaoke"],
+        "lyrics_tab":    ["Lyrics", "Tabs"],
+        "transcription": ["Transcription"],
+        "songs":         ["Songs"],
     }
-    folder_name = folder_name_for_kind.get(kind)
-    if folder_name is None:
+    folder_names = folder_names_for_kind.get(kind)
+    if folder_names is None:
         return jsonify(error=f"Unknown browse kind: {kind}"), 400
 
-    target = outdir / folder_name
-    target.mkdir(parents=True, exist_ok=True)
+    targets = []
+    for name in folder_names:
+        t = outdir / name
+        t.mkdir(parents=True, exist_ok=True)
+        targets.append(t)
 
-    if _is_local_request() and _open_native_folder(target):
-        return jsonify(ok=True, opened=True, path=folder_name)
+    display_path = " & ".join(folder_names)
 
-    found = [p for p in target.rglob("*") if p.is_file()]
+    if _is_local_request():
+        opened_any = False
+        for t in targets:
+            if _open_native_folder(t):
+                opened_any = True
+        if opened_any:
+            return jsonify(ok=True, opened=True, path=display_path)
+
+    found = []
+    for t in targets:
+        found.extend(p for p in t.rglob("*") if p.is_file())
     found.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     files = [{
         "name":    p.name,
@@ -1448,7 +2196,7 @@ def browse_folder(kind):
         "size_mb": round(p.stat().st_size / (1024 * 1024), 2),
     } for p in found]
 
-    return jsonify(ok=True, opened=False, path=folder_name, files=files)
+    return jsonify(ok=True, opened=False, path=display_path, files=files)
 
 
 # ============================================================

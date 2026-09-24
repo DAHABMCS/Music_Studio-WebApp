@@ -13,10 +13,10 @@ const state = {
   activeButtonId: null,   // which action button started the current/last job
   buttonStatus: {         // 'ready' | 'processing' | 'done' — persisted so a
     btnSrt: 'ready', btnKaraoke: 'ready', btnLyricVideo: 'ready',
-    btnLyrics: 'ready', btnTab: 'ready', btnFull: 'ready',
+    btnCreateSong: 'ready', btnLyricsTab: 'ready', btnFull: 'ready',
   },
   reviewed: {             // has the matching Browse button been clicked
-    srt: false, karaoke: false, lyrics: false, tabs: false, transcription: false,
+    srt: false, karaoke: false, lyrics_tab: false, transcription: false, songs: false,
   },
 };
 
@@ -46,8 +46,8 @@ const ACTION_TO_KIND = {
   btnSrt:        'srt',
   btnKaraoke:    'karaoke',
   btnLyricVideo: 'karaoke',
-  btnLyrics:     'lyrics',
-  btnTab:        'tabs',
+  btnCreateSong: 'songs',
+  btnLyricsTab:  'lyrics_tab',
   btnFull:       'transcription',
 };
 const ACTION_BUTTON_IDS = Object.keys(ACTION_TO_KIND);
@@ -55,8 +55,8 @@ const ACTION_BUTTON_IDS = Object.keys(ACTION_TO_KIND);
 const KIND_TO_BROWSE_BTN = {
   srt:           'browseSrtBtn',
   karaoke:       'browseKaraokeBtn',
-  lyrics:        'browseLyricsBtn',
-  tabs:          'browseTabsBtn',
+  songs:         'browseSongsBtn',
+  lyrics_tab:    'browseLyricsTabBtn',
   transcription: 'browseTranscriptionBtn',
 };
 
@@ -170,11 +170,11 @@ async function restoreSession() {
   state.activeButtonId = snap.activeButtonId || null;
   state.buttonStatus = Object.assign(
     { btnSrt: 'ready', btnKaraoke: 'ready', btnLyricVideo: 'ready',
-      btnLyrics: 'ready', btnTab: 'ready', btnFull: 'ready' },
+      btnCreateSong: 'ready', btnLyricsTab: 'ready', btnFull: 'ready' },
     snap.buttonStatus || {}
   );
   state.reviewed   = Object.assign(
-    { srt: false, karaoke: false, lyrics: false, tabs: false, transcription: false },
+    { srt: false, karaoke: false, lyrics_tab: false, transcription: false, songs: false },
     snap.reviewed || {}
   );
 
@@ -363,7 +363,7 @@ function setProgress(p)   { $('progressBar').style.width = (p || 0) + '%'; }
 /* ---------- Button locking ---------- */
 function lockButtons(lock) {
   state.isProcessing = lock;
-  ['btnSrt', 'btnKaraoke', 'btnLyricVideo', 'btnLyrics', 'btnTab', 'btnFull'].forEach(id => {
+  ['btnSrt', 'btnKaraoke', 'btnLyricVideo', 'btnCreateSong', 'btnLyricsTab', 'btnFull'].forEach(id => {
     const el = $(id);
     if (el) el.disabled = lock;
   });
@@ -438,10 +438,12 @@ function handleResult(result) {
   if (result.lyric_video) showNotice('Lyric video ready: ' + result.lyric_video, 'success');
   if (result.pdf && result.mp3) showNotice(`Ready:\n${result.pdf}\n${result.mp3}`, 'success');
   else if (result.pdf) showNotice('PDF ready: ' + result.pdf, 'success');
+  if (result.tab_pdf) showNotice('Guitar tab ready: ' + result.tab_pdf, 'success');
   if (result.folder) {
     showNotice(`Transcription ready in folder: ${result.folder}\n\n` +
           (result.files || []).join('\n'));
   }
+  if (result.song) showNotice('Song ready: ' + result.song, 'success');
   saveSession();
 }
 
@@ -489,31 +491,19 @@ $('btnLyricVideo').onclick = async () => {
   startJob(await r.json(), 'btnLyricVideo');
 };
 
-$('btnLyrics').onclick = async () => {
+$('btnLyricsTab').onclick = async () => {
   if (!state.uploaded || !state.srt) { showNotice('Generate the SRT first', 'warn'); return; }
-  const r = await fetch('/api/export_lyrics', {
+  const r = await fetch('/api/export_lyrics_and_tab', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       path: state.uploaded.path,
       srt: state.srt,
       chord_method: $('chordMethod').value,
-    }),
-  });
-  startJob(await r.json(), 'btnLyrics');
-};
-
-$('btnTab').onclick = async () => {
-  if (!state.uploaded) { showNotice('Choose an input file first', 'warn'); return; }
-  const r = await fetch('/api/export_guitar_tab', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      path: state.uploaded.path,
       use_demucs: $('useDemucs').checked,
     }),
   });
-  startJob(await r.json(), 'btnTab');
+  startJob(await r.json(), 'btnLyricsTab');
 };
 
 $('btnFull').onclick = async () => {
@@ -524,6 +514,10 @@ $('btnFull').onclick = async () => {
     body: JSON.stringify({ path: state.uploaded.path }),
   });
   startJob(await r.json(), 'btnFull');
+};
+
+$('btnCreateSong').onclick = () => {
+  openCreateSongModal();
 };
 
 $('btnStop').onclick = async () => {
@@ -544,7 +538,7 @@ $('btnClear').onclick = () => {
   setStatus('Ready');
   stopTimer();
   state.activeButtonId = null;
-  state.reviewed = { srt: false, karaoke: false, lyrics: false, tabs: false, transcription: false };
+  state.reviewed = { srt: false, karaoke: false, lyrics_tab: false, transcription: false, songs: false };
   resetAllButtonStates();
   clearSession();
 };
@@ -671,6 +665,350 @@ function escapeHtml(str) {
   const div = document.createElement('div');
   div.textContent = str;
   return div.innerHTML;
+}
+
+/* ---------- Create Song modal ----------
+   Two panels: Lyrics (verses/chorus/etc, free text) and Style (genre,
+   instruments, singer). "Generate" posts both to /api/create_song and
+   feeds the job into the same status/progress/polling pipeline every
+   other action button uses (see startJob/pollJob). "Browse Output"
+   just calls the existing browseRemote('songs') used by the
+   "Browse Songs Folder" action-grid button.
+
+   Fields persist across modal opens via localStorage (same pattern as
+   STORAGE_KEY above): "Save" writes the current fields to
+   SONG_DRAFT_KEY, and every time the modal is opened it auto-loads
+   whatever was last saved there. "Clear" wipes both the on-screen
+   fields and the saved draft. Nothing is auto-saved on close/cancel —
+   only explicit Save persists, per how this was asked for. */
+const SONG_DRAFT_KEY = 'musicStudio.songDraft.v1';
+
+const INSTRUMENT_OPTIONS = [
+  'Guitar', 'Piano', 'Drums', 'Bass', 'Strings',
+  'Synth', 'Saxophone', 'Violin', 'Acoustic Guitar', 'Choir',
+];
+
+function loadSongDraft() {
+  try {
+    return JSON.parse(localStorage.getItem(SONG_DRAFT_KEY) || 'null');
+  } catch (e) {
+    return null;
+  }
+}
+
+function readSongFields(modal) {
+  return {
+    title:       modal.querySelector('#songTitle').value.trim(),
+    lyrics:      modal.querySelector('#songLyrics').value,
+    style:       modal.querySelector('#songStyle').value.trim(),
+    singer:      modal.querySelector('#songSinger').value,
+    backend:     modal.querySelector('#songBackend').value,
+    instruments: Array.from(modal.querySelectorAll('.songInstrument:checked')).map(el => el.value),
+  };
+}
+
+function applySongFields(modal, fields) {
+  if (!fields) return;
+  modal.querySelector('#songTitle').value   = fields.title || '';
+  modal.querySelector('#songLyrics').value  = fields.lyrics || '';
+  modal.querySelector('#songStyle').value   = fields.style || '';
+  modal.querySelector('#songSinger').value  = fields.singer || 'auto';
+  modal.querySelector('#songBackend').value = fields.backend || 'ace';
+  const chosen = new Set(fields.instruments || []);
+  modal.querySelectorAll('.songInstrument').forEach(el => {
+    el.checked = chosen.has(el.value);
+  });
+}
+
+function openCreateSongModal() {
+  document.querySelectorAll('.song-modal').forEach(m => m.remove());
+
+  const modal = document.createElement('div');
+  modal.className = 'editor-modal song-modal';
+
+  const instrumentsHtml = INSTRUMENT_OPTIONS.map((name, i) => `
+    <label><input type="checkbox" class="songInstrument" value="${name}"> ${name}</label>
+  `).join('');
+
+  modal.innerHTML = `
+    <div class="editor-box song-box">
+      <h3>Create Song</h3>
+      <div class="song-presets">
+        <label for="songPresetSelect">Saved setups:</label>
+        <select id="songPresetSelect"><option value="">Loading...</option></select>
+        <button class="btn" type="button" id="songPresetLoad">Load</button>
+        <button class="btn" type="button" id="songPresetSave">Save setup...</button>
+        <button class="btn" type="button" id="songPresetDelete">Delete</button>
+        <label class="preset-check" title="Also store the title and lyrics text in the saved setup">
+          <input type="checkbox" id="songPresetLyrics"> include title &amp; lyrics
+        </label>
+      </div>
+      <div class="song-panels">
+
+        <div class="song-panel">
+          <h4>Lyrics</h4>
+          <div class="song-field">
+            <label for="songTitle">Title</label>
+            <input type="text" id="songTitle" placeholder="Song title">
+          </div>
+          <div class="song-field">
+            <label for="songLyrics">Verses, Chorus, Bridge, etc.</label>
+            <textarea id="songLyrics" spellcheck="false"
+              placeholder="[Verse 1]&#10;...&#10;&#10;[Chorus]&#10;...&#10;&#10;[Verse 2]&#10;...&#10;&#10;[Bridge]&#10;..."></textarea>
+          </div>
+          <div class="song-field song-lyrics-tools">
+            <input type="file" id="songLyricsFile" accept=".txt,.text,text/plain" hidden>
+            <button class="btn" type="button" id="songLyricsPick">Load lyrics from file...</button>
+            <span id="songLenNote" class="muted"></span>
+          </div>
+        </div>
+
+        <div class="song-panel">
+          <h4>Style</h4>
+          <div class="song-field">
+            <label for="songBackend">Backend</label>
+            <select id="songBackend">
+              <option value="ace">ACE-Step — lyrics + sung vocals</option>
+              <option value="musicgen">MusicGen — instrumental only, faster</option>
+            </select>
+            <div id="songBackendNote" class="muted" style="margin-top:4px; font-size:11px;"></div>
+          </div>
+          <div class="song-field">
+            <label for="songStyle">Genre / mood / description</label>
+            <input type="text" id="songStyle" placeholder="e.g. upbeat pop rock, 120bpm, anthemic">
+          </div>
+          <div class="song-field">
+            <label for="songSinger">Singer</label>
+            <select id="songSinger">
+              <option value="auto">Auto</option>
+              <option value="male">Male</option>
+              <option value="female">Female</option>
+              <option value="duet">Duet (Male + Female)</option>
+              <option value="instrumental">Instrumental (no vocals)</option>
+            </select>
+          </div>
+          <div class="song-field">
+            <label>Instruments</label>
+            <div class="song-instruments">${instrumentsHtml}</div>
+          </div>
+        </div>
+
+      </div>
+      <div class="editor-actions">
+        <button class="btn" id="songBrowseOutput">Browse Output</button>
+        <button class="btn" id="songSave" title="Remember these fields in this browser (loads automatically next time)">Save Draft</button>
+        <button class="btn" id="songClear">Clear</button>
+        <button class="btn accent" id="songGenerate">Generate</button>
+        <button class="btn" id="songCancel">Cancel</button>
+      </div>
+    </div>`;
+
+  document.body.appendChild(modal);
+
+  // Auto-load whatever was last saved (see SONG_DRAFT_KEY note above).
+  applySongFields(modal, loadSongDraft());
+
+  modal.querySelector('#songCancel').onclick = () => modal.remove();
+  modal.addEventListener('click', (e) => {
+    if (e.target === modal) modal.remove();
+  });
+
+  modal.querySelector('#songBrowseOutput').onclick = () => browseRemote('songs');
+
+  /* ----- Estimated song length (mirrors the server's estimate) ----- */
+  function updateLenNote() {
+    const note = modal.querySelector('#songLenNote');
+    const text = modal.querySelector('#songLyrics').value;
+    let words = 0, inst = 0;
+    text.split(/\r?\n/).forEach(line => {
+      const t = line.trim();
+      if (!t) return;
+      if (/^\[.*\]$/.test(t)) { if (/inst|intro/i.test(t)) inst++; return; }
+      words += t.split(/\s+/).length;
+    });
+    if (!words) { note.textContent = ''; note.style.color = ''; return; }
+    const secs = Math.round(words * 0.9 + 12 + inst * 10);
+    const mins = (secs / 60).toFixed(1);
+    if (secs > 360) {
+      note.textContent = `~${words} words - needs about ${mins} min, over the 6 min limit (the end may be rushed or cut)`;
+      note.style.color = '#ffb020';
+    } else {
+      note.textContent = `~${words} words - about ${mins} min`;
+      note.style.color = '';
+    }
+  }
+  modal.querySelector('#songLyrics').addEventListener('input', updateLenNote);
+
+  /* ----- Load lyrics from a text file on this computer ----- */
+  const lyricsFile = modal.querySelector('#songLyricsFile');
+  modal.querySelector('#songLyricsPick').onclick = () => lyricsFile.click();
+  lyricsFile.onchange = async () => {
+    const f = lyricsFile.files && lyricsFile.files[0];
+    if (!f) return;
+    if (f.size > 500000) {
+      showNotice('That file is too large to be lyrics', 'warn');
+      lyricsFile.value = '';
+      return;
+    }
+    try {
+      let text = await f.text();
+      text = text.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
+      modal.querySelector('#songLyrics').value = text;
+      const titleEl = modal.querySelector('#songTitle');
+      if (!titleEl.value.trim()) {
+        titleEl.value = f.name.replace(/\.[^.]+$/, '').replace(/_+/g, ' ');
+      }
+      updateLenNote();
+      showNotice('Loaded lyrics from ' + f.name, 'success');
+    } catch (e) {
+      showNotice('Could not read that file: ' + e.message, 'error');
+    }
+    lyricsFile.value = '';
+  };
+
+  /* ----- Named saved setups (stored on the server, per user) ----- */
+  const presetSelect = modal.querySelector('#songPresetSelect');
+  const presetLyricsBox = modal.querySelector('#songPresetLyrics');
+
+  async function presetApi(path, opts) {
+    const r = await fetch(path, opts);
+    let data = null;
+    try { data = await r.json(); }
+    catch (e) { throw new Error('not logged in, or the server did not answer'); }
+    if (!r.ok || (data && data.error)) throw new Error((data && data.error) || ('HTTP ' + r.status));
+    return data;
+  }
+
+  async function refreshPresets(selectName) {
+    try {
+      const data = await presetApi('/api/song_presets');
+      const list = data.presets || [];
+      presetSelect.innerHTML = list.length
+        ? list.map(p => `<option value="${escapeHtml(p.name)}">${escapeHtml(p.name)}</option>`).join('')
+        : '<option value="">- none saved yet -</option>';
+      if (selectName) presetSelect.value = selectName;
+    } catch (e) {
+      presetSelect.innerHTML = '<option value="">- could not load list -</option>';
+    }
+  }
+
+  modal.querySelector('#songPresetSave').onclick = async () => {
+    const suggested = presetSelect.value || modal.querySelector('#songTitle').value.trim();
+    const name = (window.prompt('Name for this setup:', suggested) || '').trim();
+    if (!name) return;
+    const settings = readSongFields(modal);
+    if (!presetLyricsBox.checked) { delete settings.lyrics; delete settings.title; }
+    try {
+      const res = await presetApi('/api/song_presets', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, settings }),
+      });
+      await refreshPresets(res.name);
+      showNotice('Setup "' + res.name + '" saved', 'success');
+    } catch (e) {
+      showNotice('Could not save setup: ' + e.message, 'error');
+    }
+  };
+
+  modal.querySelector('#songPresetLoad').onclick = async () => {
+    const name = presetSelect.value;
+    if (!name) { showNotice('Pick a saved setup first', 'warn'); return; }
+    try {
+      const data = await presetApi('/api/song_presets/' + encodeURIComponent(name));
+      // Merge, so a setup saved without lyrics does not wipe the lyrics you have typed.
+      applySongFields(modal, Object.assign(readSongFields(modal), data.settings || {}));
+      updateBackendNote();
+      updateLenNote();
+      showNotice('Setup "' + name + '" loaded', 'success');
+    } catch (e) {
+      showNotice('Could not load setup: ' + e.message, 'error');
+    }
+  };
+
+  modal.querySelector('#songPresetDelete').onclick = async () => {
+    const name = presetSelect.value;
+    if (!name) { showNotice('Pick a saved setup first', 'warn'); return; }
+    if (!window.confirm('Delete saved setup "' + name + '"?')) return;
+    try {
+      await presetApi('/api/song_presets/' + encodeURIComponent(name), { method: 'DELETE' });
+      await refreshPresets();
+      showNotice('Setup "' + name + '" deleted', 'success');
+    } catch (e) {
+      showNotice('Could not delete setup: ' + e.message, 'error');
+    }
+  };
+
+  refreshPresets();
+  updateLenNote();
+
+  modal.querySelector('#songSave').onclick = () => {
+    try {
+      localStorage.setItem(SONG_DRAFT_KEY, JSON.stringify(readSongFields(modal)));
+      showNotice('Draft saved in this browser — it loads automatically next time. Use "Save setup..." for named setups.', 'success');
+    } catch (e) {
+      showNotice('Could not save draft: ' + e.message, 'error');
+    }
+  };
+
+  modal.querySelector('#songClear').onclick = () => {
+    applySongFields(modal, { title: '', lyrics: '', style: '', singer: 'auto', backend: 'ace', instruments: [] });
+    try { localStorage.removeItem(SONG_DRAFT_KEY); } catch (e) {}
+    updateBackendNote();
+    updateLenNote();
+    showNotice('Song fields cleared', 'success');
+  };
+
+  // MusicGen has no lyrics/vocals input at all — make that obvious right
+  // in the modal instead of letting people discover it after a job runs.
+  const backendSelect = modal.querySelector('#songBackend');
+  const backendNote = modal.querySelector('#songBackendNote');
+  const updateBackendNote = () => {
+    backendNote.textContent = backendSelect.value === 'musicgen'
+      ? 'MusicGen ignores Lyrics and Singer — instrumental output only, from Style + Instruments.'
+      : 'ACE-Step uses your Lyrics and Singer choice to generate sung vocals.';
+  };
+  backendSelect.onchange = updateBackendNote;
+  updateBackendNote();
+
+  modal.querySelector('#songGenerate').onclick = async () => {
+    const backend = backendSelect.value;
+    const lyrics = modal.querySelector('#songLyrics').value.trim();
+    if (backend === 'ace' && !lyrics) {
+      showNotice('Enter some lyrics first (or switch to MusicGen for instrumental-only)', 'warn');
+      return;
+    }
+    if (state.isProcessing) { showNotice('Another job is already running', 'warn'); return; }
+
+    const title = modal.querySelector('#songTitle').value.trim();
+    const style = modal.querySelector('#songStyle').value.trim();
+    const singer = modal.querySelector('#songSinger').value;
+    const instruments = Array.from(modal.querySelectorAll('.songInstrument:checked'))
+      .map(el => el.value);
+
+    const genBtn = modal.querySelector('#songGenerate');
+    genBtn.disabled = true;
+    let res;
+    try {
+      const r = await fetch('/api/create_song', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title, lyrics, style, singer, instruments, backend }),
+      });
+      res = await r.json();
+    } catch (e) {
+      showNotice('Request failed: ' + e.message, 'error');
+      genBtn.disabled = false;
+      return;
+    }
+    if (res.error) {
+      showNotice(res.error, 'error');
+      genBtn.disabled = false;
+      return;
+    }
+    startJob(res, 'btnCreateSong');
+    modal.remove();
+  };
 }
 
 /* ---------- Editor modal ---------- */

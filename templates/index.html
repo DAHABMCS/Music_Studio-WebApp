@@ -40,7 +40,6 @@
 
   a{color:inherit; text-decoration: none;}
 
-  /* ---------- Top Info Bar ---------- */
   .top-info-bar {
     background: #070403;
     border-bottom: 1px solid var(--line);
@@ -78,7 +77,6 @@
     padding: 12px 0;
   }
 
-  /* ---------- Dashboard Layout ---------- */
   .dashboard-container {
     max-width: 1360px;
     margin: 0 auto;
@@ -118,7 +116,6 @@
     box-shadow: 0 0 10px var(--accent);
   }
 
-  /* 3-Column Grid: Sidebar, Content, and Right Photo Section */
   .dashboard-grid {
     display: grid;
     grid-template-columns: 240px 1fr 420px;
@@ -134,7 +131,6 @@
     .top-info-bar { justify-content: center; padding: 10px 16px; }
   }
 
-  /* ---------- Sidebar Navigation & Added Info ---------- */
   .sidebar-container {
     background: #0f0a07;
     border-right: 1px solid var(--line);
@@ -206,7 +202,6 @@
     text-decoration: underline;
   }
 
-  /* ---------- Content Panel Area ---------- */
   .content-panel {
     padding: 32px 36px;
     overflow-y: auto;
@@ -225,7 +220,6 @@
     border-radius: 3px;
   }
 
-  /* ---------- Right Photo Full-Fill Panel (Canvas Fitted) ---------- */
   .photo-sidebar-panel {
     position: relative;
     overflow: hidden;
@@ -272,7 +266,6 @@
     color: var(--ink-dim);
   }
 
-  /* ---------- Hero Typography & Elements ---------- */
   h1{
     font-family: "Outfit", sans-serif;
     font-weight: 800;
@@ -346,7 +339,6 @@
     font-size: 12.5px;
   }
 
-  /* ---------- Highly Compressed Waveform Panel ---------- */
   .wave-panel{
     background: #120c09;
     border: 1px solid var(--line);
@@ -398,7 +390,6 @@
     box-shadow: 0 0 5px currentColor;
   }
 
-  /* ---------- Section shared ---------- */
   .content-section{
     padding: 36px 0;
     border-top: 1px solid var(--line);
@@ -424,7 +415,6 @@
     font-size: 14.5px;
   }
 
-  /* ---------- Channel strips (features) ---------- */
   .strips{
     display: grid;
     grid-template-columns: repeat(2, 1fr);
@@ -469,7 +459,6 @@
     margin: 0;
   }
 
-  /* ---------- Signal chain (how it works) ---------- */
   .chain{
     display: flex;
     flex-direction: column;
@@ -505,7 +494,6 @@
     margin: 0;
   }
 
-  /* ---------- Built for ---------- */
   .audience-row{
     display: flex;
     flex-wrap: wrap;
@@ -528,7 +516,6 @@
     box-shadow: 0 0 10px rgba(245, 158, 11, 0.1);
   }
 
-  /* ---------- Closing CTA Box ---------- */
   .closer-inner{
     background: var(--bg);
     border: 1px solid var(--line);
@@ -544,7 +531,6 @@
 </head>
 <body>
 
-<!-- Top Information Bar -->
 <div class="top-info-bar">
   <span>Designed &amp; Programmed by: <strong>Amr Aboueldahab</strong></span>
 </div>
@@ -559,7 +545,6 @@
       </div>
 
       <div class="dashboard-grid">
-        <!-- Sidebar Navigation & Footer Info Area -->
         <div class="sidebar-container">
           <nav class="sidebar-nav">
             <a href="#overview" class="nav-bullet active">OVERVIEW</a>
@@ -575,10 +560,8 @@
           </div>
         </div>
 
-        <!-- Main Scrollable Content Section -->
         <div class="content-panel" id="scroll-container">
 
-          <!-- Overview Section -->
           <section id="overview" class="content-section">
             <div>
               <h1><span class="stack-line">Any song in.</span><span class="stack-line">Lyrics, tabs,</span><span class="stack-line">and karaoke out.</span></h1>
@@ -596,7 +579,6 @@
               <div class="runtime-note">⚡ Runs locally via Whisper · Demucs · FFmpeg engines. Zero subscription fees.</div>
             </div>
 
-            <!-- Highly Compressed Waveform Panel -->
             <div class="wave-panel">
               <div class="wave-panel-label">
                 <span>⚡ live_session_master.flac</span>
@@ -628,7 +610,6 @@
             </div>
           </section>
 
-          <!-- What It Does Section -->
           <section id="what-it-does" class="content-section">
             <div class="section-head">
               <h2>What it does</h2>
@@ -658,7 +639,6 @@
             </div>
           </section>
 
-          <!-- How To Start Section -->
           <section id="how-it-works" class="content-section">
             <div class="section-head">
               <h2>How to start</h2>
@@ -683,7 +663,6 @@
             </div>
           </section>
 
-          <!-- Key Features Section -->
           <section id="key-features" class="content-section">
             <div class="section-head">
               <h2>Key features</h2>
@@ -698,7 +677,6 @@
             </div>
           </section>
 
-          <!-- Support & Docs Section -->
           <section id="support" class="content-section">
             <div class="section-head">
               <h2>Support &amp; Docs</h2>
@@ -723,7 +701,6 @@
 
         </div>
 
-        <!-- Right Side Full-Fill Image Panel with Direct Canvas Scaling -->
         <div class="photo-sidebar-panel">
           <img src="https://images.unsplash.com/photo-1598488035139-bdbb2231ce04?q=80&w=1000&auto=format&fit=crop" alt="Music Studio Live Performance Scene">
           <div class="photo-overlay-gradient"></div>
