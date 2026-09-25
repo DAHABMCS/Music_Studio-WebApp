@@ -3,6 +3,8 @@
   <component name="ProjectModuleManager">
     <modules>
       <module fileurl="file://$PROJECT_DIR$/.idea/Music_Studio-webapp.iml" filepath="$PROJECT_DIR$/.idea/Music_Studio-webapp.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/ace-step.iml" filepath="$PROJECT_DIR$/.idea/ace-step.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/nano-vllm.iml" filepath="$PROJECT_DIR$/.idea/nano-vllm.iml" />
     </modules>
   </component>
 </project>
