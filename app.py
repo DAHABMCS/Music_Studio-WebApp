@@ -265,21 +265,33 @@ def _owns_job(job: dict) -> bool:
 def login():
     # Already logged in? Go straight to the dashboard.
     if session.get("user"):
+        if request.method == "POST" and request.is_json:
+            return jsonify(ok=True, redirect=url_for("dashboard"))
         return redirect(url_for("dashboard"))
 
     error = None
     if request.method == "POST":
-        u = request.form.get("username", "").strip()
-        p = request.form.get("password", "").strip()
+        # login.html's fetch() posts JSON; support classic form posts too.
+        if request.is_json:
+            data = request.get_json(silent=True) or {}
+        else:
+            data = request.form
+
+        u = (data.get("username") or "").strip()
+        p = (data.get("password") or "").strip()
 
         user = load_users().get(u)
         if user is not None and verify_password(p, user):
             session.permanent = True          # survive browser restart
             session["user"] = u
             session["role"] = get_role(user)
+            if request.is_json:
+                return jsonify(ok=True, redirect=url_for("dashboard"))
             return redirect(url_for("dashboard"))
 
         error = "Invalid username or password"
+        if request.is_json:
+            return jsonify(ok=False, error=error), 401
 
     return render_template("login.html", error=error)
 
