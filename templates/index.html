@@ -540,6 +540,75 @@
   }
   .closer h2{margin-bottom: 4px;}
   .closer p{color: var(--ink-dim); margin: 0; font-size: 14px;}
+
+  /* ---------- NEW: FEATURES LIST (from Feature Flyer) ---------- */
+  .feature-compact-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 14px;
+    margin-top: 8px;
+  }
+  .feature-compact-card {
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 16px 16px 14px;
+    transition: border-color 0.2s, transform 0.2s;
+  }
+  .feature-compact-card:hover {
+    border-color: rgba(245, 158, 11, 0.45);
+    transform: translateY(-2px);
+  }
+  .feature-compact-card .fc-icon {
+    font-size: 22px;
+    margin-bottom: 8px;
+    display: block;
+  }
+  .feature-compact-card h4 {
+    font-family: "Outfit", sans-serif;
+    font-size: 14.5px;
+    font-weight: 700;
+    color: var(--ink);
+    margin: 0 0 4px;
+  }
+  .feature-compact-card p {
+    font-size: 12.5px;
+    color: var(--ink-dim);
+    margin: 0 0 8px;
+    line-height: 1.45;
+  }
+  .feature-compact-card ul {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+  }
+  .feature-compact-card ul li {
+    font-size: 11.5px;
+    color: #b9a48c;
+    padding: 2px 0 2px 14px;
+    position: relative;
+    line-height: 1.5;
+  }
+  .feature-compact-card ul li::before {
+    content: '▸';
+    position: absolute;
+    left: 0;
+    color: var(--accent);
+    font-weight: 700;
+  }
+
+  .feature-tagline {
+    margin-top: 14px;
+    font-size: 12.5px;
+    color: var(--ink-dim);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: center;
+  }
+  .feature-tagline .dot-sep {
+    width: 4px; height: 4px; border-radius: 50%; background: var(--line);
+  }
 </style>
 </head>
 <body>
@@ -628,7 +697,7 @@
             </div>
           </section>
 
-          <!-- What It Does Section -->
+          <!-- What It Does Section (original strips + now expanded from flyer) -->
           <section id="what-it-does" class="content-section">
             <div class="section-head">
               <h2>What it does</h2>
@@ -654,6 +723,57 @@
                 <div class="strip-meter"><span style="height:45%;"></span><span style="height:90%;background:var(--accent-red);"></span></div>
                 <h3>Tab Export Utility</h3>
                 <p>Convert audio frequencies directly into structured, printable guitar tab sheets instantly.</p>
+              </div>
+            </div>
+
+            <!-- ADDITIONAL FEATURES from the flyer, in a compact grid -->
+            <div style="margin-top: 28px;">
+              <div class="section-head" style="margin-bottom: 12px;">
+                <h2 style="font-size: 20px;">And more capabilities</h2>
+              </div>
+              <div class="feature-compact-grid">
+                <div class="feature-compact-card">
+                  <span class="fc-icon">🎤</span>
+                  <h4>AI-Powered Subtitles</h4>
+                  <p>Whisper large-v3 with word-level timestamps, auto language detection, and smart cue merging.</p>
+                  <ul><li>Multi-language</li><li>stable-ts refinement</li></ul>
+                </div>
+                <div class="feature-compact-card">
+                  <span class="fc-icon">🎸</span>
+                  <h4>Vocal &amp; Guitar Isolation</h4>
+                  <p>Demucs 4-stem separation with dedicated guitar stem and no-vocals instrumental.</p>
+                  <ul><li>4-stem separation</li><li>Vocals-only output</li></ul>
+                </div>
+                <div class="feature-compact-card">
+                  <span class="fc-icon">🎼</span>
+                  <h4>Full Song Transcription</h4>
+                  <p>One-click TAB + MIDI + Chords export captures the whole arrangement.</p>
+                  <ul><li>Guitar solo TAB (PDF)</li><li>MIDI &amp; chord charts</li></ul>
+                </div>
+                <div class="feature-compact-card">
+                  <span class="fc-icon">🎬</span>
+                  <h4>Karaoke Video Builder</h4>
+                  <p>Burns synced lyrics onto static or video backgrounds, auto cloud backdrop included.</p>
+                  <ul><li>Lyric video mode</li><li>Karaoke mode (no vocals)</li></ul>
+                </div>
+                <div class="feature-compact-card">
+                  <span class="fc-icon">🎸</span>
+                  <h4>Guitar Solo Tab Export</h4>
+                  <p>librosa pyin pitch tracking with auto string/fret assignment and expressive techniques.</p>
+                  <ul><li>Bends, vibrato, hammer-ons</li><li>Phrase grouping</li></ul>
+                </div>
+                <div class="feature-compact-card">
+                  <span class="fc-icon">📝</span>
+                  <h4>Lyrics Sheet Export</h4>
+                  <p>Clean, print-ready lyric sheets with chord diagrams above lyrics.</p>
+                  <ul><li>Arabic &amp; RTL support</li><li>Chord reference section</li></ul>
+                </div>
+                <div class="feature-compact-card">
+                  <span class="fc-icon">🤖</span>
+                  <h4>AI Song Creation</h4>
+                  <p>Generate original songs from lyrics + style using ACE-Step and MusicGen.</p>
+                  <ul><li>Singer voice selection</li><li>Instrument picker</li></ul>
+                </div>
               </div>
             </div>
           </section>
@@ -683,18 +803,38 @@
             </div>
           </section>
 
-          <!-- Key Features Section -->
+          <!-- Key Features Section (audience pills + updated checklist) -->
           <section id="key-features" class="content-section">
             <div class="section-head">
               <h2>Key features</h2>
               <p class="section-sub">Engineered specifically for creators, educators, and audio professionals.</p>
             </div>
-            <div class="audience-row">
+            <div class="audience-row" style="margin-bottom: 18px;">
               <span class="audience-pill on">Content Creators</span>
               <span class="audience-pill on">Worship &amp; Choir Teams</span>
               <span class="audience-pill on">Karaoke Hosts</span>
               <span class="audience-pill on">Guitar Instructors</span>
               <span class="audience-pill">Video Editors</span>
+              <span class="audience-pill">Songwriters</span>
+            </div>
+
+            <!-- Key features at a glance – from flyer -->
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 8px;">
+              <div style="display: flex; gap: 8px; align-items: flex-start; font-size: 13px; color: var(--ink-dim);"><span style="color: #34c759; font-weight: 700; flex-shrink:0;">✓</span> Web-based dashboard — works from any browser on your LAN</div>
+              <div style="display: flex; gap: 8px; align-items: flex-start; font-size: 13px; color: var(--ink-dim);"><span style="color: #34c759; font-weight: 700; flex-shrink:0;">✓</span> Multi-user accounts with admin panel &amp; role management</div>
+              <div style="display: flex; gap: 8px; align-items: flex-start; font-size: 13px; color: var(--ink-dim);"><span style="color: #34c759; font-weight: 700; flex-shrink:0;">✓</span> Job queue &amp; progress tracking with live status</div>
+              <div style="display: flex; gap: 8px; align-items: flex-start; font-size: 13px; color: var(--ink-dim);"><span style="color: #34c759; font-weight: 700; flex-shrink:0;">✓</span> Persistent jobs — resumes after server restart</div>
+              <div style="display: flex; gap: 8px; align-items: flex-start; font-size: 13px; color: var(--ink-dim);"><span style="color: #34c759; font-weight: 700; flex-shrink:0;">✓</span> Per-user file isolation for uploads &amp; outputs</div>
+              <div style="display: flex; gap: 8px; align-items: flex-start; font-size: 13px; color: var(--ink-dim);"><span style="color: #34c759; font-weight: 700; flex-shrink:0;">✓</span> Browse folders natively in Explorer / Finder</div>
+              <div style="display: flex; gap: 8px; align-items: flex-start; font-size: 13px; color: var(--ink-dim);"><span style="color: #34c759; font-weight: 700; flex-shrink:0;">✓</span> Download SRT, MP4, PDF, MIDI, MP3, WAV</div>
+              <div style="display: flex; gap: 8px; align-items: flex-start; font-size: 13px; color: var(--ink-dim);"><span style="color: #34c759; font-weight: 700; flex-shrink:0;">✓</span> Combined Export Lyrics &amp; Tab pipeline</div>
+              <div style="display: flex; gap: 8px; align-items: flex-start; font-size: 13px; color: var(--ink-dim); grid-column: span 2;"><span style="color: #34c759; font-weight: 700; flex-shrink:0;">✓</span> No subscription. No cloud upload. Fully local.</div>
+            </div>
+
+            <div class="feature-tagline">
+              <span>🔒 Privacy First — no cloud upload</span>
+              <span class="dot-sep"></span>
+              <span>⚡ FFmpeg · Demucs · Whisper · ACE-Step · MuseScore ready</span>
             </div>
           </section>
 
@@ -723,7 +863,7 @@
 
         </div>
 
-        <!-- Right Side Image Panel — Now uses your local static/assets/studio.png -->
+        <!-- Right Side Image Panel -->
         <div class="photo-sidebar-panel">
           <img src="{{ url_for('static', filename='assets/studio.png') }}" alt="Music Studio Live Performance Scene">
           <div class="photo-overlay-gradient"></div>
