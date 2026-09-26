@@ -2214,14 +2214,54 @@ def browse_folder(kind):
 # ============================================================
 # RUN
 # ============================================================
+def _lan_ip():
+    """Best-effort guess at this machine's LAN IP (e.g. 192.168.x.x)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def _open_browser(port):
+    """Wait until the server is actually accepting connections, then open
+    the default browser. Runs in a background thread so it doesn't block
+    the server's startup call (serve() / app.run() never return)."""
+    import webbrowser
+
+    def _wait_and_open():
+        url = f"http://127.0.0.1:{port}"
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                    break
+            except OSError:
+                time.sleep(0.3)
+        webbrowser.open(url)
+
+    threading.Thread(target=_wait_and_open, daemon=True).start()
+
+
 if __name__ == "__main__":
+    ip = _lan_ip()
+
     try:
         from waitress import serve
-        print("Starting production server (waitress) on http://0.0.0.0:8000")
-        print("Access production server on http://<Server IP>:8000")
-        print("Access production server on http://192.168.1.67:8000")
-        serve(app, host="0.0.0.0", port=8000)
+        port = 8000
+        print("Starting production server (waitress)")
+        print(f" * Running on http://127.0.0.1:{port}")
+        print(f" * Running on http://{ip}:{port}")
+        _open_browser(port)
+        serve(app, host="0.0.0.0", port=port)
     except ImportError:
+        port = 5000
         print("waitress not installed — falling back to Flask's dev server.")
         print("Run 'pip install waitress' to use the production server instead.")
-        app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+        print(f" * Running on http://127.0.0.1:{port}")
+        print(f" * Running on http://{ip}:{port}")
+        _open_browser(port)
+        app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
