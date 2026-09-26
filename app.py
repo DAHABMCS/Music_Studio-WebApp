@@ -18,6 +18,7 @@ from flask import (Flask, render_template, request, jsonify,
 from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash
 from subtitle_engine import SubtitleEngine
+from user_store import load_users as _load_users_enc, save_users as _save_users_enc
 
 # ============================================================
 # APP CONFIG
@@ -44,14 +45,16 @@ for d in (UPLOAD_DIR, OUTPUT_DIR, ASSETS_DIR, JOBS_DIR):
 
 # Create a default user file if none exists.
 # NOTE: change this password immediately after first login.
+# users.json is encrypted at rest (see user_store.py) — this writes the
+# encrypted form directly, plus its key file (users.json.key), on first run.
 DEFAULT_ADMIN_PASSWORD = "change-me-now"
 if not USERS_FILE.exists():
-    USERS_FILE.write_text(json.dumps({
+    _save_users_enc(USERS_FILE, {
         "admin": {
             "password": generate_password_hash(DEFAULT_ADMIN_PASSWORD),
             "role": "admin",
         }
-    }, indent=2))
+    })
 
 LOCK = threading.Lock()
 
@@ -165,16 +168,19 @@ def _open_native_folder(path):
 
 # ============================================================
 # USER / AUTH HELPERS
+# ------------------------------------------------------------
+# users.json is encrypted at rest — see user_store.py (shared with
+# User_Management.py, so both programs always agree on the format).
 # ============================================================
 def load_users():
     try:
-        return json.loads(USERS_FILE.read_text())
+        return _load_users_enc(USERS_FILE)
     except Exception:
         return {}
 
 
 def save_users(users: dict):
-    USERS_FILE.write_text(json.dumps(users, indent=2))
+    _save_users_enc(USERS_FILE, users)
 
 
 def get_role(stored) -> str:
