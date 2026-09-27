@@ -61,8 +61,14 @@ DEFAULT_FILE = "users.json"
 
 
 def default_users_path() -> str:
-    """users.json living next to this script."""
-    script_dir = os.path.dirname(os.path.abspath(__file__))
+    """users.json living next to this script (or next to the .exe, when frozen)."""
+    if getattr(sys, "frozen", False):
+        # Running as a packaged .exe (PyInstaller etc.) — __file__ can point
+        # into a bundle-internal location that doesn't match where the .exe
+        # itself sits on disk. sys.executable is the reliable one here.
+        script_dir = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(script_dir, DEFAULT_FILE)
 
 
@@ -393,6 +399,26 @@ class UserManagerApp(tk.Tk):
 
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else default_users_path()
+
+    # --- DIAGNOSTIC: prove exactly which users.json this GUI is pointed
+    # at, so it can be compared against app.py's own _startup_debug.log.
+    # Safe to delete once you've confirmed both agree; writes one small
+    # text file next to the users.json it resolved. ---
+    try:
+        folder = os.path.dirname(os.path.abspath(path)) or "."
+        with open(os.path.join(folder, "_startup_debug.log"), "w", encoding="utf-8") as _dbg:
+            _dbg.write(f"Started (unix time): {datetime.now().timestamp()}\n")
+            _dbg.write(f"frozen (running as .exe): {getattr(sys, 'frozen', False)}\n")
+            _dbg.write(f"sys.executable: {sys.executable}\n")
+            _dbg.write(f"__file__:       {__file__}\n")
+            _dbg.write(f"Launched with arg:   {sys.argv[1] if len(sys.argv) > 1 else '(none, used default)'}\n")
+            _dbg.write(f"Resolved path:       {os.path.abspath(path)}\n")
+            _dbg.write(f"users.json exists:     {os.path.exists(path)}\n")
+            _dbg.write(f"users.json.key exists: {os.path.exists(path + '.key')}\n")
+    except Exception:
+        pass
+    # --- end diagnostic ---
+
     app = UserManagerApp(path)
     app.mainloop()
 

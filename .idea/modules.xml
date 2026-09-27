@@ -4,7 +4,9 @@
     <modules>
       <module fileurl="file://$PROJECT_DIR$/.idea/Music_Studio-webapp.iml" filepath="$PROJECT_DIR$/.idea/Music_Studio-webapp.iml" />
       <module fileurl="file://$PROJECT_DIR$/.idea/ace-step.iml" filepath="$PROJECT_DIR$/.idea/ace-step.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/ace-step@1.iml" filepath="$PROJECT_DIR$/.idea/ace-step@1.iml" />
       <module fileurl="file://$PROJECT_DIR$/.idea/nano-vllm.iml" filepath="$PROJECT_DIR$/.idea/nano-vllm.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/nano-vllm@1.iml" filepath="$PROJECT_DIR$/.idea/nano-vllm@1.iml" />
     </modules>
   </component>
 </project>
