@@ -17,6 +17,8 @@
     <div class="app-subtitle">Transcribe MP3 / MP4 audio into perfectly timed .srt subtitles</div>
     <div class="app-user">
       <span class="muted">{{ session.user }}</span>
+      <a href="{{ url_for('help_manual') }}" target="_blank" rel="noopener"
+         class="btn ghost small" title="Open the user manual (PDF)">? Help</a>
       <a href="{{ url_for('logout') }}" class="btn ghost small">Logout</a>
     </div>
   </header>

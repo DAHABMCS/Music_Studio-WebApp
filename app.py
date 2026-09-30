@@ -437,6 +437,22 @@ def dashboard():
 def assets(filename):
     return send_from_directory(ASSETS_DIR, filename)
 
+# ============================================================
+# USER MANUAL (opens inline in a new browser tab)
+# ============================================================
+MANUAL_NAME = "Music_Studio_User_Manual.pdf"
+
+@app.route("/help")
+@login_required
+def help_manual():
+    # Look next to the exe/app first, then in assets/ and docs/
+    for folder in (BASE_DIR, ASSETS_DIR, BASE_DIR / "docs"):
+        if (folder / MANUAL_NAME).is_file():
+            return send_from_directory(folder, MANUAL_NAME,
+                                       mimetype="application/pdf",
+                                       as_attachment=False)
+    return "User manual not found. Place Music_Studio_User_Manual.pdf next to the app.", 404
+
 
 # ============================================================
 # FILE BROWSER (upload/output listings used by the dashboard UI)
