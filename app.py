@@ -1717,6 +1717,58 @@ def ace_start():
     return jsonify(ok=True, message=msg)
 
 
+# ------------------------------------------------------------
+# STARTUP WAIT + SHUTDOWN
+# The browser is opened only after ACE-Step answers /health, so the
+# dashboard never loads with "AI Music Generation" unavailable.
+# ACE_WAIT_SECONDS  : max wait before opening the browser anyway (240)
+# ACE_KEEP_RUNNING=1: leave ACE running after the app exits
+# ------------------------------------------------------------
+ACE_WAIT_SECONDS = int(os.environ.get("ACE_WAIT_SECONDS", "240") or 240)
+
+
+def _wait_for_ace(timeout=ACE_WAIT_SECONDS):
+    """Block until ACE-Step answers /health. True if ready."""
+    t0 = time.time()
+    last_msg = 0
+    while time.time() - t0 < timeout:
+        if _ace_is_running():
+            print(f"[ACE] ready after {int(time.time() - t0)}s", flush=True)
+            return True
+        if _ACE_PROC is not None and _ACE_PROC.poll() is not None:
+            print(f"[ACE] process exited early (code {_ACE_PROC.returncode}) "
+                  f"- see {ACE_LOG}", flush=True)
+            return False
+        if time.time() - last_msg >= 10:
+            print(f"[ACE] loading models... {int(time.time() - t0)}s", flush=True)
+            last_msg = time.time()
+        time.sleep(2)
+    print(f"[ACE] not ready after {timeout}s - opening the app anyway.", flush=True)
+    return False
+
+
+def _stop_ace():
+    """Kill ACE-Step (and the child python that uv spawns) on app exit."""
+    if os.environ.get("ACE_KEEP_RUNNING", "0") == "1":
+        return
+    proc = _ACE_PROC
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        if sys.platform.startswith("win"):
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
+        else:
+            proc.terminate()
+    except Exception:
+        pass
+
+
+import atexit
+atexit.register(_stop_ace)
+
+
 def generate_song_audio(lyrics, style, instruments, singer, out_path,
                          backend="ace", progress_cb=None):
     """Generate a song and write it to out_path. `backend` selects which
@@ -2396,10 +2448,11 @@ def _lan_ip():
         s.close()
 
 
-def _open_browser(port):
-    """Wait until the server is actually accepting connections, then open
-    the default browser. Runs in a background thread so it doesn't block
-    the server's startup call (serve() / app.run() never return)."""
+def _open_browser(port, wait_for_ace=False):
+    """Wait until the server is actually accepting connections (and, if
+    requested, until ACE-Step is ready), then open the default browser.
+    Runs in a background thread so it doesn't block the server's startup
+    call (serve() / app.run() never return)."""
     import webbrowser
 
     def _wait_and_open():
@@ -2411,6 +2464,8 @@ def _open_browser(port):
                     break
             except OSError:
                 time.sleep(0.3)
+        if wait_for_ace:
+            _wait_for_ace()
         webbrowser.open(url)
 
     threading.Thread(target=_wait_and_open, daemon=True).start()
@@ -2421,9 +2476,11 @@ if __name__ == "__main__":
 
     # Auto-start ACE-Step silently. Set ACE_AUTOSTART=0 in the environment
     # to disable (e.g. when pointing ACE_STEP_API_URL at a remote server).
+    wait_ace = False
     if os.environ.get("ACE_AUTOSTART", "1") == "1":
         ok, msg = _spawn_ace_hidden()
         print(f"[ACE autostart] {msg}")
+        wait_ace = ok          # only wait if ACE is actually starting/running
 
     try:
         from waitress import serve
@@ -2431,7 +2488,7 @@ if __name__ == "__main__":
         print("Starting production server (waitress)")
         print(f" * Running on http://127.0.0.1:{port}")
         print(f" * Running on http://{ip}:{port}")
-        _open_browser(port)
+        _open_browser(port, wait_for_ace=wait_ace)
         serve(app, host="0.0.0.0", port=port)
     except ImportError:
         port = 5000
@@ -2439,5 +2496,5 @@ if __name__ == "__main__":
         print("Run 'pip install waitress' to use the production server instead.")
         print(f" * Running on http://127.0.0.1:{port}")
         print(f" * Running on http://{ip}:{port}")
-        _open_browser(port)
+        _open_browser(port, wait_for_ace=wait_ace)
         app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
