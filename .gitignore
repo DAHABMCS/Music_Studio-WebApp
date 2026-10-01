@@ -16,7 +16,21 @@ __pycache__/
 
 # Outputs
 outputs/
+# Build output
+build/
+dist/
 
+# Logs
+*.log
+
+# Runtime state
+runtime/
+jobs/
+jobs.json
+
+# User data
+uploads/
+users.json.bak*
 # OS/IDE
 .DS_Store
 Thumbs.db
