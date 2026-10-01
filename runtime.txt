@@ -1,1 +1,5 @@
+<<<<<<< HEAD
 python-3.11.10
+=======
+python-3.11.10
+>>>>>>> 14f61240 (Fix Python version and spaCy for Render)
