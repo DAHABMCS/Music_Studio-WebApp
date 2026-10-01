@@ -276,4 +276,19 @@
 
 {% block scripts %}
 <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+<script>
+  // Clear button also empties the Input / Output / Background boxes
+  // (and resets the hidden file pickers so the same file can be re-chosen).
+  (function () {
+    var clearBtn = document.getElementById('btnClear');
+    if (!clearBtn) return;
+    clearBtn.addEventListener('click', function () {
+      ['inputFilePath', 'outputFilePath', 'backgroundPath',
+       'inputFilePicker', 'backgroundPicker'].forEach(function (id) {
+        var el = document.getElementById(id);
+        if (el) el.value = '';
+      });
+    });
+  })();
+</script>
 {% endblock %}

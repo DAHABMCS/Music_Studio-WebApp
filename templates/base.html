@@ -5,6 +5,24 @@
   <title>{% block title %}Subtitle-Lyric-Karaoke-Chord - MP3/MP4 to SRT{% endblock %}</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+  <style>
+    /* ---- Guide me walkthrough ---- */
+    .guide-spot {
+      position: fixed; z-index: 9998; border-radius: 10px; pointer-events: none;
+      box-shadow: 0 0 0 9999px rgba(0,0,0,.65), 0 0 0 3px #f59e0b;
+      transition: all .25s ease;
+    }
+    .guide-tip {
+      position: fixed; z-index: 9999; width: 300px; max-width: calc(100vw - 24px);
+      background: #161b22; color: #e6edf3; border: 1px solid #30363d;
+      border-radius: 12px; padding: 14px 16px; font-size: 14px; line-height: 1.5;
+      box-shadow: 0 12px 40px rgba(0,0,0,.6);
+    }
+    .guide-tip h4 { margin: 0 0 6px; font-size: 15px; color: #f59e0b; }
+    .guide-tip p { margin: 0 0 12px; }
+    .guide-nav { display: flex; align-items: center; gap: 6px; }
+    .guide-nav .guide-count { margin-right: auto; font-size: 12px; opacity: .7; }
+  </style>
 </head>
 <body class="{% block body_class %}{% endblock %}">
 
@@ -17,6 +35,8 @@
     <div class="app-subtitle">Transcribe MP3 / MP4 audio into perfectly timed .srt subtitles</div>
     <div class="app-user">
       <span class="muted">{{ session.user }}</span>
+      <button type="button" id="btnGuide" class="btn ghost small"
+              title="Take a quick guided tour of the dashboard">💡 Guide me</button>
       <a href="{{ url_for('help_manual') }}" target="_blank" rel="noopener"
          class="btn ghost small" title="Open the user manual (PDF)">? Help</a>
       <a href="{{ url_for('logout') }}" class="btn ghost small">Logout</a>
@@ -33,5 +53,126 @@
   {% block content %}{% endblock %}
 
   {% block scripts %}{% endblock %}
+
+  {% if session.user %}
+  <script>
+  (function () {
+    var STEPS = [
+      { sel: '#inputFilePath', title: '1. Choose your file',
+        text: 'Click Browse and pick an MP3, MP4, WAV, M4A, FLAC or OGG file. The .srt output path fills in automatically.' },
+      { sel: '#backgroundPath', title: '2. Background (optional)',
+        text: 'Add an image or video to use as the backdrop for karaoke / lyric videos.' },
+      { sel: '#language', title: '3. Settings',
+        text: 'Pick the language (or leave on auto), the Whisper model (larger = more accurate but slower), the chord method, and whether to extract the guitar.' },
+      { sel: '#btnSrt', title: '4. Generate Subtitles',
+        text: 'Transcribes the audio into a timed .srt file. This is the usual first step.' },
+      { sel: '#btnKaraoke', title: '5. Karaoke & Lyric Video',
+        text: 'Karaoke removes the vocals; Lyric Video keeps them. Both burn the lyrics onto a video.' },
+      { sel: '#btnLyricsTab', title: '6. Lyrics, Guitar Tabs & MP3',
+        text: 'Exports lyrics with chords/tabs alongside an MP3.' },
+      { sel: '#statusText', title: '7. Status & Progress',
+        text: 'Watch the current job, elapsed time and progress bar here. Use Stop to cancel and Clear to reset.' },
+      { sel: '#browseSrtBtn', title: '8. Browse results',
+        text: 'These buttons list your previously generated SRT files, karaoke videos, music, lyrics/tabs and transcriptions.' },
+      { sel: '#srtPreview', title: '9. SRT Preview',
+        text: 'The generated subtitles appear here. Press Edit below to adjust them.' }
+    ];
+
+    var spot, tip, idx = 0, steps = [];
+
+    // Put the dashboard back to its initial, ready-for-work state.
+    function resetGui() {
+      window.scrollTo(0, 0);
+      var stop = document.getElementById('btnStop');
+      var jobRunning = stop && !stop.disabled;
+      // Only reset if nothing is running, so a live job is never wiped.
+      if (!jobRunning) {
+        var clear = document.getElementById('btnClear');
+        if (clear) clear.click();
+      }
+      var first = document.getElementById('inputFilePath');
+      if (first) first.scrollIntoView({ block: 'start' });
+      window.scrollTo(0, 0);
+    }
+
+    function end() {
+      var wasActive = !!spot;
+      if (spot) spot.remove();
+      if (tip) tip.remove();
+      spot = tip = null;
+      window.removeEventListener('resize', place);
+      document.removeEventListener('keydown', onKey);
+      if (wasActive) resetGui();
+    }
+
+    function onKey(e) {
+      if (e.key === 'Escape') end();
+      else if (e.key === 'ArrowRight') go(1);
+      else if (e.key === 'ArrowLeft') go(-1);
+    }
+
+    function place() {
+      if (!spot) return;
+      var s = steps[idx], el = document.querySelector(s.sel);
+      el.scrollIntoView({ block: 'center', behavior: 'instant' in window ? 'instant' : 'auto' });
+      var r = el.getBoundingClientRect(), pad = 6;
+      spot.style.left = (r.left - pad) + 'px';
+      spot.style.top = (r.top - pad) + 'px';
+      spot.style.width = (r.width + pad * 2) + 'px';
+      spot.style.height = (r.height + pad * 2) + 'px';
+
+      tip.innerHTML =
+        '<h4></h4><p></p><div class="guide-nav">' +
+        '<span class="guide-count"></span>' +
+        '<button type="button" class="btn ghost small" data-a="skip">Skip</button>' +
+        (idx > 0 ? '<button type="button" class="btn small" data-a="prev">Back</button>' : '') +
+        '<button type="button" class="btn accent small" data-a="next">' +
+        (idx === steps.length - 1 ? 'Done' : 'Next') + '</button></div>';
+      tip.querySelector('h4').textContent = s.title;
+      tip.querySelector('p').textContent = s.text;
+      tip.querySelector('.guide-count').textContent = (idx + 1) + ' / ' + steps.length;
+      tip.querySelector('[data-a=skip]').onclick = end;
+      var prev = tip.querySelector('[data-a=prev]');
+      if (prev) prev.onclick = function () { go(-1); };
+      tip.querySelector('[data-a=next]').onclick = function () { go(1); };
+
+      var th = tip.offsetHeight, tw = tip.offsetWidth;
+      var top = r.bottom + 14;
+      if (top + th > window.innerHeight - 8) top = Math.max(8, r.top - th - 14);
+      var left = Math.min(Math.max(8, r.left), window.innerWidth - tw - 8);
+      tip.style.top = top + 'px';
+      tip.style.left = left + 'px';
+    }
+
+    function go(d) {
+      idx += d;
+      if (idx >= steps.length) return end();
+      if (idx < 0) idx = 0;
+      place();
+    }
+
+    function start() {
+      if (spot) { spot.remove(); tip.remove(); spot = tip = null; }
+      steps = STEPS.filter(function (s) { return document.querySelector(s.sel); });
+      if (!steps.length) {
+        // Not on the dashboard — take the user there
+        window.location.href = '/dashboard';
+        return;
+      }
+      idx = 0;
+      spot = document.createElement('div'); spot.className = 'guide-spot';
+      tip = document.createElement('div'); tip.className = 'guide-tip';
+      document.body.appendChild(spot);
+      document.body.appendChild(tip);
+      window.addEventListener('resize', place);
+      document.addEventListener('keydown', onKey);
+      place();
+    }
+
+    var btn = document.getElementById('btnGuide');
+    if (btn) btn.addEventListener('click', start);
+  })();
+  </script>
+  {% endif %}
 </body>
 </html>
