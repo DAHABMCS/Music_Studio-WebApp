@@ -369,6 +369,19 @@ function lockButtons(lock) {
   });
   const stop = $('btnStop');
   if (stop) stop.disabled = !lock;
+  setGearSpinning(lock);
+}
+
+/* ---------- Gear animation: plays only while a job is running ---------- */
+function setGearSpinning(on) {
+  const v = $('gearVideo');
+  if (!v) return;
+  if (on) {
+    const p = v.play();
+    if (p && p.catch) p.catch(() => {});
+  } else {
+    v.pause();
+  }
 }
 
 /* ---------- Job polling ---------- */

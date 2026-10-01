@@ -232,9 +232,10 @@
               <button class="btn" id="btnStop" disabled>Stop</button>
               <button class="btn" id="btnClear">Clear</button>
             </div>
-            <img class="gear-decor"
-                 src="{{ url_for('static', filename='assets/gear_decor.png') }}"
-                 alt="gear decoration">
+            <video class="gear-decor" id="gearVideo"
+                   src="{{ url_for('static', filename='assets/Gear.mp4') }}"
+                   muted loop playsinline preload="auto"
+                   aria-label="gear animation"></video>
           </div>
 
           <!-- column 3 : browse buttons -->
