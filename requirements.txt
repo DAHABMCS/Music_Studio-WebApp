@@ -132,7 +132,7 @@ six==1.17.0
 smart_open==7.7.1
 soundfile==0.13.1
 soxr==1.1.0
-spacy==3.8.4
+spacy>=3.8.0,<3.9.0
 spacy-legacy==3.0.12
 spacy-loggers==1.0.5
 sphn==0.2.1
