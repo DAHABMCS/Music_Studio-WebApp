@@ -18,14 +18,14 @@
   }
 
   .dashboard-panel {
-    width: 100%;
-    max-width: 950px;             /* reduced from full viewport width */
-    background: #161b22;           /* lighter than backdrop so it pops */
-    border-radius: 18px;
-    padding: 15px 32px 36px;
-    box-shadow: 0 25px 70px rgba(0, 0, 0, 0.5),
-                0 0 0 1px rgba(255, 255, 255, 0.05);
-  }
+  width: 100%;
+  max-width: 1010px;         /* was 950px: 942 content + 64 padding + a little slack */
+  background: #161b22;
+  border-radius: 18px;
+  padding: 15px 32px 36px;
+  box-shadow: 0 25px 70px rgba(0, 0, 0, 0.5),
+              0 0 0 1px rgba(255, 255, 255, 0.05);
+}
 
   @media (max-width: 700px) {
     .dashboard-backdrop { padding: 16px 8px; }

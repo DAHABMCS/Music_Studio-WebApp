@@ -453,6 +453,23 @@ def help_manual():
                                        as_attachment=False)
     return "User manual not found. Place Music_Studio_User_Manual.pdf next to the app.", 404
 
+# ============================================================
+# STARTUP GUIDE (button details & flow charts — opened from "Guide me")
+# ============================================================
+STARTUP_GUIDE_NAME = "startup_Guide.pdf"
+
+@app.route("/startup-guide")
+@login_required
+def startup_guide():
+    # Same lookup order as the user manual: next to the exe/app first,
+    # then assets/ and docs/
+    for folder in (BASE_DIR, ASSETS_DIR, BASE_DIR / "docs"):
+        if (folder / STARTUP_GUIDE_NAME).is_file():
+            return send_from_directory(folder, STARTUP_GUIDE_NAME,
+                                       mimetype="application/pdf",
+                                       as_attachment=False)
+    return "Startup guide not found. Place startup_Guide.pdf next to the app.", 404
+
 
 # ============================================================
 # FILE BROWSER (upload/output listings used by the dashboard UI)

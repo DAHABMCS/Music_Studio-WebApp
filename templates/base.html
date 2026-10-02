@@ -136,6 +136,19 @@
       if (prev) prev.onclick = function () { go(-1); };
       tip.querySelector('[data-a=next]').onclick = function () { go(1); };
 
+      // Last step only: offer the button-details / flow-chart PDF
+      if (idx === steps.length - 1) {
+        var more = document.createElement('button');
+        more.type = 'button';
+        more.className = 'btn small';
+        more.style.cssText = 'width:100%; margin-top:10px;';
+        more.textContent = '📄 Button details & flow charts (PDF)';
+        more.onclick = function () {
+          window.open("{{ url_for('startup_guide') }}", '_blank', 'noopener');
+        };
+        tip.appendChild(more);
+      }
+
       var th = tip.offsetHeight, tw = tip.offsetWidth;
       var top = r.bottom + 14;
       if (top + th > window.innerHeight - 8) top = Math.max(8, r.top - th - 14);
