@@ -709,10 +709,36 @@ function loadSongDraft() {
   }
 }
 
+/* Song language -> reading direction. Arabic, Persian and Urdu read right to
+   left; "auto" lets the browser decide line by line from the letters typed. */
+const SONG_RTL_LANGS = ['ar', 'fa', 'ur', 'he'];
+
+function songLangDir(lang) {
+  if (!lang || lang === 'auto') return 'auto';
+  return SONG_RTL_LANGS.includes(lang) ? 'rtl' : 'ltr';
+}
+
+function applySongDirection(modal) {
+  const langEl = modal.querySelector('#songLanguage');
+  const dir = songLangDir(langEl ? langEl.value : 'auto');
+  const lyrics = modal.querySelector('#songLyrics');
+  if (lyrics) {
+    lyrics.setAttribute('dir', dir);
+    lyrics.style.textAlign = 'start';          // right edge when rtl, left when ltr
+    lyrics.style.unicodeBidi = dir === 'auto' ? 'plaintext' : 'normal';
+  }
+  // Title and style text boxes always follow the letters typed into them.
+  ['#songTitle', '#songStyle'].forEach(sel => {
+    const el = modal.querySelector(sel);
+    if (el) el.setAttribute('dir', 'auto');
+  });
+}
+
 function readSongFields(modal) {
   return {
     title:       modal.querySelector('#songTitle').value.trim(),
     lyrics:      modal.querySelector('#songLyrics').value,
+    language:    modal.querySelector('#songLanguage').value,
     style:       modal.querySelector('#songStyle').value.trim(),
     singer:      modal.querySelector('#songSinger').value,
     backend:     modal.querySelector('#songBackend').value,
@@ -727,6 +753,12 @@ function applySongFields(modal, fields) {
   modal.querySelector('#songStyle').value   = fields.style || '';
   modal.querySelector('#songSinger').value  = fields.singer || 'auto';
   modal.querySelector('#songBackend').value = fields.backend || 'ace';
+  const langEl = modal.querySelector('#songLanguage');
+  if (langEl) {
+    langEl.value = fields.language || 'auto';
+    if (langEl.value !== (fields.language || 'auto')) langEl.value = 'auto';   // unknown code
+  }
+  applySongDirection(modal);
   const chosen = new Set(fields.instruments || []);
   modal.querySelectorAll('.songInstrument').forEach(el => {
     el.checked = chosen.has(el.value);
@@ -765,8 +797,29 @@ function openCreateSongModal() {
             <input type="text" id="songTitle" placeholder="Song title">
           </div>
           <div class="song-field">
+            <label for="songLanguage">Language <span class="muted">(sung language &amp; reading direction)</span></label>
+            <select id="songLanguage">
+              <option value="auto">Auto - detect from the lyrics</option>
+              <option value="ar">Arabic - عربي (right to left)</option>
+              <option value="en">English</option>
+              <option value="fa">Persian - فارسی (right to left)</option>
+              <option value="ur">Urdu - اردو (right to left)</option>
+              <option value="tr">Turkish</option>
+              <option value="fr">French</option>
+              <option value="es">Spanish</option>
+              <option value="de">German</option>
+              <option value="it">Italian</option>
+              <option value="pt">Portuguese</option>
+              <option value="hi">Hindi</option>
+              <option value="ru">Russian</option>
+              <option value="ja">Japanese</option>
+              <option value="ko">Korean</option>
+              <option value="zh">Chinese</option>
+            </select>
+          </div>
+          <div class="song-field">
             <label for="songLyrics">Verses, Chorus, Bridge, etc.</label>
-            <textarea id="songLyrics" spellcheck="false"
+            <textarea id="songLyrics" data-dir-fixed dir="auto" spellcheck="false"
               placeholder="[Verse 1]&#10;...&#10;&#10;[Chorus]&#10;...&#10;&#10;[Verse 2]&#10;...&#10;&#10;[Bridge]&#10;..."></textarea>
           </div>
           <div class="song-field song-lyrics-tools">
@@ -820,6 +873,11 @@ function openCreateSongModal() {
 
   // Auto-load whatever was last saved (see SONG_DRAFT_KEY note above).
   applySongFields(modal, loadSongDraft());
+  applySongDirection(modal);
+  modal.querySelector('#songLanguage').addEventListener('change', () => {
+    applySongDirection(modal);
+    updateLenNote();
+  });
 
   modal.querySelector('#songCancel').onclick = () => modal.remove();
   modal.addEventListener('click', (e) => {
@@ -832,18 +890,23 @@ function openCreateSongModal() {
   function updateLenNote() {
     const note = modal.querySelector('#songLenNote');
     const text = modal.querySelector('#songLyrics').value;
-    let words = 0, inst = 0;
+    const lang = modal.querySelector('#songLanguage').value;
+    const isArabic = lang === 'ar' || (lang === 'auto' && /[\u0600-\u06FF\u0750-\u077F]{3}/.test(text));
+    const wps = isArabic ? 1.1 : 0.85;                 // seconds per sung word
+    let words = 0, secs = 12;                           // 12s = intro + outro
     text.split(/\r?\n/).forEach(line => {
       const t = line.trim();
       if (!t) return;
-      if (/^\[.*\]$/.test(t)) { if (/inst|intro/i.test(t)) inst++; return; }
-      words += t.split(/\s+/).length;
+      if (/^\[.*\]$/.test(t)) { secs += /inst|intro/i.test(t) ? 10 : 4; return; }
+      const w = t.split(/\s+/).length;
+      words += w;
+      secs += Math.max(2.5, w * wps + 0.8);
     });
     if (!words) { note.textContent = ''; note.style.color = ''; return; }
-    const secs = Math.round(words * 0.9 + 12 + inst * 10);
+    secs = Math.round(secs);
     const mins = (secs / 60).toFixed(1);
-    if (secs > 360) {
-      note.textContent = `~${words} words - needs about ${mins} min, over the 6 min limit (the end may be rushed or cut)`;
+    if (secs > 90) {
+      note.textContent = `~${words} words - about ${mins} min (long songs are made in parts and joined, so it takes longer)`;
       note.style.color = '#ffb020';
     } else {
       note.textContent = `~${words} words - about ${mins} min`;
@@ -931,6 +994,7 @@ function openCreateSongModal() {
       const data = await presetApi('/api/song_presets/' + encodeURIComponent(name));
       // Merge, so a setup saved without lyrics does not wipe the lyrics you have typed.
       applySongFields(modal, Object.assign(readSongFields(modal), data.settings || {}));
+      applySongDirection(modal);
       updateBackendNote();
       updateLenNote();
       showNotice('Setup "' + name + '" loaded', 'success');
@@ -965,7 +1029,7 @@ function openCreateSongModal() {
   };
 
   modal.querySelector('#songClear').onclick = () => {
-    applySongFields(modal, { title: '', lyrics: '', style: '', singer: 'auto', backend: 'ace', instruments: [] });
+    applySongFields(modal, { title: '', lyrics: '', language: 'auto', style: '', singer: 'auto', backend: 'ace', instruments: [] });
     try { localStorage.removeItem(SONG_DRAFT_KEY); } catch (e) {}
     updateBackendNote();
     updateLenNote();
@@ -996,6 +1060,7 @@ function openCreateSongModal() {
     const title = modal.querySelector('#songTitle').value.trim();
     const style = modal.querySelector('#songStyle').value.trim();
     const singer = modal.querySelector('#songSinger').value;
+    const language = modal.querySelector('#songLanguage').value;
     const instruments = Array.from(modal.querySelectorAll('.songInstrument:checked'))
       .map(el => el.value);
 
@@ -1006,7 +1071,7 @@ function openCreateSongModal() {
       const r = await fetch('/api/create_song', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title, lyrics, style, singer, instruments, backend }),
+        body: JSON.stringify({ title, lyrics, language, style, singer, instruments, backend }),
       });
       res = await r.json();
     } catch (e) {

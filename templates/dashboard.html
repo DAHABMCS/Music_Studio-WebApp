@@ -291,4 +291,35 @@
     });
   })();
 </script>
+
+<style>
+  /* Text direction: boxes that contain Arabic start at the right margin and
+     read right-to-left; English stays left-to-right. Per line, from the
+     letters typed. (The Create Song lyrics box is controlled by its own
+     Language selector in app.js and is marked data-dir-fixed.) */
+  textarea, pre, .preview,
+  input[type="text"]:not([readonly]),
+  [contenteditable="true"] { text-align: start; }
+  textarea, pre, .preview { white-space: pre-wrap; }
+  [dir="auto"] { unicode-bidi: plaintext; }
+</style>
+<script>
+  (function () {
+    var AUTO = 'textarea, pre, .preview, input[type="text"]:not([readonly]), ' +
+               '[contenteditable="true"]';
+    function setDir(el) {
+      if (el.hasAttribute('data-dir-fixed')) return;     // managed by app.js
+      el.setAttribute('dir', 'auto');
+    }
+    function mark(node) {
+      if (!node || node.nodeType !== 1) return;
+      if (node.matches(AUTO)) setDir(node);
+      node.querySelectorAll(AUTO).forEach(setDir);
+    }
+    mark(document.body);
+    new MutationObserver(function (changes) {
+      changes.forEach(function (c) { c.addedNodes.forEach(mark); });
+    }).observe(document.body, { childList: true, subtree: true });
+  })();
+</script>
 {% endblock %}

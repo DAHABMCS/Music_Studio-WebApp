@@ -52,12 +52,6 @@ ASSETS_DIR = BASE_DIR / "assets"
 USERS_FILE = BASE_DIR / "users.json"
 JOBS_DIR   = BASE_DIR / "jobs"
 
-# Bundled ACE-Step runtime (shipped next to the exe in the dist folder).
-RUNTIME_DIR = BASE_DIR / "runtime"
-ACE_DIR     = RUNTIME_DIR / "ACE-Step-1.5"
-UV_EXE      = RUNTIME_DIR / "uv.exe"
-HF_CACHE    = RUNTIME_DIR / "hf_cache"
-ACE_LOG     = BASE_DIR / "ace_server.log"
 
 for d in (UPLOAD_DIR, OUTPUT_DIR, ASSETS_DIR, JOBS_DIR):
     d.mkdir(exist_ok=True)
@@ -1193,13 +1187,36 @@ def _run_full_transcription_job(job_id, input_path):
         music_module.convert_input_to_wav(input_path_obj, wav_file)
 
         # --- Stage 2: source separation (optional) ---------------
-        _p(15, "Separating instruments with Demucs...")
+        # New: beat-aligned polyphonic transcription (midi_refine.py).
+        # If it (or its dependencies) isn't available we fall back to the
+        # original pyin pipeline below, so nothing breaks.
+        refine = None
         try:
-            separated = music_module.separate_sources(wav_file, out_dir)
-        except Exception as sep_err:
-            print(f"[full_transcription] source separation failed, "
-                  f"continuing with full mix: {sep_err}")
-            separated = None
+            _rspec = importlib.util.spec_from_file_location(
+                "midi_refine", str(BASE_DIR / "midi_refine.py"))
+            refine = importlib.util.module_from_spec(_rspec)
+            sys.modules["midi_refine"] = refine
+            _rspec.loader.exec_module(refine)
+        except Exception as _re:
+            print(f"[full_transcription] midi_refine unavailable, "
+                  f"using legacy melody path: {_re}")
+            refine = None
+
+        guitar_stem = drums_stem = None
+        if refine is not None:
+            _p(15, "Isolating guitar (Demucs 6-stem)...")
+            guitar_stem, drums_stem = refine.separate_guitar_stems(
+                wav_file, out_dir, log=print)
+
+        separated = guitar_stem
+        if separated is None:
+            _p(15, "Separating instruments with Demucs...")
+            try:
+                separated = music_module.separate_sources(wav_file, out_dir)
+            except Exception as sep_err:
+                print(f"[full_transcription] source separation failed, "
+                      f"continuing with full mix: {sep_err}")
+                separated = None
 
         analysis_audio = separated if separated else wav_file
         stem_copy = out_dir / "02_INSTRUMENTAL_STEM.wav"
@@ -1214,52 +1231,78 @@ def _run_full_transcription_job(job_id, input_path):
         total_duration_seconds = music_module.get_audio_duration_seconds(analysis_audio)
 
         # --- Stage 4: melody -> TAB ------------------------------
-        # extract_melody's librosa.pyin call is a single, long, opaque
-        # blocking call — it can take several minutes on a full song with
-        # no way to report progress from inside it. Previously the status
-        # text just sat frozen on "Extracting guitar melody..." the whole
-        # time, which is indistinguishable from having actually hung. A
-        # lightweight heartbeat thread updates elapsed time in the status
-        # text every few seconds while it runs, so it's visibly alive.
-        _p(45, "Extracting guitar melody (can take several minutes)...")
-        _heartbeat_stop = threading.Event()
+        refined = None
+        if refine is not None:
+            _p(45, "Transcribing guitar notes (beat-aligned, polyphonic)...")
+            try:
+                refined = refine.refine_transcription(
+                    analysis_audio, out_dir,
+                    drums_path=drums_stem,
+                    tempo_hint=tempo_bpm,
+                    progress=lambda m: _p(55, m),
+                    log=print,
+                )
+                tempo_bpm = refined["tempo_bpm"]
+                tab_notes = music_module.make_tab_notes(refined["lead_notes"])
+                print(f"[full_transcription] refined: {refined['n_lead']} solo "
+                      f"notes, {refined['n_rhythm']} rhythm notes, "
+                      f"{refined['tempo_bpm']} BPM, grid={refined['grid']}")
+            except Exception as _rf:
+                import traceback
+                traceback.print_exc()
+                print(f"[full_transcription] refined transcription failed, "
+                      f"falling back to legacy pyin: {_rf}")
+                refined = None
 
-        def _melody_heartbeat():
-            start = time.time()
-            while not _heartbeat_stop.wait(5):
-                elapsed = int(time.time() - start)
-                mm, ss = divmod(elapsed, 60)
-                _p(45, f"Extracting guitar melody... ({mm}m {ss:02d}s elapsed)")
+        if refined is None:
+            # extract_melody's librosa.pyin call is a single, long, opaque
+            # blocking call — it can take several minutes on a full song with
+            # no way to report progress from inside it. Previously the status
+            # text just sat frozen on "Extracting guitar melody..." the whole
+            # time, which is indistinguishable from having actually hung. A
+            # lightweight heartbeat thread updates elapsed time in the status
+            # text every few seconds while it runs, so it's visibly alive.
+            _p(45, "Extracting guitar melody (can take several minutes)...")
+            _heartbeat_stop = threading.Event()
 
-        _hb_thread = threading.Thread(target=_melody_heartbeat, daemon=True)
-        _hb_thread.start()
-        try:
-            raw_notes = music_module.extract_melody(analysis_audio)
-        finally:
-            _heartbeat_stop.set()
-            _hb_thread.join(timeout=1)
+            def _melody_heartbeat():
+                start = time.time()
+                while not _heartbeat_stop.wait(5):
+                    elapsed = int(time.time() - start)
+                    mm, ss = divmod(elapsed, 60)
+                    _p(45, f"Extracting guitar melody... ({mm}m {ss:02d}s elapsed)")
 
-        melody_notes = music_module.smooth_melody(raw_notes)
-        tab_notes    = music_module.make_tab_notes(melody_notes)
+            _hb_thread = threading.Thread(target=_melody_heartbeat, daemon=True)
+            _hb_thread.start()
+            try:
+                raw_notes = music_module.extract_melody(analysis_audio)
+            finally:
+                _heartbeat_stop.set()
+                _hb_thread.join(timeout=1)
+
+            melody_notes = music_module.smooth_melody(raw_notes)
+            tab_notes    = music_module.make_tab_notes(melody_notes)
 
         # --- Stage 5: chords -------------------------------------
         _p(60, "Detecting chords...")
         chords = music_module.detect_chords(analysis_audio, tempo_bpm)
 
         # --- Stage 6: MIDIs --------------------------------------
-        _p(70, "Writing guitar MIDI...")
-        guitar_midi = out_dir / "03_GUITAR_SOLO.mid"
-        music_module.create_guitar_midi(
-            tab_notes, tempo_bpm, guitar_midi,
-            total_duration_seconds=total_duration_seconds,
-        )
+        # (already written by midi_refine when it succeeded)
+        if refined is None:
+            _p(70, "Writing guitar MIDI...")
+            guitar_midi = out_dir / "03_GUITAR_SOLO.mid"
+            music_module.create_guitar_midi(
+                tab_notes, tempo_bpm, guitar_midi,
+                total_duration_seconds=total_duration_seconds,
+            )
 
-        _p(75, "Writing chord MIDI...")
-        chord_midi = out_dir / "04_RHYTHM_CHORDS.mid"
-        music_module.create_chord_midi(
-            chords, tempo_bpm, chord_midi,
-            total_duration_seconds=total_duration_seconds,
-        )
+            _p(75, "Writing chord MIDI...")
+            chord_midi = out_dir / "04_RHYTHM_CHORDS.mid"
+            music_module.create_chord_midi(
+                chords, tempo_bpm, chord_midi,
+                total_duration_seconds=total_duration_seconds,
+            )
 
         # --- Stage 7: PDFs ---------------------------------------
         _p(85, "Generating guitar TAB PDF...")
@@ -1620,23 +1663,48 @@ ACE_STEP_INFER_STEPS = 8            # turbo model: 8 is the recommended value
 ACE_STEP_TIMEOUT_SECONDS = 90 * 60  # give up waiting after this long
 ACE_STEP_POLL_SECONDS = 3
 
+# --- Chunked generation (keeps every request short enough for CPU) ---------
+# The lyrics are split at section boundaries ([verse], [chorus], ...) into
+# chunks of roughly ACE_STEP_CHUNK_SECONDS of audio each, generated one after
+# another with the SAME style/seed, then joined with a short crossfade.
+# Songs that already fit in one chunk are generated in a single request.
+ACE_STEP_CHUNK_SECONDS = float(os.environ.get("ACE_STEP_CHUNK_SECONDS", "60") or 60)
+ACE_STEP_SEED = int(os.environ.get("ACE_STEP_SEED", "12345") or 12345)
+ACE_STEP_BPM = os.environ.get("ACE_STEP_BPM", "").strip()        # e.g. "96" (optional)
+ACE_STEP_KEY = os.environ.get("ACE_STEP_KEY", "").strip()        # e.g. "A minor" (optional)
+ACE_STEP_CROSSFADE_SECONDS = float(os.environ.get("ACE_STEP_CROSSFADE_SECONDS", "1.0") or 1.0)
+ACE_STEP_CHUNK_RETRIES = 1
+
 
 # ============================================================
-# ACE-STEP SERVER HEALTH CHECK + AUTOSTART
+# ACE-STEP SERVER CHECK (this app does NOT start ACE-Step)
 # ------------------------------------------------------------
-# The dashboard polls /api/ace_status right after login (and every
-# ~60s after that) so a user finds out immediately if the bundled
-# ACE-Step server didn't come up, instead of waiting 90 minutes for a
-# Create Song job to time out. See checkAceServer() in app.js.
-#
-# _spawn_ace_hidden() launches the ACE-Step server that ships in
-# runtime/ next to the exe, with no visible console window. Called
-# automatically at startup (see __main__ below) and from /api/ace_start
-# if the user clicks the banner's "Start server" button.
+# ACE-Step must be started separately on the PC that runs it, e.g. with
+# start_ace_step.bat. This app only checks that it is reachable.
+#   - /api/ace_status : used by the dashboard banner
+#   - _require_ace_running() : called before every song request
 # ============================================================
 
-_ACE_PROC = None
-_ACE_PROC_LOCK = threading.Lock()
+ACE_START_HINT = (
+    "Start ACE-Step on the PC that hosts it (run start_ace_step.bat, or "
+    "'cd ACE-Step-1.5' then 'uv run acestep-api'), wait until it prints "
+    "'Uvicorn running on http://127.0.0.1:8001' (about 3 minutes on CPU), "
+    "then try again. Don't close its window while songs are being generated."
+)
+
+
+def _ace_port_open() -> bool:
+    """True if something is listening on the ACE-Step port (it may still be
+    loading models, or busy generating, and not answer /health yet)."""
+    try:
+        from urllib.parse import urlparse
+        u = urlparse(ACE_STEP_API_URL)
+        host = u.hostname or "127.0.0.1"
+        port = u.port or (443 if u.scheme == "https" else 80)
+        with socket.create_connection((host, port), timeout=1.5):
+            return True
+    except Exception:
+        return False
 
 
 def _ace_is_running() -> bool:
@@ -1647,147 +1715,51 @@ def _ace_is_running() -> bool:
         return False
 
 
-def _spawn_ace_hidden():
-    """Start the bundled ACE-Step server with no visible console.
-    Idempotent. Returns (ok, message)."""
-    global _ACE_PROC
-
-    if _ace_is_running():
-        return True, "ACE-Step is already running."
-
-    # If ACE_STEP_API_URL was overridden to a remote host, don't try to
-    # spawn a local server — that's not what the user asked for.
-    if "127.0.0.1" not in ACE_STEP_API_URL and "localhost" not in ACE_STEP_API_URL:
-        return False, (
-            f"ACE_STEP_API_URL is set to a remote server ({ACE_STEP_API_URL}); "
-            "the local bundled runtime won't be started."
-        )
-
-    if not UV_EXE.exists():
-        return False, f"Bundled runtime missing: {UV_EXE} not found."
-    if not ACE_DIR.is_dir():
-        return False, f"Bundled ACE-Step missing: {ACE_DIR} not found."
-
-    with _ACE_PROC_LOCK:
-        if _ace_is_running():
-            return True, "ACE-Step is already running."
-
-        env = os.environ.copy()
-        env["HF_HOME"] = str(HF_CACHE)          # keep models inside runtime/
-        env["UV_TORCH_BACKEND"] = "cpu"         # force CPU build
-        env["ACESTEP_NO_INIT"] = "false"        # load models at startup
-        env.setdefault("PYTHONUTF8", "1")
-        # Propagate the API key to the child so its own auth matches ours.
-        if ACE_STEP_API_KEY:
-            env["ACESTEP_API_KEY"] = ACE_STEP_API_KEY
-
-        try:
-            log = open(ACE_LOG, "ab", buffering=0)
-        except Exception as e:
-            return False, f"Cannot open ACE log {ACE_LOG}: {e}"
-
-        creationflags = 0
-        startupinfo = None
-        if sys.platform.startswith("win"):
-            creationflags = (subprocess.CREATE_NO_WINDOW
-                             | subprocess.DETACHED_PROCESS)
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startupinfo.wShowWindow = subprocess.SW_HIDE
-
-        try:
-            _ACE_PROC = subprocess.Popen(
-                [str(UV_EXE), "run", "acestep-api"],
-                cwd=str(ACE_DIR),
-                env=env,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                creationflags=creationflags,
-                startupinfo=startupinfo,
-                close_fds=True,
-            )
-        except Exception as e:
-            return False, f"Failed to launch ACE-Step: {e}"
-
-    return True, "Starting ACE-Step… (30–120s the first time)"
-
-
 @app.route("/api/ace_status")
 @login_required
 def ace_status():
-    """Used by the dashboard after login to show a warning banner if
-    the bundled ACE-Step server isn't reachable."""
+    """Used by the dashboard to show a warning banner if ACE-Step isn't reachable."""
     try:
         _ace_http("GET", "/health", timeout=5)
         return jsonify(running=True, url=ACE_STEP_API_URL)
     except Exception as e:
-        return jsonify(running=False, url=ACE_STEP_API_URL, error=str(e))
+        return jsonify(running=False, url=ACE_STEP_API_URL, error=str(e),
+                       hint=ACE_START_HINT)
 
 
 @app.route("/api/ace_start", methods=["POST"])
 @login_required
 def ace_start():
-    ok, msg = _spawn_ace_hidden()
-    if not ok:
-        return jsonify(error=msg), 500
-    return jsonify(ok=True, message=msg)
+    """Kept so an old dashboard 'Start server' button doesn't 404. This app
+    no longer starts ACE-Step itself."""
+    return jsonify(error="This app does not start ACE-Step. " + ACE_START_HINT), 400
 
 
-# ------------------------------------------------------------
-# STARTUP WAIT + SHUTDOWN
-# The browser is opened only after ACE-Step answers /health, so the
-# dashboard never loads with "AI Music Generation" unavailable.
-# ACE_WAIT_SECONDS  : max wait before opening the browser anyway (240)
-# ACE_KEEP_RUNNING=1: leave ACE running after the app exits
-# ------------------------------------------------------------
-ACE_WAIT_SECONDS = int(os.environ.get("ACE_WAIT_SECONDS", "240") or 240)
-
-
-def _wait_for_ace(timeout=ACE_WAIT_SECONDS):
-    """Block until ACE-Step answers /health. True if ready."""
-    t0 = time.time()
-    last_msg = 0
-    while time.time() - t0 < timeout:
+def _require_ace_running(progress=None, max_wait=900):
+    """Called before each song request. Returns when ACE-Step answers.
+    If nothing is listening, fail at once with instructions. If the port is
+    open but /health isn't answering yet (models still loading), wait."""
+    if _ace_is_running():
+        return
+    if not _ace_port_open():
+        raise RuntimeError(
+            f"ACE-Step is not running at {ACE_STEP_API_URL}. " + ACE_START_HINT)
+    t0, last = time.time(), 0
+    while time.time() - t0 < max_wait:
         if _ace_is_running():
-            print(f"[ACE] ready after {int(time.time() - t0)}s", flush=True)
-            return True
-        if _ACE_PROC is not None and _ACE_PROC.poll() is not None:
-            print(f"[ACE] process exited early (code {_ACE_PROC.returncode}) "
-                  f"- see {ACE_LOG}", flush=True)
-            return False
-        if time.time() - last_msg >= 10:
-            print(f"[ACE] loading models... {int(time.time() - t0)}s", flush=True)
-            last_msg = time.time()
+            return
+        if progress and time.time() - last >= 10:
+            last = time.time()
+            progress(18, f"Waiting for ACE-Step to finish loading... "
+                         f"{int(time.time() - t0)}s")
         time.sleep(2)
-    print(f"[ACE] not ready after {timeout}s - opening the app anyway.", flush=True)
-    return False
-
-
-def _stop_ace():
-    """Kill ACE-Step (and the child python that uv spawns) on app exit."""
-    if os.environ.get("ACE_KEEP_RUNNING", "0") == "1":
-        return
-    proc = _ACE_PROC
-    if proc is None or proc.poll() is not None:
-        return
-    try:
-        if sys.platform.startswith("win"):
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           creationflags=subprocess.CREATE_NO_WINDOW)
-        else:
-            proc.terminate()
-    except Exception:
-        pass
-
-
-import atexit
-atexit.register(_stop_ace)
+    raise RuntimeError(
+        f"ACE-Step is listening at {ACE_STEP_API_URL} but not answering after "
+        f"{max_wait // 60} minutes. Check its window for errors.")
 
 
 def generate_song_audio(lyrics, style, instruments, singer, out_path,
-                         backend="ace", progress_cb=None):
+                         backend="ace", progress_cb=None, language=""):
     """Generate a song and write it to out_path. `backend` selects which
     engine does the work — routed here from the dashboard's Backend
     dropdown in the Create Song modal:
@@ -1799,7 +1771,7 @@ def generate_song_audio(lyrics, style, instruments, singer, out_path,
         return generate_song_audio_musicgen(style, instruments, out_path,
                                              progress_cb=progress_cb)
     return generate_song_audio_ace(lyrics, style, instruments, singer, out_path,
-                                    progress_cb=progress_cb)
+                                    progress_cb=progress_cb, language=language)
 
 
 def _ace_http(method, path, payload=None, timeout=60):
@@ -1890,32 +1862,52 @@ def _clean_lyrics_for_ace(lyrics):
     return "\n\n".join(out) if out else lyrics
 
 
-def _needed_seconds(lyrics_for_model):
-    """Rough song length (seconds) so the words actually fit. Too short a
-    duration for the amount of text = rushed, garbled or missing vocals."""
-    words = 0
-    empty_inst = 0
+def _normalize_language(value):
+    """The Create Song language choice -> an ACE-Step language code.
+    "", "auto", None or anything unrecognised -> "" (= detect from the lyrics)."""
+    v = str(value or "").strip().lower()
+    if v in ("", "auto"):
+        return ""
+    return v if _re.fullmatch(r"[a-z]{2,3}", v) else ""
+
+
+def _needed_seconds(lyrics_for_model, language=""):
+    """Song length (seconds) needed to actually sing all the lyrics.
+    A sung line takes longer than its word count suggests (held notes, a
+    breath between lines), and Arabic words are long and stretched when sung.
+    Too short a duration = rushed, garbled or missing vocals.
+    Tune with ACE_STEP_SECONDS_PER_WORD (e.g. 1.2 if lyrics still get cut off,
+    0.7 if the song has too much empty music)."""
+    forced = os.environ.get("ACE_STEP_SECONDS_PER_WORD", "").strip()
+    if forced:
+        wps = float(forced)
+    else:
+        wps = 1.1 if _guess_vocal_language(lyrics_for_model, language) == "ar" else 0.85
+    total = 12.0                                   # intro + outro
     for line in lyrics_for_model.split("\n"):
         line = line.strip()
         if not line:
             continue
         if line.startswith("["):
-            if "inst" in line.lower() or "intro" in line.lower():
-                empty_inst += 1
+            low = line.lower()
+            total += 10 if ("inst" in low or "intro" in low) else 4   # gap between sections
             continue
-        words += len(line.split())
-    return float(round(words * 0.9 + 12 + empty_inst * 10))
+        total += max(2.5, len(line.split()) * wps + 0.8)
+    return float(round(total))
 
 
-def _auto_duration(lyrics_for_model):
+def _auto_duration(lyrics_for_model, language=""):
     """Needed time, kept inside the 30s..360s range the server allows."""
-    return float(max(30, min(360, _needed_seconds(lyrics_for_model))))
+    return float(max(30, min(360, _needed_seconds(lyrics_for_model, language))))
 
 
-def _guess_vocal_language(text):
-    """Pick ACE-Step's vocal_language from the script the lyrics are
-    written in. Wrong language = weak or missing vocals, so this matters.
-    Override with the ACE_STEP_VOCAL_LANGUAGE env var (e.g. "ar")."""
+def _guess_vocal_language(text, language=""):
+    """Pick ACE-Step's vocal_language. Order: the language chosen in the
+    Create Song window, then the ACE_STEP_VOCAL_LANGUAGE env var, then the
+    script the lyrics are written in. Wrong language = weak or missing
+    vocals, so this matters."""
+    if language:
+        return language
     forced = os.environ.get("ACE_STEP_VOCAL_LANGUAGE", "").strip()
     if forced:
         return forced
@@ -1938,9 +1930,11 @@ def _guess_vocal_language(text):
     return best if counts[best] >= 3 else "en"
 
 
-def generate_song_audio_ace(lyrics, style, instruments, singer, out_path, progress_cb=None):
-    """Generate a song from lyrics + style and write it to out_path, by
-    calling a running ACE-Step 1.5 REST API server (local or remote)."""
+def _ace_generate_one(lyrics, style, instruments, singer, out_path, progress_cb=None,
+                      seed=None, bpm=None, key_scale=None, language=""):
+    """Generate ONE piece of audio (a whole short song, or one chunk of a long
+    song) and write it to out_path, by calling a running ACE-Step 1.5 REST
+    API server (local or remote)."""
 
     warn_prefix = ""
 
@@ -1969,9 +1963,18 @@ def generate_song_audio_ace(lyrics, style, instruments, singer, out_path, progre
         lyrics_for_model = "[instrumental]"
     else:
         lyrics_for_model = _clean_lyrics_for_ace(lyrics)
-    vocal_language = _guess_vocal_language(lyrics_for_model)
-    duration = ACE_STEP_DURATION_SECONDS or _auto_duration(lyrics_for_model)
-    needed = _needed_seconds(lyrics_for_model)
+    vocal_language = _guess_vocal_language(lyrics_for_model, language)
+    # Name the sung language in the style prompt as well as in vocal_language;
+    # without it non-English vocals are often mumbled or sung with an English accent.
+    _lang_names = {"ar": "Arabic", "zh": "Chinese", "ja": "Japanese",
+                   "ko": "Korean", "ru": "Russian", "es": "Spanish",
+                   "fr": "French", "de": "German", "it": "Italian",
+                   "pt": "Portuguese", "hi": "Hindi", "tr": "Turkish",
+                   "fa": "Persian", "ur": "Urdu"}
+    if singer != "instrumental" and vocal_language in _lang_names:
+        tags = f"{_lang_names[vocal_language]} vocals, sung in {_lang_names[vocal_language]}, " + tags
+    duration = ACE_STEP_DURATION_SECONDS or _auto_duration(lyrics_for_model, vocal_language)
+    needed = _needed_seconds(lyrics_for_model, vocal_language)
     if singer != "instrumental" and needed > duration + 5:
         warn_prefix = (f"WARNING: these lyrics need about {needed / 60:.1f} min but this song is "
                        f"limited to {duration / 60:.1f} min, so the end may be rushed or cut off. "
@@ -1981,12 +1984,13 @@ def generate_song_audio_ace(lyrics, style, instruments, singer, out_path, progre
           f"duration={duration}s\n--- lyrics sent ---\n{lyrics_for_model}\n-------------------",
           flush=True)
 
+    _require_ace_running(_p)
     _p(18, f"Connecting to ACE-Step server at {ACE_STEP_API_URL}...")
     _ace_http("GET", "/health", timeout=15)
 
     _p(25, f"Submitting ~{int(duration)}s song to ACE-Step "
            "(first run downloads models on the server — can take a while)...")
-    submit = json.loads(_ace_http("POST", "/release_task", {
+    payload = {
         "prompt": tags,
         "lyrics": lyrics_for_model,
         "audio_duration": duration,
@@ -1998,7 +2002,16 @@ def generate_song_audio_ace(lyrics, style, instruments, singer, out_path, progre
         "thinking": False,
         "use_cot_caption": False,
         "use_cot_language": False,
-    }).decode("utf-8"))
+    }
+    # Same seed / tempo / key for every chunk keeps the sound consistent.
+    if seed is not None:
+        payload["seed"] = int(seed)
+        payload["use_random_seed"] = False
+    if bpm:
+        payload["bpm"] = int(float(bpm))
+    if key_scale:
+        payload["key_scale"] = key_scale
+    submit = json.loads(_ace_http("POST", "/release_task", payload).decode("utf-8"))
     task_id = ((submit or {}).get("data") or {}).get("task_id")
     if not task_id:
         raise RuntimeError(f"ACE-Step did not accept the task: {submit!r}")
@@ -2063,6 +2076,133 @@ def generate_song_audio_ace(lyrics, style, instruments, singer, out_path, progre
         raise RuntimeError("ACE-Step returned an empty audio file.")
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     Path(out_path).write_bytes(audio)
+
+
+def _split_ace_chunks(lyrics_for_model, limit_seconds, language=""):
+    """Group cleaned lyric sections into chunks of <= limit_seconds of audio.
+    Never splits inside a section; one oversized section becomes its own chunk."""
+    blocks = [b.strip() for b in _re.split(r"\n\s*\n", lyrics_for_model) if b.strip()]
+    chunks, cur, cur_sec = [], [], 0.0
+    for b in blocks:
+        sec = max(_needed_seconds(b, language) - 12, 5.0)     # drop the per-call base
+        if cur and cur_sec + sec + 12 > limit_seconds:
+            chunks.append("\n\n".join(cur))
+            cur, cur_sec = [], 0.0
+        cur.append(b)
+        cur_sec += sec
+    if cur:
+        chunks.append("\n\n".join(cur))
+    return chunks
+
+
+def _join_audio_chunks(paths, out_path, crossfade):
+    """Join WAV chunks into out_path with ffmpeg (already required by this app).
+    Crossfades the seams; falls back to a plain join if the crossfade fails."""
+    ff = shutil.which("ffmpeg")
+    if ff is None:
+        raise RuntimeError(
+            "ffmpeg is required to join the song chunks but wasn't found on PATH. "
+            f"The individual parts are saved in: {Path(paths[0]).parent}")
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    n = len(paths)
+
+    def _run(filter_graph, last_label):
+        cmd = [ff, "-y"]
+        for p in paths:
+            cmd += ["-i", str(p)]
+        cmd += ["-filter_complex", filter_graph, "-map", last_label,
+                "-c:a", "pcm_s16le", str(out_path)]
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", creationflags=flags)
+
+    attempts = []
+    if crossfade > 0:
+        parts, prev = [], "[0:a]"
+        for k in range(1, n):
+            lab = f"[x{k}]"
+            parts.append(f"{prev}[{k}:a]acrossfade=d={crossfade}:c1=tri:c2=tri{lab}")
+            prev = lab
+        attempts.append((";".join(parts), prev))
+    attempts.append(("".join(f"[{k}:a]" for k in range(n)) + f"concat=n={n}:v=0:a=1[out]", "[out]"))
+
+    last_err = ""
+    for graph, label in attempts:
+        proc = _run(graph, label)
+        if proc.returncode == 0 and Path(out_path).exists() and Path(out_path).stat().st_size > 1000:
+            return
+        last_err = (proc.stderr or "")[-600:]
+        print(f"[ACE-Step] join attempt failed: {last_err}", flush=True)
+    raise RuntimeError(f"ffmpeg could not join the song chunks: {last_err}")
+
+
+def generate_song_audio_ace(lyrics, style, instruments, singer, out_path, progress_cb=None,
+                            language=""):
+    """Generate a song with ACE-Step. Long songs are split into section-based
+    chunks (each short enough for CPU), generated one by one with the same
+    seed/style, then joined with a crossfade. Short songs use one request."""
+
+    def _p(value, status):
+        if progress_cb:
+            progress_cb(value, status)
+
+    one_kw = dict(seed=ACE_STEP_SEED, bpm=ACE_STEP_BPM or None, key_scale=ACE_STEP_KEY or None,
+                  language=language)
+
+    # Instrumental, or the user forced a fixed length: single request.
+    if singer == "instrumental" or ACE_STEP_DURATION_SECONDS:
+        return _ace_generate_one(lyrics, style, instruments, singer, out_path,
+                                 progress_cb=progress_cb, **one_kw)
+
+    chunks = _split_ace_chunks(_clean_lyrics_for_ace(lyrics), ACE_STEP_CHUNK_SECONDS, language)
+    if len(chunks) <= 1:
+        return _ace_generate_one(lyrics, style, instruments, singer, out_path,
+                                 progress_cb=progress_cb, **one_kw)
+
+    out_path = Path(out_path)
+    chunk_dir = out_path.parent / "chunks"
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    n = len(chunks)
+    print(f"[ACE-Step] splitting song into {n} chunks "
+          f"(~{ACE_STEP_CHUNK_SECONDS:.0f}s each)", flush=True)
+
+    paths = []
+    for i, text in enumerate(chunks):
+        cp = chunk_dir / f"{out_path.stem}_part{i + 1:02d}.wav"
+        if cp.exists() and cp.stat().st_size > 1000:        # already done
+            paths.append(cp)
+            continue
+
+        def _cp(v, s, i=i):
+            frac = (i + min(max(float(v), 0.0), 100.0) / 100.0) / n
+            _p(15 + frac * 75, f"Chunk {i + 1}/{n}: {s}")
+
+        attempt = 0
+        while True:
+            t0 = time.time()
+            try:
+                _ace_generate_one(text, style, instruments, singer, str(cp),
+                                  progress_cb=_cp, **one_kw)
+                break
+            except RuntimeError as e:
+                took = time.time() - t0
+                # A failure after ~10 min is almost certainly the server's
+                # generation timeout; its worker may still be running, so a
+                # retry would only compete with it. Restart ACE-Step instead.
+                if attempt >= ACE_STEP_CHUNK_RETRIES or took > 540:
+                    raise RuntimeError(
+                        f"Chunk {i + 1}/{n} failed after {int(took)}s: {e}. "
+                        f"Chunks finished so far are in {chunk_dir}. "
+                        "If this was a timeout, restart ACE-Step and use a smaller "
+                        "ACE_STEP_CHUNK_SECONDS (e.g. 30).")
+                attempt += 1
+                print(f"[ACE-Step] chunk {i + 1}/{n} failed ({e}); retrying "
+                      f"({attempt}/{ACE_STEP_CHUNK_RETRIES})...", flush=True)
+                time.sleep(5)
+        paths.append(cp)
+
+    _p(92, f"Joining {n} chunks...")
+    _join_audio_chunks(paths, out_path, ACE_STEP_CROSSFADE_SECONDS)
+    _p(98, "Song joined.")
 
 
 # Populated on first use by generate_song_audio_musicgen() — same reasoning
@@ -2157,16 +2297,19 @@ def create_song():
         }
         _save_job(job_id)
 
+    language = _normalize_language(data.get("language"))
+
     threading.Thread(
         target=_run_create_song_job,
-        args=(job_id, title, lyrics, style, instruments, singer, backend),
+        args=(job_id, title, lyrics, style, instruments, singer, backend, language),
         daemon=True,
     ).start()
 
     return jsonify(job_id=job_id)
 
 
-def _run_create_song_job(job_id, title, lyrics, style, instruments, singer, backend="ace"):
+def _run_create_song_job(job_id, title, lyrics, style, instruments, singer, backend="ace",
+                         language=""):
     try:
         with LOCK:
             user = JOBS[job_id].get("user", "shared")
@@ -2194,13 +2337,15 @@ def _run_create_song_job(job_id, title, lyrics, style, instruments, singer, back
             "singer": singer,
             "instruments": instruments,
             "backend": backend,
+            "language": language or "auto",
         }, indent=2), encoding="utf-8")
 
         _p(15, f"Generating song with {backend}...")
         # .wav, not .mp3 — both backends output WAV audio.
         out_path = songs_folder / f"{stem}.wav"
         generate_song_audio(lyrics, style, instruments, singer,
-                             str(out_path), backend=backend, progress_cb=_p)
+                             str(out_path), backend=backend, progress_cb=_p,
+                             language=language)
 
         with LOCK:
             JOBS[job_id]["progress"] = 100
@@ -2227,7 +2372,7 @@ def _run_create_song_job(job_id, title, lyrics, style, instruments, singer, back
 # Stored per user in outputs/<user>/Presets/<name>.json
 # ============================================================
 
-PRESET_KEYS = ("title", "style", "singer", "instruments", "backend", "lyrics")
+PRESET_KEYS = ("title", "style", "singer", "instruments", "backend", "lyrics", "language")
 PRESET_MAX_BYTES = 200_000
 
 
@@ -2465,11 +2610,8 @@ def _lan_ip():
         s.close()
 
 
-def _open_browser(port, wait_for_ace=False):
-    """Wait until the server is actually accepting connections (and, if
-    requested, until ACE-Step is ready), then open the default browser.
-    Runs in a background thread so it doesn't block the server's startup
-    call (serve() / app.run() never return)."""
+def _open_browser(port):
+    """Wait until the server accepts connections, then open the default browser."""
     import webbrowser
 
     def _wait_and_open():
@@ -2481,8 +2623,6 @@ def _open_browser(port, wait_for_ace=False):
                     break
             except OSError:
                 time.sleep(0.3)
-        if wait_for_ace:
-            _wait_for_ace()
         webbrowser.open(url)
 
     threading.Thread(target=_wait_and_open, daemon=True).start()
@@ -2491,13 +2631,13 @@ def _open_browser(port, wait_for_ace=False):
 if __name__ == "__main__":
     ip = _lan_ip()
 
-    # Auto-start ACE-Step silently. Set ACE_AUTOSTART=0 in the environment
-    # to disable (e.g. when pointing ACE_STEP_API_URL at a remote server).
-    wait_ace = False
-    if os.environ.get("ACE_AUTOSTART", "1") == "1":
-        ok, msg = _spawn_ace_hidden()
-        print(f"[ACE autostart] {msg}")
-        wait_ace = ok          # only wait if ACE is actually starting/running
+    # ACE-Step is NOT started by this app. Start it separately on this PC.
+    if _ace_is_running():
+        print(f"[ACE] ACE-Step is reachable at {ACE_STEP_API_URL}", flush=True)
+    else:
+        print(f"[ACE] ACE-Step is NOT running at {ACE_STEP_API_URL}. "
+              "Start it separately (start_ace_step.bat) before creating songs.",
+              flush=True)
 
     try:
         from waitress import serve
@@ -2505,7 +2645,7 @@ if __name__ == "__main__":
         print("Starting production server (waitress)")
         print(f" * Running on http://127.0.0.1:{port}")
         print(f" * Running on http://{ip}:{port}")
-        _open_browser(port, wait_for_ace=wait_ace)
+        _open_browser(port)
         serve(app, host="0.0.0.0", port=port)
     except ImportError:
         port = 5000
@@ -2513,5 +2653,5 @@ if __name__ == "__main__":
         print("Run 'pip install waitress' to use the production server instead.")
         print(f" * Running on http://127.0.0.1:{port}")
         print(f" * Running on http://{ip}:{port}")
-        _open_browser(port, wait_for_ace=wait_ace)
+        _open_browser(port)
         app.run(host="0.0.0.0", port=port, debug=False, threaded=True)

@@ -308,6 +308,11 @@ def extract_melody(audio_file):
 
     times = librosa.times_like(f0, sr=sr, hop_length=512)
 
+    # BUGFIX: librosa.effects.trim() removed leading silence above, but the
+    # offset was thrown away, so every note time was shifted EARLIER by the
+    # trimmed amount. Add it back so notes line up with the real audio.
+    times = times + float(index[0]) / sr
+
     # A fixed 0.60 confidence cutoff can wipe out entire sections
     # of a song (anything not a very clean, isolated single note).
     # Instead, use an adaptive threshold based on the distribution
@@ -459,24 +464,53 @@ def find_best_guitar_position(midi_number, previous_position=None):
     return min(possibilities, key=cost)
 
 
+def _all_positions(midi_number, max_fret=19):
+    return [(sn, midi_number - om) for sn, om in GUITAR_TUNING.items()
+            if 0 <= midi_number - om <= max_fret]
+
+
 def make_tab_notes(notes):
-    result = []
-    previous_position = None
-
+    """Choose string/fret for every note with dynamic programming so the
+    WHOLE line is playable (small hand movement, low positions), instead of
+    the old greedy choice that could wander up to fret 17 and back."""
+    cand = []
     for n in notes:
-        position = find_best_guitar_position(n["midi"], previous_position)
-        if position is None:
-            continue
+        pos = _all_positions(n["midi"])
+        if not pos:                       # out of range -> skip like before
+            pos = _all_positions(n["midi"], max_fret=22)
+        cand.append(pos)
+    keep = [i for i, p in enumerate(cand) if p]
+    if not keep:
+        return []
 
-        string_number, fret = position
-        item = dict(n)
-        item["string"] = string_number
-        item["fret"] = fret
-        item["note_name"] = midi_to_note_name(n["midi"])
+    def local(p):                         # prefer open/low positions
+        return 0.15 * max(0, p[1] - 7) + (0.6 if p[1] > 12 else 0.0)
 
+    def move(a, b):
+        return abs(a[1] - b[1]) * 0.8 + abs(a[0] - b[0]) * 0.5
+
+    cost = [{p: local(p) for p in cand[keep[0]]}]
+    back = [{}]
+    for ii in range(1, len(keep)):
+        cur, bk = {}, {}
+        for p in cand[keep[ii]]:
+            best_prev = min(cost[-1], key=lambda q: cost[-1][q] + move(q, p))
+            cur[p] = cost[-1][best_prev] + move(best_prev, p) + local(p)
+            bk[p] = best_prev
+        cost.append(cur); back.append(bk)
+    p = min(cost[-1], key=cost[-1].get)
+    chosen = [p]
+    for ii in range(len(keep) - 1, 0, -1):
+        p = back[ii][p]
+        chosen.append(p)
+    chosen.reverse()
+
+    result = []
+    for i, (sn, fr) in zip(keep, chosen):
+        item = dict(notes[i])
+        item["string"], item["fret"] = sn, fr
+        item["note_name"] = midi_to_note_name(notes[i]["midi"])
         result.append(item)
-        previous_position = position
-
     return result
 
 
@@ -523,86 +557,131 @@ def detect_tempo(audio_file):
 # CHORD DETECTION
 # ============================================================
 
+def _major_minor_profiles():
+    maj = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
+    mnr = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+    return maj, mnr
+
+
+def estimate_key(chroma):
+    """Krumhansl-Schmuckler key estimate from a (12, T) chroma matrix.
+    Returns (tonic_pitch_class, 'major'|'minor')."""
+    maj, mnr = _major_minor_profiles()
+    c = np.asarray(chroma).mean(axis=1)
+    best = (-2.0, 0, "major")
+    for k in range(12):
+        for prof, mode in ((maj, "major"), (mnr, "minor")):
+            r = np.corrcoef(c, np.roll(prof, k))[0, 1]
+            if r > best[0]:
+                best = (r, k, mode)
+    return best[1], best[2]
+
+
+def _diatonic_triads(tonic, mode):
+    """Set of (root_pc, suffix) triads that belong to the key (natural minor
+    also admits the major V, and major also admits the minor iv/v pairs that
+    are common in rock/pop)."""
+    scale = [0, 2, 4, 5, 7, 9, 11] if mode == "major" else [0, 2, 3, 5, 7, 8, 10]
+    qual_major = ["", "m", "m", "", "", "m", "dim"]
+    qual_minor = ["m", "dim", "", "m", "m", "", ""]
+    quals = qual_major if mode == "major" else qual_minor
+    out = {((tonic + d) % 12, q) for d, q in zip(scale, quals)}
+    if mode == "minor":
+        out.add(((tonic + 7) % 12, ""))    # major V (harmonic minor)
+    return out
+
+
 def chord_name_from_chroma(chroma_vector):
-    chroma_vector = np.asarray(chroma_vector)
-
-    if np.max(chroma_vector) <= 0:
+    """Kept for compatibility: best plain triad for one chroma vector."""
+    v = np.asarray(chroma_vector, dtype=float)
+    if v.max() <= 0:
         return "N"
-
-    chroma_vector = chroma_vector / np.max(chroma_vector)
-
-    best_name = "N"
-    best_score = -999
-
+    v = v / np.linalg.norm(v)
+    best, best_score = "N", -1.0
     for root in range(12):
-        for suffix, intervals in CHORD_TEMPLATES.items():
-            template = np.zeros(12)
-            for interval in intervals:
-                template[(root + interval) % 12] = 1
-
-            # weighted similarity
-            score = np.dot(chroma_vector, template)
-            # Reward root
-            score += chroma_vector[root] * 0.5
-
-            if score > best_score:
-                best_score = score
-                best_name = NOTE_NAMES[root] + suffix
-
-    # Reject very weak matches
-    if best_score < 1.0:
-        return "N"
-
-    return best_name
+        for suffix in ("", "m"):
+            t = np.zeros(12)
+            for iv, w in zip(CHORD_TEMPLATES[suffix], (1.0, 0.8, 0.9)):
+                t[(root + iv) % 12] = w
+            sc = float(v @ (t / np.linalg.norm(t)))
+            if sc > best_score:
+                best, best_score = NOTE_NAMES[root] + suffix, sc
+    return best
 
 
-def detect_chords(audio_file, tempo_bpm):
+def detect_chords(audio_file, tempo_bpm, window_beats=2, switch_penalty=0.15,
+                  off_key_penalty=0.12):
+    """Triad-first, key-aware chord detection.
+
+    Why this replaced the old per-beat 7th-chord matcher:
+      * 4-note templates (maj7/m7/7) always out-score the matching triad
+        because extra template notes are never penalised -> ~95% of chords
+        came out as 7ths and flipped between maj/min every beat.
+      * Each beat was decided independently, with no key or continuity.
+    Now: harmonic-percussive split -> 36-bin CQT chroma -> window of
+    `window_beats` beats -> cosine similarity against major/minor triads ->
+    a prior for chords belonging to the detected key -> Viterbi smoothing
+    (changing chord costs `switch_penalty`).
+    """
     print("\nDetecting chords...")
+    y, sr = librosa.load(str(audio_file), sr=22050, mono=True)
+    y_h = librosa.effects.harmonic(y, margin=2)
+    hop = 2048
+    chroma = librosa.feature.chroma_cqt(y=y_h, sr=sr, hop_length=hop,
+                                        bins_per_octave=36)
+    frame_times = librosa.frames_to_time(np.arange(chroma.shape[1]), sr=sr,
+                                         hop_length=hop)
+    tonic, mode = estimate_key(chroma)
+    print(f"  Estimated key: {NOTE_NAMES[tonic]} {mode}")
 
-    y, sr = librosa.load(str(audio_file), sr=SAMPLE_RATE, mono=True)
+    cands = [(r, q) for r in range(12) for q in ("", "m")]
+    tmpl = []
+    for r, q in cands:
+        t = np.zeros(12)
+        for iv, w in zip(CHORD_TEMPLATES[q], (1.0, 0.8, 0.9)):
+            t[(r + iv) % 12] = w
+        tmpl.append(t / np.linalg.norm(t))
+    tmpl = np.array(tmpl)
+    diatonic = _diatonic_triads(tonic, mode)
+    prior = np.array([0.0 if c in diatonic else -off_key_penalty for c in cands])
 
-    hop_length = 2048
-    chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop_length)
-
-    frame_times = librosa.frames_to_time(
-        np.arange(chroma.shape[1]),
-        sr=sr,
-        hop_length=hop_length
-    )
-
-    # One chord per beat
-    beat_length = 60.0 / tempo_bpm
+    win = max(0.2, window_beats * 60.0 / tempo_bpm)
     duration = len(y) / sr
-
-    chords = []
+    starts, X = [], []
     t = 0.0
     while t < duration:
-        end = min(t + beat_length, duration)
-        mask = (frame_times >= t) & (frame_times < end)
+        m = (frame_times >= t) & (frame_times < t + win)
+        v = chroma[:, m].mean(axis=1) if m.any() else np.ones(12)
+        X.append(v / (np.linalg.norm(v) + 1e-9))
+        starts.append(t)
+        t += win
+    X = np.array(X)
+    score = X @ tmpl.T + prior
+    n, k = score.shape
 
-        if np.any(mask):
-            vector = np.mean(chroma[:, mask], axis=1)
-            chord_name = chord_name_from_chroma(vector)
+    dp = np.zeros((n, k)); back = np.zeros((n, k), dtype=int)
+    dp[0] = score[0]
+    idx = np.arange(k)
+    for i in range(1, n):
+        for j in range(k):
+            cand = dp[i - 1] - np.where(idx == j, 0.0, switch_penalty)
+            back[i, j] = int(cand.argmax())
+            dp[i, j] = cand[back[i, j]] + score[i, j]
+    path = [int(dp[-1].argmax())]
+    for i in range(n - 1, 0, -1):
+        path.append(int(back[i, path[-1]]))
+    path.reverse()
+
+    chords = []
+    for i, p in enumerate(path):
+        name = NOTE_NAMES[cands[p][0]] + cands[p][1]
+        end = min(starts[i] + win, duration)
+        if chords and chords[-1]["chord"] == name:
+            chords[-1]["end"] = end
         else:
-            chord_name = "N"
-
-        chords.append({
-            "start": t,
-            "end": end,
-            "chord": chord_name
-        })
-        t = end
-
-    # Merge consecutive identical chords
-    merged = []
-    for item in chords:
-        if merged and merged[-1]["chord"] == item["chord"]:
-            merged[-1]["end"] = item["end"]
-        else:
-            merged.append(dict(item))
-
-    print("Chord segments:", len(merged))
-    return merged
+            chords.append({"start": starts[i], "end": end, "chord": name})
+    print("Chord segments:", len(chords))
+    return chords
 
 
 # ============================================================
@@ -718,7 +797,12 @@ def create_chord_midi(
             root_name += "-"
 
         try:
-            c = chord.Chord(root_name)
+            # BUGFIX: chord.Chord("Em") builds ONE root note, not a chord.
+            # Build the real chord tones from the detected quality.
+            _rl = 2 if len(name) > 1 and name[1] in "#b" else 1
+            _pc = NOTE_NAMES.index(name[:_rl]) if name[:_rl] in NOTE_NAMES else 0
+            _iv = CHORD_TEMPLATES.get(name[_rl:], [0, 4, 7])
+            c = chord.Chord([48 + _pc + i for i in _iv])
             c.duration.quarterLength = quarter_length
             part.append(c)
             cursor_seconds = item["end"]
@@ -769,126 +853,86 @@ def draw_guitar_tab_pdf(
     tab_notes,
     tempo_bpm,
     output_file,
-    title="Guitar Solo — Standard Notation + TAB"
+    title="Guitar Solo — TAB",
+    beats_per_bar=4,
+    bars_per_row=4,
+    first_bar_offset_beats=0.0,
 ):
+    """Time-proportional solo TAB: 4 bars per row, bar lines, bar numbers,
+    note stems showing duration class. Notes sit where they occur in time,
+    so rhythm is visible (the old version just listed 12 notes per row with
+    no bars or durations).  `first_bar_offset_beats` shifts the bar lines if
+    the downbeat is not at t=0."""
     print("\nCreating guitar TAB PDF...")
-
     page_width, page_height = A4
-
     c = canvas.Canvas(str(output_file), pagesize=A4)
-    margin = 40
+    margin = 45
     c.setTitle(title)
-
-    # Header
     c.setFont("Helvetica-Bold", 16)
     c.drawString(margin, page_height - 45, title)
-
     c.setFont("Helvetica", 9)
-    c.drawString(
-        margin,
-        page_height - 60,
-        f"Detected tempo: {tempo_bpm:.1f} BPM    "
-        f"Standard tuning: E A D G B E"
-    )
+    c.drawString(margin, page_height - 60,
+                 f"Tempo ~{tempo_bpm:.0f} BPM   Standard tuning E A D G B E   "
+                 f"{bars_per_row} bars per line (draft - check by ear)")
 
-    y = page_height - 100
-    line_spacing = 12
-    notes_per_row = 12
-
-    rows = [
-        tab_notes[i:i + notes_per_row]
-        for i in range(0, len(tab_notes), notes_per_row)
-    ]
-
-    if not rows:
+    if not tab_notes:
         c.setFont("Helvetica", 12)
-        c.drawString(margin, y, "No reliable guitar melody was detected.")
+        c.drawString(margin, page_height - 100, "No reliable guitar melody was detected.")
+        c.save()
+        return output_file
 
-    for row_index, row in enumerate(rows):
-        if y < 130:
+    beat = 60.0 / tempo_bpm
+    off = first_bar_offset_beats * beat
+    row_beats = beats_per_bar * bars_per_row
+    row_dur = row_beats * beat
+    total_end = max(n["end"] for n in tab_notes)
+    rows = max(1, math.ceil((total_end - off) / row_dur))
+    x0, x1 = margin + 22, page_width - margin
+    spacing = 11
+    y = page_height - 105
+
+    for r in range(rows):
+        if y < 110:
             c.showPage()
             y = page_height - 60
-            c.setFont("Helvetica-Bold", 16)
+            c.setFont("Helvetica-Bold", 14)
             c.drawString(margin, y, title + " — continued")
-            y -= 45
-
-        # ----------------------------------------------------
-        # Standard notation area
-        # ----------------------------------------------------
-        notation_y = y
-
-        c.setFont("Helvetica-Bold", 9)
-        c.drawString(margin, notation_y + 30, "STANDARD NOTATION")
-
-        staff_top = notation_y + 15
-        for line in range(5):
-            yy = staff_top - line * 6
-            c.line(margin, yy, page_width - margin, yy)
-
-        # Treble clef
-        c.setFont("Times-Bold", 22)
-        c.drawString(margin + 5, staff_top - 25, "𝄞")
-
-        # Draw approximate noteheads
-        x_start = margin + 45
-        x_end = page_width - margin - 10
-        usable_width = x_end - x_start
-        step = usable_width / max(1, len(row))
-
-        for i, n in enumerate(row):
-            x = x_start + i * step
-            midi = n["midi"]
-            staff_position = (midi - 64) * 0.85
-            note_y = staff_top - 24 + staff_position
-
-            c.ellipse(
-                x - 3, note_y - 2, x + 3, note_y + 2,
-                stroke=1, fill=1
-            )
-            c.line(x + 3, note_y, x + 3, note_y + 22)
-
-            c.setFont("Helvetica", 6)
-            c.drawCentredString(x, staff_top - 43, n["note_name"])
-
-        # ----------------------------------------------------
-        # TAB
-        # ----------------------------------------------------
-        tab_top = y - 55
-
-        c.setFont("Helvetica-Bold", 9)
-        c.drawString(margin, tab_top + 12, "GUITAR TAB")
-
-        for string_number in range(1, 7):
-            yy = tab_top - (string_number - 1) * line_spacing
-            c.line(margin, yy, page_width - margin, yy)
-
+            y -= 40
+        t0 = off + r * row_dur
+        top = y
+        for sn in range(1, 7):
+            yy = top - (sn - 1) * spacing
+            c.setLineWidth(0.4)
+            c.line(x0, yy, x1, yy)
             c.setFont("Helvetica-Bold", 7)
-            c.drawString(margin - 20, yy - 3, STRING_NAMES[string_number])
-
-        # Frets
-        x_start = margin + 20
-        step = (page_width - margin - x_start - 5) / max(1, len(row))
-
-        for i, n in enumerate(row):
-            x = x_start + i * step
-            string_number = n["string"]
-            fret = n["fret"]
-            yy = tab_top - (string_number - 1) * line_spacing
-
-            # White background for fret number
+            c.drawString(margin, yy - 2.5, STRING_NAMES[sn])
+        # bar lines + bar numbers
+        for bi in range(bars_per_row + 1):
+            x = x0 + (x1 - x0) * bi / bars_per_row
+            c.setLineWidth(0.9)
+            c.line(x, top + 3, x, top - 5 * spacing - 3)
+            if bi < bars_per_row:
+                c.setFont("Helvetica", 6)
+                c.drawString(x + 2, top + 8, str(r * bars_per_row + bi + 1))
+        for n in tab_notes:
+            if not (t0 <= n["start"] < t0 + row_dur):
+                continue
+            x = x0 + (n["start"] - t0) / row_dur * (x1 - x0)
+            yy = top - (n["string"] - 1) * spacing
             c.setFillColor(colors.white)
-            c.rect(x - 5, yy - 4, 10, 8, stroke=0, fill=1)
-
+            c.rect(x - 4, yy - 4, 8 if n["fret"] < 10 else 11, 8, stroke=0, fill=1)
             c.setFillColor(colors.black)
             c.setFont("Helvetica-Bold", 8)
-            c.drawCentredString(x, yy - 3, str(fret))
-
-        # Row number
-        c.setFont("Helvetica", 7)
-        c.drawString(page_width - 70, tab_top - 70, f"Line {row_index + 1}")
-
-        y = tab_top - 100
-
+            c.drawCentredString(x, yy - 2.8, str(n["fret"]))
+            # duration stem under the staff: 1 tick per beat-fraction
+            d_beats = (n["end"] - n["start"]) / beat
+            c.setLineWidth(0.6)
+            c.line(x, top - 5 * spacing - 8, x, top - 5 * spacing - 14)
+            if d_beats < 0.75:
+                c.line(x, top - 5 * spacing - 14, x + 4, top - 5 * spacing - 11)
+            if d_beats < 0.38:
+                c.line(x, top - 5 * spacing - 11, x + 4, top - 5 * spacing - 8)
+        y = top - 5 * spacing - 38
     c.save()
     return output_file
 
