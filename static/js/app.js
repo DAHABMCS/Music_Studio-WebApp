@@ -456,7 +456,10 @@ function handleResult(result) {
     showNotice(`Transcription ready in folder: ${result.folder}\n\n` +
           (result.files || []).join('\n'));
   }
-  if (result.song) showNotice('Song ready: ' + result.song, 'success');
+  if (result.tracks) {
+    showNotice('Files ready:\n' + Object.entries(result.tracks)
+      .map(([k, v]) => k + ': ' + v).join('\n'), 'success');
+  } else if (result.song) showNotice('Song ready: ' + result.song, 'success');
   saveSession();
 }
 
@@ -532,6 +535,12 @@ $('btnFull').onclick = async () => {
 $('btnCreateSong').onclick = () => {
   openCreateSongModal();
 };
+
+if ($('btnAiLyrics')) {
+  $('btnAiLyrics').onclick = () => {
+    openAiLyricsModal();
+  };
+}
 
 $('btnStop').onclick = async () => {
   if (state.jobId) {
@@ -765,6 +774,225 @@ function applySongFields(modal, fields) {
   });
 }
 
+/* ---------- AI Lyrics modal ----------
+   Style + a short description of the subject + language -> the server
+   (/api/generate_lyrics_ai) asks an AI to write the lyrics. The result is
+   editable here, and "Use in AI Song" drops it (with the style, language
+   and title) into the Create Song window through the same saved-draft
+   mechanism that window already auto-loads (SONG_DRAFT_KEY). */
+const AI_LYRICS_LANGUAGES = [
+  ['auto', 'Auto - same language as the description'],
+  ['ar', 'Arabic - عربي (right to left)'],
+  ['en', 'English'],
+  ['fa', 'Persian - فارسی (right to left)'],
+  ['ur', 'Urdu - اردو (right to left)'],
+  ['tr', 'Turkish'], ['fr', 'French'], ['es', 'Spanish'], ['de', 'German'],
+  ['it', 'Italian'], ['pt', 'Portuguese'], ['hi', 'Hindi'], ['ru', 'Russian'],
+  ['ja', 'Japanese'], ['ko', 'Korean'], ['zh', 'Chinese'],
+];
+
+function openAiLyricsModal() {
+  document.querySelectorAll('.ailyrics-modal').forEach(m => m.remove());
+  const draft = loadSongDraft() || {};
+
+  const modal = document.createElement('div');
+  modal.className = 'editor-modal ailyrics-modal';
+  const langOptions = AI_LYRICS_LANGUAGES
+    .map(([code, label]) => `<option value="${code}">${label}</option>`).join('');
+
+  modal.innerHTML = `
+    <div class="editor-box song-box" style="max-width:560px; width:92%; max-height:88vh; overflow-y:auto; box-sizing:border-box; padding:12px 16px;">
+      <h3 style="margin:0 0 6px; font-size:16px;">AI Lyrics</h3>
+      <div class="song-field">
+        <label for="aiLyStyle">Style / genre / mood</label>
+        <input type="text" id="aiLyStyle" style="width:100%; box-sizing:border-box; padding:4px 6px; font-size:13px;" placeholder="e.g. romantic pop ballad, slow, emotional">
+      </div>
+      <div class="song-field">
+        <label for="aiLySubject">What is the song about?</label>
+        <textarea id="aiLySubject" rows="2" data-dir-fixed dir="auto" spellcheck="false"
+          style="width:100%; box-sizing:border-box; height:52px; min-height:52px; max-height:90px; overflow-y:auto; resize:vertical; padding:4px 6px; font-size:13px;"
+          placeholder="e.g. missing someone who lives far away, but promising to meet again"></textarea>
+      </div>
+      <div class="song-field">
+        <label for="aiLyLanguage">Language of the lyrics</label>
+        <select id="aiLyLanguage" style="width:100%; box-sizing:border-box; padding:3px 6px; font-size:13px;">${langOptions}</select>
+      </div>
+      <div class="song-field">
+        <label for="aiLyTitle">Title <span class="muted">(optional - the AI suggests one)</span></label>
+        <input type="text" id="aiLyTitle" dir="auto" style="width:100%; box-sizing:border-box; padding:4px 6px; font-size:13px;" placeholder="Song title">
+      </div>
+      <div class="song-field">
+        <label for="aiLyResult">Lyrics <span class="muted">(you can edit them before using them)</span></label>
+        <textarea id="aiLyResult" rows="8" data-dir-fixed dir="auto" spellcheck="false"
+          style="width:100%; box-sizing:border-box; height:170px; min-height:90px; max-height:45vh; overflow-y:auto; resize:vertical; padding:4px 6px; font-size:13px; line-height:1.4;"
+          placeholder="The lyrics will appear here..."></textarea>
+        <div id="aiLyNote" class="muted" style="margin-top:4px; font-size:11px;"></div>
+      </div>
+      <details id="aiLyKeyBox" style="margin:2px 0 6px; font-size:12px;">
+        <summary style="cursor:pointer;">AI key settings <span id="aiLyKeyState" class="muted"></span></summary>
+        <div style="display:flex; gap:6px; margin-top:4px;">
+          <input type="password" id="aiLyKey" autocomplete="off" placeholder="Optional: paste an Anthropic key (sk-ant-...) for better lyrics"
+                 style="flex:1; box-sizing:border-box; padding:4px 6px; font-size:12px;">
+          <button class="btn" id="aiLyKeySave">Save key</button>
+        </div>
+      </details>
+      <div class="editor-actions" style="position:sticky; bottom:-12px; padding:8px 0 4px; background:inherit; display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end;">
+        <div id="aiLyProg" style="display:none; width:100%; margin-bottom:2px;">
+          <div style="position:relative; height:8px; background:rgba(255,255,255,0.15); border-radius:4px; overflow:hidden;">
+            <div id="aiLyBar" style="position:absolute; top:0; left:0; height:100%; width:30%; background:#e8b100; border-radius:4px;"></div>
+          </div>
+          <div id="aiLyProgText" style="font-size:12px; margin-top:3px;"></div>
+        </div>
+        <button class="btn" id="aiLyCopy">Copy</button>
+        <button class="btn accent" id="aiLyGenerate">Generate Lyrics</button>
+        <button class="btn" id="aiLyUse" title="Open AI Song with these lyrics filled in">Use in AI Song</button>
+        <button class="btn" id="aiLyClose">Close</button>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+
+  const q = (sel) => modal.querySelector(sel);
+  modal.querySelectorAll('.song-field').forEach(f => {
+    f.style.margin = '0 0 6px';
+    const lb = f.querySelector('label');
+    if (lb) { lb.style.fontSize = '12px'; lb.style.marginBottom = '2px'; lb.style.display = 'block'; }
+  });
+  q('#aiLyStyle').value    = draft.style || '';
+  q('#aiLyLanguage').value = draft.language || 'auto';
+  if (q('#aiLyLanguage').value !== (draft.language || 'auto')) q('#aiLyLanguage').value = 'auto';
+  q('#aiLyStyle').setAttribute('dir', 'auto');
+
+  const applyDir = () => {
+    const dir = songLangDir(q('#aiLyLanguage').value);
+    const res = q('#aiLyResult');
+    res.setAttribute('dir', dir);
+    res.style.textAlign = 'start';
+    res.style.unicodeBidi = dir === 'auto' ? 'plaintext' : 'normal';
+  };
+  applyDir();
+  q('#aiLyLanguage').addEventListener('change', applyDir);
+
+  const refreshKeyState = async () => {
+    try {
+      const r = await (await fetch('/api/lyrics_ai_key')).json();
+      q('#aiLyKeyState').textContent = r.has_key
+        ? '- Anthropic key saved (' + r.hint + ')'
+        : '- optional (no key: using your local Ollama model)';
+    } catch (e) {}
+  };
+  refreshKeyState();
+  q('#aiLyKeySave').onclick = async () => {
+    const key = q('#aiLyKey').value.trim();
+    if (!key) { showNotice('Paste your Anthropic key first', 'warn'); return; }
+    try {
+      const r = await fetch('/api/lyrics_ai_key', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key }) });
+      const res = await r.json().catch(() => ({}));
+      if (!r.ok || res.error) throw new Error(res.error || 'Could not save the key');
+      q('#aiLyKey').value = '';
+      showNotice('Key saved - you can generate lyrics now', 'success');
+      refreshKeyState();
+    } catch (e) { showNotice(e.message, 'error'); }
+  };
+
+  q('#aiLyClose').onclick = () => modal.remove();
+  modal.addEventListener('click', (e) => { if (e.target === modal) modal.remove(); });
+
+  q('#aiLyCopy').onclick = async () => {
+    const text = q('#aiLyResult').value;
+    if (!text.trim()) { showNotice('There are no lyrics to copy yet', 'warn'); return; }
+    try {
+      await navigator.clipboard.writeText(text);
+      showNotice('Lyrics copied', 'success');
+    } catch (e) {
+      q('#aiLyResult').select();
+      showNotice('Select the lyrics and press Ctrl+C to copy them', 'info');
+    }
+  };
+
+  q('#aiLyGenerate').onclick = async () => {
+    const subject = q('#aiLySubject').value.trim();
+    if (!subject) { showNotice('Describe what the song is about first', 'warn'); return; }
+    if (q('#aiLyResult').value.trim() &&
+        !confirm('Replace the lyrics below with newly written ones?')) return;
+
+    const btn = q('#aiLyGenerate');
+    const label = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Writing lyrics...';
+    q('#aiLyNote').textContent = '';
+    setButtonState('btnAiLyrics', 'btn-processing');
+
+    // The server gives no real percentage, so show a moving bar plus the
+    // elapsed time - proof the AI is still working.
+    const prog = q('#aiLyProg'), bar = q('#aiLyBar'), ptxt = q('#aiLyProgText');
+    const t0 = Date.now();
+    let pos = 0, dirn = 1;
+    prog.style.display = 'block';
+    const barTimer = setInterval(() => {
+      pos += dirn * 2.2;
+      if (pos >= 70) dirn = -1;
+      if (pos <= 0) dirn = 1;
+      bar.style.left = pos + '%';
+    }, 30);
+    const tickText = () => {
+      const sec = Math.floor((Date.now() - t0) / 1000);
+      const mm = String(Math.floor(sec / 60)).padStart(2, '0');
+      const ss = String(sec % 60).padStart(2, '0');
+      ptxt.textContent = 'AI is writing your lyrics... ' + mm + ':' + ss +
+        (sec > 45 ? '  (a local model can take a few minutes - please wait)' : '');
+    };
+    tickText();
+    const textTimer = setInterval(tickText, 1000);
+    try {
+      const r = await fetch('/api/generate_lyrics_ai', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          style: q('#aiLyStyle').value.trim(),
+          subject,
+          language: q('#aiLyLanguage').value,
+          title: q('#aiLyTitle').value.trim(),
+        }),
+      });
+      let res = null;
+      try { res = await r.json(); } catch (e) { res = null; }
+      if (!res) throw new Error('Unexpected reply from the server (are you still signed in?)');
+      if (res.error) throw new Error(res.error);
+      q('#aiLyResult').value = res.lyrics || '';
+      if (res.title && !q('#aiLyTitle').value.trim()) q('#aiLyTitle').value = res.title;
+      const lines = (res.lyrics || '').split('\n').filter(l => l.trim() && !/^\[.*\]$/.test(l.trim())).length;
+      q('#aiLyNote').textContent = `${lines} sung lines. Edit anything you like, then press "Use in AI Song".`;
+    } catch (e) {
+      q('#aiLyNote').textContent = '';
+      showNotice('Could not write lyrics: ' + e.message, 'error');
+    } finally {
+      clearInterval(barTimer);
+      clearInterval(textTimer);
+      prog.style.display = 'none';
+      btn.disabled = false;
+      btn.textContent = label;
+      setButtonState('btnAiLyrics', 'btn-ready');
+    }
+  };
+
+  q('#aiLyUse').onclick = () => {
+    const lyrics = q('#aiLyResult').value;
+    if (!lyrics.trim()) { showNotice('Generate (or type) some lyrics first', 'warn'); return; }
+    const merged = Object.assign({}, loadSongDraft() || {}, {
+      title:    q('#aiLyTitle').value.trim() || (loadSongDraft() || {}).title || '',
+      lyrics:   lyrics,
+      style:    q('#aiLyStyle').value.trim(),
+      language: q('#aiLyLanguage').value,
+    });
+    try { localStorage.setItem(SONG_DRAFT_KEY, JSON.stringify(merged)); } catch (e) {}
+    modal.remove();
+    openCreateSongModal();
+    showNotice('Lyrics added to AI Song - choose a singer, then press Generate', 'success');
+  };
+}
+
 function openCreateSongModal() {
   document.querySelectorAll('.song-modal').forEach(m => m.remove());
 
@@ -838,6 +1066,12 @@ function openCreateSongModal() {
               <option value="musicgen">MusicGen — instrumental only, faster</option>
             </select>
             <div id="songBackendNote" class="muted" style="margin-top:4px; font-size:11px;"></div>
+            <label id="songStemsRow" style="display:block; margin-top:8px; font-size:12px;">
+              <input type="checkbox" id="songStems"> Also create a separate backtrack (music only)
+            </label>
+            <div id="songStemsNote" class="muted" style="margin-top:2px; font-size:11px;">
+              Makes two files: the full song and a clean instrumental backtrack of the same length and style. Takes about twice as long. Both are volume-matched.
+            </div>
           </div>
           <div class="song-field">
             <label for="songStyle">Genre / mood / description</label>
@@ -1045,7 +1279,15 @@ function openCreateSongModal() {
       ? 'MusicGen ignores Lyrics and Singer — instrumental output only, from Style + Instruments.'
       : 'ACE-Step uses your Lyrics and Singer choice to generate sung vocals.';
   };
-  backendSelect.onchange = updateBackendNote;
+  const stemsRow = modal.querySelector('#songStemsRow');
+  const stemsNote = modal.querySelector('#songStemsNote');
+  const updateStemsVisibility = () => {
+    const show = backendSelect.value === 'ace';
+    stemsRow.style.display = show ? 'block' : 'none';
+    stemsNote.style.display = show ? 'block' : 'none';
+  };
+  backendSelect.onchange = () => { updateBackendNote(); updateStemsVisibility(); };
+  updateStemsVisibility();
   updateBackendNote();
 
   modal.querySelector('#songGenerate').onclick = async () => {
@@ -1071,7 +1313,8 @@ function openCreateSongModal() {
       const r = await fetch('/api/create_song', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title, lyrics, language, style, singer, instruments, backend }),
+        body: JSON.stringify({ title, lyrics, language, style, singer, instruments, backend,
+                               stems: backend === 'ace' && modal.querySelector('#songStems').checked }),
       });
       res = await r.json();
     } catch (e) {

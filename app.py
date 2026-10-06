@@ -1553,6 +1553,7 @@ def job_status(job_id):
             "folder": job.get("folder"),
             "files":  job.get("files"),
             "song":   job.get("song"),
+            "tracks": job.get("tracks"),
         },
         error=None if "Error" not in job["status"] else job["status"],
     )
@@ -1774,7 +1775,7 @@ def generate_song_audio(lyrics, style, instruments, singer, out_path,
                                     progress_cb=progress_cb, language=language)
 
 
-def _ace_http(method, path, payload=None, timeout=60):
+def _ace_http(method, path, payload=None, timeout=60, base_url=None):
     """Tiny stdlib HTTP helper for the ACE-Step API. Returns raw bytes."""
     import urllib.request
     import urllib.error
@@ -1786,7 +1787,7 @@ def _ace_http(method, path, payload=None, timeout=60):
     if ACE_STEP_API_KEY:
         headers["Authorization"] = f"Bearer {ACE_STEP_API_KEY}"
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
-    req = urllib.request.Request(ACE_STEP_API_URL + path, data=data,
+    req = urllib.request.Request((base_url or ACE_STEP_API_URL) + path, data=data,
                                  headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -1931,7 +1932,7 @@ def _guess_vocal_language(text, language=""):
 
 
 def _ace_generate_one(lyrics, style, instruments, singer, out_path, progress_cb=None,
-                      seed=None, bpm=None, key_scale=None, language=""):
+                      seed=None, bpm=None, key_scale=None, language="", duration=None):
     """Generate ONE piece of audio (a whole short song, or one chunk of a long
     song) and write it to out_path, by calling a running ACE-Step 1.5 REST
     API server (local or remote)."""
@@ -1973,7 +1974,15 @@ def _ace_generate_one(lyrics, style, instruments, singer, out_path, progress_cb=
                    "fa": "Persian", "ur": "Urdu"}
     if singer != "instrumental" and vocal_language in _lang_names:
         tags = f"{_lang_names[vocal_language]} vocals, sung in {_lang_names[vocal_language]}, " + tags
-    duration = ACE_STEP_DURATION_SECONDS or _auto_duration(lyrics_for_model, vocal_language)
+    # ACE-Step has no dialect switch (only vocal_language="ar"), so steer the
+    # accent through the style prompt. Set ACE_STEP_ARABIC_DIALECT to "" to
+    # disable, or e.g. "Gulf" / "Levantine" for another dialect.
+    if singer != "instrumental" and vocal_language == "ar":
+        _dia = os.environ.get("ACE_STEP_ARABIC_DIALECT", "Egyptian").strip()
+        if _dia:
+            tags = (f"{_dia} Arabic dialect, {_dia} accent, colloquial {_dia} pronunciation, "
+                    f"not Modern Standard Arabic, not Gulf Arabic, " + tags)
+    duration = duration or ACE_STEP_DURATION_SECONDS or _auto_duration(lyrics_for_model, vocal_language)
     needed = _needed_seconds(lyrics_for_model, vocal_language)
     if singer != "instrumental" and needed > duration + 5:
         warn_prefix = (f"WARNING: these lyrics need about {needed / 60:.1f} min but this song is "
@@ -2136,7 +2145,7 @@ def _join_audio_chunks(paths, out_path, crossfade):
 
 
 def generate_song_audio_ace(lyrics, style, instruments, singer, out_path, progress_cb=None,
-                            language=""):
+                            language="", duration=None):
     """Generate a song with ACE-Step. Long songs are split into section-based
     chunks (each short enough for CPU), generated one by one with the same
     seed/style, then joined with a crossfade. Short songs use one request."""
@@ -2146,7 +2155,7 @@ def generate_song_audio_ace(lyrics, style, instruments, singer, out_path, progre
             progress_cb(value, status)
 
     one_kw = dict(seed=ACE_STEP_SEED, bpm=ACE_STEP_BPM or None, key_scale=ACE_STEP_KEY or None,
-                  language=language)
+                  language=language, duration=duration)
 
     # Instrumental, or the user forced a fixed length: single request.
     if singer == "instrumental" or ACE_STEP_DURATION_SECONDS:
@@ -2203,6 +2212,179 @@ def generate_song_audio_ace(lyrics, style, instruments, singer, out_path, progre
     _p(92, f"Joining {n} chunks...")
     _join_audio_chunks(paths, out_path, ACE_STEP_CROSSFADE_SECONDS)
     _p(98, "Song joined.")
+
+
+# ============================================================
+# SONG + SEPARATE BACKTRACK  (full_song.wav + backtrack.wav)
+# ------------------------------------------------------------
+# Two normal generations with the fast ACE-Step model (works on CPU):
+#   1) FULL SONG  - lyrics + vocals + music, exactly as before
+#   2) BACKTRACK  - same style / instruments / seed / tempo / key, but
+#                   [instrumental] and the same length as the song.
+# The backtrack is generated directly (nothing is separated or removed),
+# so every instrument is intact. It is a close relative of the music in the
+# full song, NOT the identical arrangement - they are two separate runs.
+# Both files are loudness-matched with ffmpeg so they play at a similar,
+# comfortable volume (turn off with ACE_STEP_NORMALIZE=0).
+# ============================================================
+ACE_BACKTRACK_HINT = os.environ.get(
+    "ACE_STEP_BACKTRACK_HINT",
+    "full band arrangement, all instruments clearly audible, balanced mix, high quality")
+ACE_NORMALIZE = os.environ.get("ACE_STEP_NORMALIZE", "1").strip() != "0"
+ACE_TARGET_LUFS = float(os.environ.get("ACE_STEP_TARGET_LUFS", "-14") or -14)
+
+
+def _wav_seconds(path):
+    try:
+        import soundfile as sf
+        info = sf.info(str(path))
+        return info.frames / float(info.samplerate)
+    except Exception:
+        return 0.0
+
+
+def _normalize_loudness(path, target_lufs=-14.0):
+    """Even out the volume of a WAV in place (EBU R128 loudnorm, true peak
+    kept under -1.5 dB). If ffmpeg fails the original file is left untouched."""
+    ff = shutil.which("ffmpeg")
+    if ff is None:
+        return False
+    path = Path(path)
+    tmp = path.with_name(path.stem + "_norm.wav")
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    proc = subprocess.run(
+        [ff, "-y", "-i", str(path), "-af",
+         f"loudnorm=I={target_lufs}:TP=-1.5:LRA=11", "-ar", "48000",
+         "-c:a", "pcm_s16le", str(tmp)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        creationflags=flags)
+    if proc.returncode == 0 and tmp.exists() and tmp.stat().st_size > 1000:
+        tmp.replace(path)
+        return True
+    tmp.unlink(missing_ok=True)
+    print(f"[ACE-Step] loudness step skipped: {(proc.stderr or '')[-300:]}", flush=True)
+    return False
+
+
+def _make_backtrack_from_song(song_path, back_path, status=None):
+    """Remove the vocals from the finished song with Demucs and save the
+    result as back_path (a WAV). Same audio as the song, so the music is
+    identical. Raises RuntimeError with the real Demucs message on failure."""
+    import glob
+
+    def _s(msg):
+        if status:
+            status(msg)
+
+    # ffmpeg: on PATH, or bundled next to the exe / inside _internal.
+    if shutil.which("ffmpeg") is None:
+        for d in (BASE_DIR, BASE_DIR / "_internal",
+                  Path(getattr(sys, "_MEIPASS", BASE_DIR))):
+            if (d / "ffmpeg.exe").exists() or (d / "ffmpeg").exists():
+                os.environ["PATH"] = str(d) + os.pathsep + os.environ.get("PATH", "")
+                break
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError("ffmpeg was not found (Demucs needs it). Put ffmpeg.exe next "
+                           "to the app or on PATH.")
+
+    out_dir = tempfile.mkdtemp(prefix="demucs_backtrack_")
+    try:
+        _s("Separating vocals from music (1-3 min)...")
+        args = ["-n", "htdemucs", "--two-stems=vocals", "-o", out_dir, str(song_path)]
+
+        if getattr(sys, "frozen", False):
+            # Packaged .exe: sys.executable is the app itself and cannot run
+            # "python -m demucs", so run the bundled Demucs inside this process.
+            try:
+                from demucs.separate import main as demucs_main
+            except Exception as e:
+                raise RuntimeError(f"Demucs is not bundled in this build ({e}).")
+            try:
+                demucs_main(args)
+            except SystemExit as e:
+                if e.code not in (0, None):
+                    raise RuntimeError(f"Demucs failed (exit {e.code}). "
+                                       "The console window shows the details.")
+            except Exception as e:
+                raise RuntimeError(f"Demucs failed: {e}")
+        else:
+            proc = subprocess.run([sys.executable, "-m", "demucs"] + args,
+                                  capture_output=True, text=True, encoding="utf-8",
+                                  errors="replace",
+                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if proc.returncode != 0:
+                err = (proc.stderr or proc.stdout or "")[-900:]
+                hint = ""
+                low = err.lower()
+                if "no module named demucs" in low:
+                    hint = "  FIX: pip install demucs"
+                elif "torchcodec" in low:
+                    hint = "  FIX: pip install torchcodec   (or: pip install \"torchaudio<2.9\")"
+                raise RuntimeError(f"Demucs failed (exit {proc.returncode}): {err}{hint}")
+
+        found = glob.glob(os.path.join(out_dir, "**", "no_vocals.*"), recursive=True)
+        if not found:
+            raise RuntimeError("Demucs finished but produced no 'no_vocals' file.")
+        src = found[0]
+        if src.lower().endswith(".wav"):
+            shutil.copyfile(src, str(back_path))
+        else:                                   # e.g. .mp3/.flac: convert to WAV
+            conv = subprocess.run(
+                [shutil.which("ffmpeg"), "-y", "-i", src, "-c:a", "pcm_s16le", str(back_path)],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if conv.returncode != 0:
+                raise RuntimeError("Could not convert the backtrack to WAV: " + (conv.stderr or "")[-300:])
+        if not Path(back_path).exists() or Path(back_path).stat().st_size < 1000:
+            raise RuntimeError("The backtrack file was not written.")
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def _generate_song_and_backtrack(folder, stem, lyrics, style, instruments, singer,
+                                 language, _p):
+    """Returns (main_output_path, tracks_dict, final_status_text)."""
+    folder = Path(folder)
+    song_path = folder / f"{stem}_full_song.wav"
+    back_path = folder / f"{stem}_backtrack.wav"
+
+    # ---- 1) full song (voice + music), same path as a normal song -------------
+    _p(6, "File 1/2: generating the full song (voice + music)...")
+    generate_song_audio_ace(
+        lyrics, style, instruments, singer, str(song_path),
+        progress_cb=lambda v, s: _p(6 + min(float(v), 100) * 0.50, "Full song: " + s),
+        language=language)
+
+    # ---- 2) backtrack: take the vocals OUT of the song we just made ----------
+    # Same audio, voice removed (Demucs) => the music is IDENTICAL to the full
+    # song. (Generating a second "[instrumental]" song can never match, because
+    # the prompt/lyrics/length differ, so the model invents new music.)
+    _p(58, "File 2/2: removing the vocals to make the backtrack (same music)...")
+    try:
+        _make_backtrack_from_song(song_path, back_path,
+                                  lambda msg: _p(70, "Backtrack: " + str(msg)))
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        # Keep the exact reason next to the song so it can be read later.
+        try:
+            (folder / "backtrack_error.txt").write_text(str(e), encoding="utf-8")
+        except Exception:
+            pass
+        if ACE_NORMALIZE:
+            _normalize_loudness(song_path, ACE_TARGET_LUFS)
+        return (song_path, {"full_song": str(song_path)},
+                f"Full song saved, but the BACKTRACK FAILED: {e}")
+    warn = ""
+
+    if ACE_NORMALIZE:
+        _p(94, "Matching the volume of both files...")
+        _normalize_loudness(song_path, ACE_TARGET_LUFS)
+        _normalize_loudness(back_path, ACE_TARGET_LUFS)
+
+    return (song_path,
+            {"full_song": str(song_path), "backtrack": str(back_path)},
+            "Complete!" + warn)
 
 
 # Populated on first use by generate_song_audio_musicgen() — same reasoning
@@ -2263,6 +2445,233 @@ def generate_song_audio_musicgen(style, instruments, out_path, progress_cb=None)
                             data=audio_values[0, 0].cpu().numpy())
 
 
+# ============================================================
+# AI LYRICS WRITER  (the "Generate lyrics" button in Create Song)
+# ------------------------------------------------------------
+# POST /api/generate_lyrics_ai  {style, subject, language, title?}
+#   -> {title, lyrics}  (lyrics already use [verse]/[chorus] tags, short
+#      sung lines, ready to paste into the Lyrics box)
+#
+# Which AI writes the lyrics (set environment variables, then restart):
+#   Anthropic (default when a key is set):
+#       ANTHROPIC_API_KEY=sk-ant-...
+#       LYRICS_LLM_MODEL=claude-sonnet-5-5        (optional)
+#   Local, free, offline (Ollama):
+#       LYRICS_LLM_PROVIDER=ollama
+#       LYRICS_LLM_MODEL=qwen2.5:7b               (any model you pulled)
+#       OLLAMA_URL=http://127.0.0.1:11434         (optional)
+# ============================================================
+LYRICS_LLM_PROVIDER = os.environ.get("LYRICS_LLM_PROVIDER", "").strip().lower()
+LYRICS_LLM_MODEL = os.environ.get("LYRICS_LLM_MODEL", "").strip()
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+
+_LYRIC_LANG_NAMES = {"ar": "Arabic", "en": "English", "zh": "Chinese", "ja": "Japanese",
+                     "ko": "Korean", "ru": "Russian", "es": "Spanish", "fr": "French",
+                     "de": "German", "it": "Italian", "pt": "Portuguese", "hi": "Hindi",
+                     "tr": "Turkish", "fa": "Persian", "ur": "Urdu"}
+
+
+def _lyrics_ai_settings():
+    """Settings for the lyrics AI. Environment variables win; otherwise they are
+    read from a plain-text file called lyrics_ai.env next to the app (so a
+    packaged .exe started from Explorer can use them too). The file is read on
+    every call, so editing it needs NO restart. One KEY=VALUE per line:
+        ANTHROPIC_API_KEY=sk-ant-...
+        LYRICS_LLM_PROVIDER=ollama      (optional)
+        LYRICS_LLM_MODEL=...            (optional)
+        OLLAMA_URL=http://127.0.0.1:11434   (optional)
+    """
+    vals = {}
+    try:
+        f = BASE_DIR / "lyrics_ai.env"
+        if f.exists():
+            for line in f.read_text(encoding="utf-8-sig").splitlines():
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    vals[k.strip()] = v.strip().strip('"').strip("'")
+    except Exception:
+        pass
+    for k in ("ANTHROPIC_API_KEY", "LYRICS_LLM_PROVIDER", "LYRICS_LLM_MODEL", "OLLAMA_URL"):
+        if os.environ.get(k, "").strip():
+            vals[k] = os.environ[k].strip()
+    return vals
+
+
+def _pick_ollama_model(base_url, wanted=""):
+    """Choose a model that is really installed in Ollama. Uses the wanted one if
+    it exists, otherwise the best installed general-purpose model."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(base_url + "/api/tags", timeout=8) as r:
+            names = [m.get("name", "") for m in (json.loads(r.read().decode("utf-8")).get("models") or [])]
+    except Exception:
+        raise RuntimeError("Ollama is not running. Start the Ollama app (or run 'ollama serve'), "
+                           "or save an Anthropic key in 'AI key settings'.")
+    names = [n for n in names if n]
+    if not names:
+        raise RuntimeError("Ollama has no models installed. Run:  ollama pull gemma3:12b")
+    if wanted and wanted in names:
+        return wanted
+    local = [n for n in names if "cloud" not in n.lower()]
+    good = [n for n in local if not any(b in n.lower() for b in
+            ("r1", "coder", "embed", "vision", "reason", "think"))]
+    for pref in ("gemma", "mistral", "llama", "qwen", "phi"):
+        for n in good:
+            if pref in n.lower():
+                return n
+    return (good or local or names)[0]
+
+
+def _llm_complete(system, user, max_tokens=1200, timeout=420):
+    """One text completion from the configured AI. Returns the reply text."""
+    import urllib.request
+    import urllib.error
+
+    cfg = _lyrics_ai_settings()
+    api_key = cfg.get("ANTHROPIC_API_KEY", "")
+    # No key saved = use the free local Ollama model (default).
+    provider = (cfg.get("LYRICS_LLM_PROVIDER", "").lower()
+                or ("anthropic" if api_key else "ollama"))
+    model_name = cfg.get("LYRICS_LLM_MODEL", "")
+    ollama_url = cfg.get("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+    if provider == "ollama":
+        url = ollama_url + "/api/chat"
+        body = {"model": _pick_ollama_model(ollama_url, model_name), "stream": False,
+                "messages": [{"role": "system", "content": system},
+                             {"role": "user", "content": user}]}
+        headers = {"Content-Type": "application/json"}
+    elif provider == "anthropic":
+        key = api_key
+        if not key:
+            raise RuntimeError("No Anthropic key found. Put ANTHROPIC_API_KEY=sk-ant-... in "
+                               "lyrics_ai.env next to the app, or use a local model with "
+                               "LYRICS_LLM_PROVIDER=ollama.")
+        url = "https://api.anthropic.com/v1/messages"
+        body = {"model": model_name or "claude-sonnet-5-5", "max_tokens": max_tokens,
+                "system": system, "messages": [{"role": "user", "content": user}]}
+        headers = {"Content-Type": "application/json", "x-api-key": key,
+                   "anthropic-version": "2023-06-01"}
+    else:
+        raise RuntimeError("No lyrics AI is configured. Create a file named lyrics_ai.env next "
+                           f"to the app ({BASE_DIR}) containing the line "
+                           "ANTHROPIC_API_KEY=sk-ant-... (or LYRICS_LLM_PROVIDER=ollama).")
+
+    req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"),
+                                 headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"Lyrics AI returned HTTP {e.code}: "
+                           f"{e.read().decode('utf-8', 'replace')[:300]}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Can't reach the lyrics AI ({e.reason}).")
+
+    if provider == "ollama":
+        text = ((data.get("message") or {}).get("content") or "")
+    else:
+        text = "".join(b.get("text", "") for b in (data.get("content") or [])
+                       if b.get("type") == "text")
+    return text.strip()
+
+
+def _write_lyrics_with_ai(style, subject, language, title=""):
+    lang_code = _normalize_language(language)
+    if lang_code:
+        lang_name = _LYRIC_LANG_NAMES.get(lang_code, lang_code)
+        lang_rule = f"Write ALL the lyrics in {lang_name}."
+    else:
+        lang_name = ""
+        lang_rule = "Write the lyrics in the same language as the subject description."
+
+    dialect_rule = ""
+    if lang_code == "ar":
+        dia = os.environ.get("ACE_STEP_ARABIC_DIALECT", "Egyptian").strip()
+        if dia:
+            dialect_rule = (f"Write in everyday spoken {dia} Arabic (colloquial), not Modern "
+                            f"Standard Arabic: use natural {dia} words and spelling as people "
+                            "actually speak, e.g. for Egyptian: عايز، إزاي، ده، دي، مش، كده، دلوقتي. ")
+
+    system = (
+        "You are a professional songwriter. You write singable song lyrics and reply with "
+        "the lyrics ONLY: no explanations, no notes, no markdown, no code fences.\n"
+        "FORMAT (strict, an AI singer reads this directly):\n"
+        "- First line: TITLE: <short song title>\n"
+        "- Then a blank line, then the lyrics.\n"
+        "- Put each section tag alone on its own line in square brackets, lowercase: "
+        "[verse], [chorus], [verse], [chorus], [bridge], [chorus]. Use [intro] or [outro] "
+        "only if they contain sung words.\n"
+        "- Under each tag write short sung lines of about 4 to 8 words, one line per row.\n"
+        "- 2 verses of 4 lines, a chorus of 4 lines that repeats, a bridge of 2 to 4 lines. "
+        "Keep the whole song under about 30 lines so it fits in 3 minutes.\n"
+        "- Match the requested musical style in mood, imagery and rhythm. Use natural "
+        "rhyme and a memorable chorus. Stay on the given subject.\n"
+        "- Do not write stage directions or text in parentheses."
+    )
+    user = (f"Musical style: {style or 'pop'}\n"
+            f"Song subject: {subject}\n"
+            + (f"Working title: {title}\n" if title else "")
+            + f"{lang_rule} {dialect_rule}")
+
+    raw = _llm_complete(system, user)
+    raw = _re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", raw.strip())     # drop code fences
+    out_title, body = "", raw
+    m = _re.match(r"\s*(?:TITLE|Title|العنوان)\s*[:：]\s*(.+?)\s*\n", raw)
+    if m:
+        out_title = m.group(1).strip().strip('"*')
+        body = raw[m.end():].strip()
+    body = _re.sub(r"\n{3,}", "\n\n", body).strip()
+    if not body:
+        raise RuntimeError("The AI returned no lyrics. Try again.")
+    return out_title, body
+
+
+@app.route("/api/lyrics_ai_key", methods=["GET", "POST"])
+@login_required
+def lyrics_ai_key():
+    """GET: is a key saved?  POST {key}: save it to lyrics_ai.env (admin only)."""
+    if request.method == "GET":
+        k = _lyrics_ai_settings().get("ANTHROPIC_API_KEY", "")
+        return jsonify(has_key=bool(k), hint=(k[:7] + "..." + k[-4:]) if len(k) > 14 else "")
+    if session.get("role") != "admin":
+        return jsonify(error="Only an admin can change the AI key."), 403
+    key = ((request.get_json(force=True) or {}).get("key") or "").strip()
+    if not key.startswith("sk-ant-") or len(key) < 30 or any(c.isspace() for c in key):
+        return jsonify(error="That is not an Anthropic key. It is one long string "
+                             "starting with sk-ant- (create it at console.anthropic.com)."), 400
+    f = BASE_DIR / "lyrics_ai.env"
+    lines = []
+    try:
+        if f.exists():
+            lines = [l for l in f.read_text(encoding="utf-8-sig").splitlines()
+                     if not l.strip().startswith("ANTHROPIC_API_KEY")]
+    except Exception:
+        lines = []
+    lines.append("ANTHROPIC_API_KEY=" + key)
+    try:
+        f.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except Exception as e:
+        return jsonify(error=f"Could not save the key file: {e}"), 500
+    return jsonify(ok=True)
+
+
+@app.route("/api/generate_lyrics_ai", methods=["POST"])
+@login_required
+def generate_lyrics_ai():
+    data = request.get_json(force=True) or {}
+    subject = (data.get("subject") or "").strip()[:800]
+    style = (data.get("style") or "").strip()[:300]
+    title = (data.get("title") or "").strip()[:120]
+    if not subject:
+        return jsonify(error="Describe what the song is about first."), 400
+    try:
+        out_title, lyrics = _write_lyrics_with_ai(style, subject, data.get("language"), title)
+    except Exception as e:
+        return jsonify(error=str(e)), 502
+    return jsonify(title=out_title, lyrics=lyrics)
+
+
 @app.route("/api/create_song", methods=["POST"])
 @login_required
 def create_song():
@@ -2280,6 +2689,7 @@ def create_song():
         instruments = [str(instruments)]
     instruments = [str(i) for i in instruments]
 
+    stems = bool(data.get("stems"))
     backend = data.get("backend") or "ace"
     if backend not in ("ace", "musicgen"):
         return jsonify(error=f"Unknown backend: {backend}"), 400
@@ -2301,7 +2711,7 @@ def create_song():
 
     threading.Thread(
         target=_run_create_song_job,
-        args=(job_id, title, lyrics, style, instruments, singer, backend, language),
+        args=(job_id, title, lyrics, style, instruments, singer, backend, language, stems),
         daemon=True,
     ).start()
 
@@ -2309,7 +2719,7 @@ def create_song():
 
 
 def _run_create_song_job(job_id, title, lyrics, style, instruments, singer, backend="ace",
-                         language=""):
+                         language="", stems=False):
     try:
         with LOCK:
             user = JOBS[job_id].get("user", "shared")
@@ -2338,20 +2748,29 @@ def _run_create_song_job(job_id, title, lyrics, style, instruments, singer, back
             "instruments": instruments,
             "backend": backend,
             "language": language or "auto",
+            "with_backtrack": bool(stems),
         }, indent=2), encoding="utf-8")
 
-        _p(15, f"Generating song with {backend}...")
-        # .wav, not .mp3 — both backends output WAV audio.
-        out_path = songs_folder / f"{stem}.wav"
-        generate_song_audio(lyrics, style, instruments, singer,
-                             str(out_path), backend=backend, progress_cb=_p,
-                             language=language)
+        tracks = None
+        final_status = "Complete!"
+        if stems and backend == "ace" and singer != "instrumental":
+            # full_song.wav + backtrack.wav, both made directly (no separation)
+            out_path, tracks, final_status = _generate_song_and_backtrack(
+                songs_folder, stem, lyrics, style, instruments, singer, language, _p)
+        else:
+            _p(15, f"Generating song with {backend}...")
+            # .wav, not .mp3 — both backends output WAV audio.
+            out_path = songs_folder / f"{stem}.wav"
+            generate_song_audio(lyrics, style, instruments, singer,
+                                 str(out_path), backend=backend, progress_cb=_p,
+                                 language=language)
 
         with LOCK:
             JOBS[job_id]["progress"] = 100
-            JOBS[job_id]["status"]   = "Complete!"
+            JOBS[job_id]["status"]   = final_status
             JOBS[job_id]["output"]   = str(out_path)
             JOBS[job_id]["song"]     = str(out_path)
+            JOBS[job_id]["tracks"]   = tracks
             JOBS[job_id]["folder"]   = str(songs_folder)
             JOBS[job_id]["files"]    = [p.name for p in songs_folder.iterdir() if p.is_file()]
             JOBS[job_id]["_ts"]      = time.time()
