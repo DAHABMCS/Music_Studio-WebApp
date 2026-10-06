@@ -844,6 +844,7 @@ function openAiLyricsModal() {
           <div id="aiLyProgText" style="font-size:12px; margin-top:3px;"></div>
         </div>
         <button class="btn" id="aiLyCopy">Copy</button>
+        <button class="btn" id="aiLySave" title="Save the lyrics as a text file">Save</button>
         <button class="btn accent" id="aiLyGenerate">Generate Lyrics</button>
         <button class="btn" id="aiLyUse" title="Open AI Song with these lyrics filled in">Use in AI Song</button>
         <button class="btn" id="aiLyClose">Close</button>
@@ -896,8 +897,59 @@ function openAiLyricsModal() {
     } catch (e) { showNotice(e.message, 'error'); }
   };
 
-  q('#aiLyClose').onclick = () => modal.remove();
-  modal.addEventListener('click', (e) => { if (e.target === modal) modal.remove(); });
+  // ---- Save as a .txt file, and ask before closing unsaved lyrics ----
+  let dirty = false;                       // lyrics changed since last save / use
+  q('#aiLyResult').addEventListener('input', () => { dirty = true; });
+
+  const saveLyricsFile = () => {
+    const lyrics = q('#aiLyResult').value;
+    if (!lyrics.trim()) { showNotice('There are no lyrics to save yet', 'warn'); return false; }
+    const title = q('#aiLyTitle').value.trim();
+    const safe = (title || 'lyrics').replace(/[\\/:*?"<>|]+/g, '').trim().slice(0, 60) || 'lyrics';
+    const text = (title ? title + '\r\n\r\n' : '') + lyrics.replace(/\r?\n/g, '\r\n');
+    // BOM so Notepad shows Arabic / other scripts correctly
+    const blob = new Blob(['\ufeff' + text], { type: 'text/plain;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = safe + '.txt';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+    dirty = false;
+    showNotice('Lyrics saved as ' + safe + '.txt (check your Downloads folder)', 'success');
+    return true;
+  };
+  q('#aiLySave').onclick = saveLyricsFile;
+
+  const askSaveBeforeClose = () => {
+    if (modal.querySelector('.ailyrics-confirm')) return;
+    const ov = document.createElement('div');
+    ov.className = 'ailyrics-confirm';
+    ov.style.cssText = 'position:fixed; inset:0; z-index:10000; display:flex; align-items:center; ' +
+                       'justify-content:center; background:rgba(0,0,0,0.6);';
+    ov.innerHTML = `
+      <div style="background:#161b22; color:#e6edf3; border:1px solid #444; border-radius:10px;
+                  padding:16px 18px; max-width:380px; width:90%;">
+        <div style="font-size:14px; margin-bottom:12px;">
+          These lyrics have not been saved. Do you want to save them before closing?
+        </div>
+        <div style="display:flex; gap:6px; justify-content:flex-end; flex-wrap:wrap;">
+          <button class="btn accent" id="aiLyCfSave">Save &amp; close</button>
+          <button class="btn" id="aiLyCfDiscard">Close without saving</button>
+          <button class="btn" id="aiLyCfCancel">Cancel</button>
+        </div>
+      </div>`;
+    modal.appendChild(ov);
+    ov.querySelector('#aiLyCfSave').onclick = () => { if (saveLyricsFile()) modal.remove(); else ov.remove(); };
+    ov.querySelector('#aiLyCfDiscard').onclick = () => modal.remove();
+    ov.querySelector('#aiLyCfCancel').onclick = () => ov.remove();
+  };
+  const tryClose = () => {
+    if (dirty && q('#aiLyResult').value.trim()) askSaveBeforeClose();
+    else modal.remove();
+  };
+  q('#aiLyClose').onclick = tryClose;
+  modal.addEventListener('click', (e) => { if (e.target === modal) tryClose(); });
 
   q('#aiLyCopy').onclick = async () => {
     const text = q('#aiLyResult').value;
@@ -961,6 +1013,7 @@ function openAiLyricsModal() {
       if (!res) throw new Error('Unexpected reply from the server (are you still signed in?)');
       if (res.error) throw new Error(res.error);
       q('#aiLyResult').value = res.lyrics || '';
+      dirty = !!(res.lyrics || '').trim();
       if (res.title && !q('#aiLyTitle').value.trim()) q('#aiLyTitle').value = res.title;
       const lines = (res.lyrics || '').split('\n').filter(l => l.trim() && !/^\[.*\]$/.test(l.trim())).length;
       q('#aiLyNote').textContent = `${lines} sung lines. Edit anything you like, then press "Use in AI Song".`;
@@ -987,6 +1040,7 @@ function openAiLyricsModal() {
       language: q('#aiLyLanguage').value,
     });
     try { localStorage.setItem(SONG_DRAFT_KEY, JSON.stringify(merged)); } catch (e) {}
+    dirty = false;
     modal.remove();
     openCreateSongModal();
     showNotice('Lyrics added to AI Song - choose a singer, then press Generate', 'success');
