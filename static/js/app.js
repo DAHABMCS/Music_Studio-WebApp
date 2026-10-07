@@ -1016,10 +1016,19 @@ function openAiLyricsModal() {
       dirty = !!(res.lyrics || '').trim();
       if (res.title && !q('#aiLyTitle').value.trim()) q('#aiLyTitle').value = res.title;
       const lines = (res.lyrics || '').split('\n').filter(l => l.trim() && !/^\[.*\]$/.test(l.trim())).length;
+      if (!lines) throw new Error('The AI answered but wrote no lyrics. Press Generate Lyrics again.');
+      q('#aiLyNote').style.color = '';
       q('#aiLyNote').textContent = `${lines} sung lines. Edit anything you like, then press "Use in AI Song".`;
     } catch (e) {
-      q('#aiLyNote').textContent = '';
-      showNotice('Could not write lyrics: ' + e.message, 'error');
+      // Keep the error INSIDE this window (a corner toast vanishes after a few seconds).
+      let msg = e.message || String(e);
+      if (/failed to fetch|networkerror|load failed/i.test(msg)) {
+        msg = 'The connection to the app was lost while waiting (is the app still running?). ' +
+              'Check the black server window for a line starting with [lyrics-ai].';
+      }
+      q('#aiLyNote').style.color = '#ff6b60';
+      q('#aiLyNote').textContent = 'Could not write lyrics: ' + msg;
+      showNotice('Could not write lyrics: ' + msg, 'error', { duration: 15000 });
     } finally {
       clearInterval(barTimer);
       clearInterval(textTimer);

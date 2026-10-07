@@ -2500,34 +2500,41 @@ def _lyrics_ai_settings():
 
 def _pick_ollama_model(base_url, wanted=""):
     """Choose a model that is really installed in Ollama. Uses the wanted one if
-    it exists, otherwise the best installed general-purpose model."""
+    it exists. Otherwise picks a general-purpose model, preferring ones small
+    enough (<= ~9 GB) to answer in a reasonable time on a CPU."""
     import urllib.request
     try:
         with urllib.request.urlopen(base_url + "/api/tags", timeout=8) as r:
-            names = [m.get("name", "") for m in (json.loads(r.read().decode("utf-8")).get("models") or [])]
+            models = json.loads(r.read().decode("utf-8")).get("models") or []
     except Exception:
         raise RuntimeError("Ollama is not running. Start the Ollama app (or run 'ollama serve'), "
                            "or save an Anthropic key in 'AI key settings'.")
-    names = [n for n in names if n]
+    sizes = {m.get("name", ""): int(m.get("size") or 0) for m in models if m.get("name")}
+    names = list(sizes)
     if not names:
-        raise RuntimeError("Ollama has no models installed. Run:  ollama pull gemma3:12b")
+        raise RuntimeError("Ollama has no models installed. Run:  ollama pull gemma3:4b")
     if wanted and wanted in names:
         return wanted
     local = [n for n in names if "cloud" not in n.lower()]
     good = [n for n in local if not any(b in n.lower() for b in
-            ("r1", "coder", "embed", "vision", "reason", "think"))]
+            ("r1", "coder", "embed", "vision", "reason", "think", "gpt-oss", "deepseek"))]
+    pool = good or local or names
+    small = [n for n in pool if 0 < sizes.get(n, 0) <= 9_000_000_000]
+    pool = small or pool
     for pref in ("gemma", "mistral", "llama", "qwen", "phi"):
-        for n in good:
+        for n in pool:
             if pref in n.lower():
                 return n
-    return (good or local or names)[0]
+    return pool[0]
 
 
-def _llm_complete(system, user, max_tokens=1200, timeout=420):
+def _llm_complete(system, user, max_tokens=1200, timeout=None):
     """One text completion from the configured AI. Returns the reply text."""
     import urllib.request
     import urllib.error
 
+    import socket
+    timeout = timeout or int(os.environ.get("LYRICS_LLM_TIMEOUT", "900") or 900)
     cfg = _lyrics_ai_settings()
     api_key = cfg.get("ANTHROPIC_API_KEY", "")
     # No key saved = use the free local Ollama model (default).
@@ -2537,7 +2544,10 @@ def _llm_complete(system, user, max_tokens=1200, timeout=420):
     ollama_url = cfg.get("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
     if provider == "ollama":
         url = ollama_url + "/api/chat"
-        body = {"model": _pick_ollama_model(ollama_url, model_name), "stream": False,
+        model_name = _pick_ollama_model(ollama_url, model_name)
+        print(f"[lyrics-ai] asking Ollama model '{model_name}' (waits up to {timeout}s)...", flush=True)
+        body = {"model": model_name, "stream": False, "think": False, "keep_alive": "30m",
+                "options": {"num_predict": 900, "temperature": 0.8},
                 "messages": [{"role": "system", "content": system},
                              {"role": "user", "content": user}]}
         headers = {"Content-Type": "application/json"}
@@ -2565,11 +2575,19 @@ def _llm_complete(system, user, max_tokens=1200, timeout=420):
     except urllib.error.HTTPError as e:
         raise RuntimeError(f"Lyrics AI returned HTTP {e.code}: "
                            f"{e.read().decode('utf-8', 'replace')[:300]}")
+    except (socket.timeout, TimeoutError):
+        raise RuntimeError(f"The lyrics AI did not finish within {timeout // 60} minutes - the "
+                           "model is too big for this PC. Install a smaller one "
+                           "(ollama pull gemma3:4b) or save an Anthropic key in 'AI key settings'.")
     except urllib.error.URLError as e:
         raise RuntimeError(f"Can't reach the lyrics AI ({e.reason}).")
 
     if provider == "ollama":
-        text = ((data.get("message") or {}).get("content") or "")
+        msg = data.get("message") or {}
+        text = (msg.get("content") or "")
+        if not text.strip() and msg.get("thinking"):
+            raise RuntimeError(f"The model '{model_name}' only produced hidden 'thinking' text and no "
+                               "lyrics. Use a normal model such as gemma3 or llama3.")
     else:
         text = "".join(b.get("text", "") for b in (data.get("content") or [])
                        if b.get("type") == "text")
@@ -2668,7 +2686,11 @@ def generate_lyrics_ai():
     try:
         out_title, lyrics = _write_lyrics_with_ai(style, subject, data.get("language"), title)
     except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"[lyrics-ai] FAILED: {e}", flush=True)
         return jsonify(error=str(e)), 502
+    print(f"[lyrics-ai] OK - {len(lyrics.splitlines())} lines", flush=True)
     return jsonify(title=out_title, lyrics=lyrics)
 
 
@@ -3065,7 +3087,7 @@ if __name__ == "__main__":
         print(f" * Running on http://127.0.0.1:{port}")
         print(f" * Running on http://{ip}:{port}")
         _open_browser(port)
-        serve(app, host="0.0.0.0", port=port)
+        serve(app, host="0.0.0.0", port=port, channel_timeout=3600, threads=8)
     except ImportError:
         port = 5000
         print("waitress not installed — falling back to Flask's dev server.")
