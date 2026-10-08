@@ -2711,7 +2711,12 @@ def create_song():
         instruments = [str(instruments)]
     instruments = [str(i) for i in instruments]
 
-    stems = bool(data.get("stems"))
+    # The two panel options. Both are ACTIVE by default: if the page doesn't
+    # send them (older page / old saved setup) they count as ON.
+    #   include_title_lyrics -> save title + lyrics with the song
+    #   stems (backtrack)    -> also create the separate music-only backtrack
+    stems = _as_bool(data.get("stems", data.get("backtrack")), True)
+    include_title_lyrics = _as_bool(data.get("include_title_lyrics"), True)
     backend = data.get("backend") or "ace"
     if backend not in ("ace", "musicgen"):
         return jsonify(error=f"Unknown backend: {backend}"), 400
@@ -2733,15 +2738,26 @@ def create_song():
 
     threading.Thread(
         target=_run_create_song_job,
-        args=(job_id, title, lyrics, style, instruments, singer, backend, language, stems),
+        args=(job_id, title, lyrics, style, instruments, singer, backend, language, stems,
+              include_title_lyrics),
         daemon=True,
     ).start()
 
     return jsonify(job_id=job_id)
 
 
+def _as_bool(value, default=True):
+    """Tolerant bool for JSON/form values. None/"" -> default (so the two
+    panel options are ON unless the page explicitly sends false)."""
+    if value is None or value == "":
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() not in ("0", "false", "no", "off")
+    return bool(value)
+
+
 def _run_create_song_job(job_id, title, lyrics, style, instruments, singer, backend="ace",
-                         language="", stems=False):
+                         language="", stems=True, include_title_lyrics=True):
     try:
         with LOCK:
             user = JOBS[job_id].get("user", "shared")
@@ -2762,7 +2778,8 @@ def _run_create_song_job(job_id, title, lyrics, style, instruments, singer, back
 
         # Write the request metadata first, so it's browsable even if
         # generation below fails partway through (see generate_song_audio).
-        (songs_folder / "lyrics.txt").write_text(lyrics, encoding="utf-8")
+        if include_title_lyrics:
+            (songs_folder / "lyrics.txt").write_text(f"{title}\n\n{lyrics}\n", encoding="utf-8")
         (songs_folder / "song_request.json").write_text(json.dumps({
             "title": title,
             "style": style,
@@ -2771,6 +2788,7 @@ def _run_create_song_job(job_id, title, lyrics, style, instruments, singer, back
             "backend": backend,
             "language": language or "auto",
             "with_backtrack": bool(stems),
+            "include_title_lyrics": bool(include_title_lyrics),
         }, indent=2), encoding="utf-8")
 
         tracks = None
@@ -2813,7 +2831,10 @@ def _run_create_song_job(job_id, title, lyrics, style, instruments, singer, back
 # Stored per user in outputs/<user>/Presets/<name>.json
 # ============================================================
 
-PRESET_KEYS = ("title", "style", "singer", "instruments", "backend", "lyrics", "language")
+PRESET_KEYS = ("title", "style", "singer", "instruments", "backend", "lyrics", "language",
+               "include_title_lyrics", "backtrack")
+# The two radio/check options: saved as real booleans, ON by default.
+PRESET_BOOL_KEYS = ("include_title_lyrics", "backtrack")
 PRESET_MAX_BYTES = 200_000
 
 
@@ -2858,9 +2879,14 @@ def save_song_preset():
             if k == "instruments":
                 v = v if isinstance(v, list) else [v]
                 v = [str(i) for i in v]
+            elif k in PRESET_BOOL_KEYS:
+                v = _as_bool(v, True)
             else:
                 v = str(v)
             clean[k] = v
+    # Always store both options so a saved setup remembers them explicitly.
+    for k in PRESET_BOOL_KEYS:
+        clean.setdefault(k, True)
     if not clean:
         return jsonify(error="Nothing to save"), 400
     blob = json.dumps({"name": stem, "settings": clean}, indent=2, ensure_ascii=False)
@@ -2877,7 +2903,12 @@ def load_song_preset(name):
     if not stem or not path.exists():
         return jsonify(error="Saved setup not found"), 404
     try:
-        return jsonify(json.loads(path.read_text(encoding="utf-8")))
+        preset = json.loads(path.read_text(encoding="utf-8"))
+        # Setups saved before these options existed load with both ON.
+        st = preset.setdefault("settings", {})
+        for k in PRESET_BOOL_KEYS:
+            st[k] = _as_bool(st.get(k), True)
+        return jsonify(preset)
     except Exception:
         return jsonify(error="That saved setup is damaged"), 500
 

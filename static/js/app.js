@@ -752,6 +752,9 @@ function readSongFields(modal) {
     singer:      modal.querySelector('#songSinger').value,
     backend:     modal.querySelector('#songBackend').value,
     instruments: Array.from(modal.querySelectorAll('.songInstrument:checked')).map(el => el.value),
+    // The two option checkboxes are saved with everything else (both default ON).
+    include_title_lyrics: !!(modal.querySelector('#songPresetLyrics') || { checked: true }).checked,
+    backtrack:            !!(modal.querySelector('#songStems') || { checked: true }).checked,
   };
 }
 
@@ -772,6 +775,10 @@ function applySongFields(modal, fields) {
   modal.querySelectorAll('.songInstrument').forEach(el => {
     el.checked = chosen.has(el.value);
   });
+  const incEl = modal.querySelector('#songPresetLyrics');
+  if (incEl) incEl.checked = fields.include_title_lyrics !== false;
+  const bkEl = modal.querySelector('#songStems');
+  if (bkEl) bkEl.checked = fields.backtrack !== false;
 }
 
 /* ---------- AI Lyrics modal ----------
@@ -1075,8 +1082,8 @@ function openCreateSongModal() {
         <button class="btn" type="button" id="songPresetLoad">Load</button>
         <button class="btn" type="button" id="songPresetSave">Save setup...</button>
         <button class="btn" type="button" id="songPresetDelete">Delete</button>
-        <label class="preset-check" title="Also store the title and lyrics text in the saved setup">
-          <input type="checkbox" id="songPresetLyrics"> include title &amp; lyrics
+        <label class="preset-check" title="Also save / use the title and lyrics text (saved setups, drafts and the song folder)">
+          <input type="checkbox" id="songPresetLyrics" checked> include title &amp; lyrics
         </label>
       </div>
       <div class="song-panels">
@@ -1130,7 +1137,7 @@ function openCreateSongModal() {
             </select>
             <div id="songBackendNote" class="muted" style="margin-top:4px; font-size:11px;"></div>
             <label id="songStemsRow" style="display:block; margin-top:8px; font-size:12px;">
-              <input type="checkbox" id="songStems"> Also create a separate backtrack (music only)
+              <input type="checkbox" id="songStems" checked> Also create a separate backtrack (music only)
             </label>
             <div id="songStemsNote" class="muted" style="margin-top:2px; font-size:11px;">
               Makes two files: the full song and a clean instrumental backtrack of the same length and style. Takes about twice as long. Both are volume-matched.
@@ -1318,7 +1325,9 @@ function openCreateSongModal() {
 
   modal.querySelector('#songSave').onclick = () => {
     try {
-      localStorage.setItem(SONG_DRAFT_KEY, JSON.stringify(readSongFields(modal)));
+      const draft = readSongFields(modal);
+      if (!draft.include_title_lyrics) { delete draft.lyrics; delete draft.title; }
+      localStorage.setItem(SONG_DRAFT_KEY, JSON.stringify(draft));
       showNotice('Draft saved in this browser — it loads automatically next time. Use "Save setup..." for named setups.', 'success');
     } catch (e) {
       showNotice('Could not save draft: ' + e.message, 'error');
@@ -1377,7 +1386,9 @@ function openCreateSongModal() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ title, lyrics, language, style, singer, instruments, backend,
-                               stems: backend === 'ace' && modal.querySelector('#songStems').checked }),
+                               stems: backend === 'ace' && modal.querySelector('#songStems').checked,
+                               backtrack: modal.querySelector('#songStems').checked,
+                               include_title_lyrics: modal.querySelector('#songPresetLyrics').checked }),
       });
       res = await r.json();
     } catch (e) {

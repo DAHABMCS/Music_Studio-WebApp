@@ -171,7 +171,13 @@
         "C:/Users/dahab/Music_Studio-webapp/uploads",
         "C:/Users/dahab/OneDrive/Desktop/start_ace_server.bat",
         "C:/Users/dahab/OneDrive/Desktop/music_studio_config.bat",
-        "C:/Users/dahab/Music_Studio-webapp/Music_Studio_User_Manual.pdf"
+        "C:/Users/dahab/Music_Studio-webapp/Music_Studio_User_Manual.pdf",
+        "C:/Users/dahab/Music_Studio-webapp/runtime/ACE-Step-1.5/start_api_server.bat",
+        "C:/Users/dahab/Music_Studio-webapp/runtime/ACE-Step-1.5/acestep",
+        "C:/Users/dahab/Music_Studio-webapp/runtime/ACE-Step-1.5/pyproject.toml",
+        "C:/Users/dahab/Music_Studio-webapp/runtime/ACE-Step-1.5/uv.lock",
+        "C:/Users/dahab/Music_Studio-webapp/runtime/uv.exe",
+        "C:/Users/dahab/Music_Studio-webapp/ACE-Step-1.5/checkpoints"
     ],
     "exclude_modules": [
         "IPython",
