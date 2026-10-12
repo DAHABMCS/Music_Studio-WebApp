@@ -245,6 +245,13 @@ async function restoreSession() {
         $('srtPreview').textContent = t.slice(0, 8000);
       }
     } catch { /* ignore */ }
+    try {
+      const r2 = await fetch(`/api/output_abs?path=${encodeURIComponent(state.srt)}`);
+      if (r2.ok) {
+        const a = await r2.json();
+        if (a.path && $('outputFilePath')) $('outputFilePath').value = a.path;
+      }
+    } catch { /* ignore */ }
   }
 }
 
@@ -327,7 +334,7 @@ async function uploadFile(file, kind = 'input') {
     }
     if (kind === 'input') {
       state.uploaded = j;
-      $('outputFilePath').value = j.srt_path || (file.name.replace(/\.[^.]+$/, '') + '.srt');
+      $('outputFilePath').value = j.srt_full_path || j.srt_path || (file.name.replace(/\.[^.]+$/, '') + '.srt');
       state.srt = null;
     }
     saveSession();
@@ -446,6 +453,9 @@ function handleResult(result) {
   }
   if (result.srt) {
     state.srt = result.srt;
+  }
+  if (result.srt_abs && $('outputFilePath')) {
+    $('outputFilePath').value = result.srt_abs;   // complete path, not just the name
   }
   if (result.video) showNotice('Karaoke video ready: ' + result.video, 'success');
   if (result.lyric_video) showNotice('Lyric video ready: ' + result.lyric_video, 'success');
@@ -571,20 +581,34 @@ $('btnEdit').onclick = () => {
   openEditor(srt);
 };
 
-function copySrtPath() {
-  const v = $('outputFilePath').value;
+function _isAbsolutePath(p) {
+  return /^[A-Za-z]:[\\/]/.test(p) || p.startsWith('/') || p.startsWith('\\\\'.slice(0,2));
+}
+
+async function copySrtPath() {
+  let v = ($('outputFilePath').value || '').trim();
   if (!v) { showNotice('No output path yet', 'warn'); return; }
+
+  // The box can still hold a bare "Song.srt" (older saved session, or the
+  // file hasn't been generated yet). Ask the server for the complete path
+  // so what lands on the clipboard is never just the file name.
+  if (!_isAbsolutePath(v)) {
+    try {
+      const r = await fetch(`/api/output_abs?path=${encodeURIComponent(state.srt || v)}`);
+      if (r.ok) {
+        const a = await r.json();
+        if (a.path) { v = a.path; $('outputFilePath').value = v; }
+      }
+    } catch (e) { /* fall through with what we have */ }
+  }
 
   // navigator.clipboard only exists in secure contexts (https, or
   // localhost). This dashboard is typically opened over plain http on
-  // a LAN IP (see app.py's own startup message), where
-  // navigator.clipboard is undefined — calling .writeText on it throws
-  // synchronously, before any .catch() runs, so the button silently
-  // does nothing. Fall back to a hidden-textarea + execCommand copy
-  // in that case.
+  // a LAN IP, where navigator.clipboard is undefined, so fall back to a
+  // hidden-textarea + execCommand copy in that case.
   if (navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(v)
-      .then(() => setStatus('SRT path copied'))
+      .then(() => setStatus('SRT path copied: ' + v))
       .catch(() => copyViaFallback(v));
   } else {
     copyViaFallback(v);
@@ -601,7 +625,7 @@ function copyViaFallback(text) {
   ta.select();
   try {
     const ok = document.execCommand('copy');
-    setStatus(ok ? 'SRT path copied' : 'Copy failed');
+    setStatus(ok ? 'SRT path copied: ' + text : 'Copy failed');
   } catch (e) {
     setStatus('Copy failed');
   } finally {
@@ -743,6 +767,8 @@ function applySongDirection(modal) {
   });
 }
 
+const ARABIC_DIALECT_CODES = ['egyptian', 'gulf', 'levantine', 'iraqi', 'maghrebi', 'msa'];
+
 function readSongFields(modal) {
   return {
     title:       modal.querySelector('#songTitle').value.trim(),
@@ -753,6 +779,7 @@ function readSongFields(modal) {
     backend:     modal.querySelector('#songBackend').value,
     instruments: Array.from(modal.querySelectorAll('.songInstrument:checked')).map(el => el.value),
     // The two option checkboxes are saved with everything else (both default ON).
+    dialect:     (modal.querySelector('#songDialect') || { value: 'egyptian' }).value,
     include_title_lyrics: !!(modal.querySelector('#songPresetLyrics') || { checked: true }).checked,
     backtrack:            !!(modal.querySelector('#songStems') || { checked: true }).checked,
   };
@@ -775,6 +802,8 @@ function applySongFields(modal, fields) {
   modal.querySelectorAll('.songInstrument').forEach(el => {
     el.checked = chosen.has(el.value);
   });
+  const diaEl = modal.querySelector('#songDialect');
+  if (diaEl) diaEl.value = ARABIC_DIALECT_CODES.includes(fields.dialect) ? fields.dialect : 'egyptian';
   const incEl = modal.querySelector('#songPresetLyrics');
   if (incEl) incEl.checked = fields.include_title_lyrics !== false;
   const bkEl = modal.querySelector('#songStems');
@@ -824,6 +853,17 @@ function openAiLyricsModal() {
         <label for="aiLyLanguage">Language of the lyrics</label>
         <select id="aiLyLanguage" style="width:100%; box-sizing:border-box; padding:3px 6px; font-size:13px;">${langOptions}</select>
       </div>
+      <div class="song-field" id="aiLyDialectRow">
+        <label for="aiLyDialect">Arabic dialect</label>
+        <select id="aiLyDialect" style="width:100%; box-sizing:border-box; padding:3px 6px; font-size:13px;">
+          <option value="egyptian">Egyptian - مصري</option>
+              <option value="gulf">Gulf - خليجي</option>
+              <option value="levantine">Levantine - شامي</option>
+              <option value="iraqi">Iraqi - عراقي</option>
+              <option value="maghrebi">Maghrebi - مغاربي</option>
+              <option value="msa">Modern Standard - فصحى</option>
+        </select>
+      </div>
       <div class="song-field">
         <label for="aiLyTitle">Title <span class="muted">(optional - the AI suggests one)</span></label>
         <input type="text" id="aiLyTitle" dir="auto" style="width:100%; box-sizing:border-box; padding:4px 6px; font-size:13px;" placeholder="Song title">
@@ -869,6 +909,12 @@ function openAiLyricsModal() {
   q('#aiLyLanguage').value = draft.language || 'auto';
   if (q('#aiLyLanguage').value !== (draft.language || 'auto')) q('#aiLyLanguage').value = 'auto';
   q('#aiLyStyle').setAttribute('dir', 'auto');
+  q('#aiLyDialect').value = ARABIC_DIALECT_CODES.includes(draft.dialect) ? draft.dialect : 'egyptian';
+  const applyDialectRow = () => {
+    q('#aiLyDialectRow').style.display = q('#aiLyLanguage').value === 'ar' ? '' : 'none';
+  };
+  applyDialectRow();
+  q('#aiLyLanguage').addEventListener('change', applyDialectRow);
 
   const applyDir = () => {
     const dir = songLangDir(q('#aiLyLanguage').value);
@@ -1012,6 +1058,7 @@ function openAiLyricsModal() {
           style: q('#aiLyStyle').value.trim(),
           subject,
           language: q('#aiLyLanguage').value,
+          dialect: q('#aiLyDialect').value,
           title: q('#aiLyTitle').value.trim(),
         }),
       });
@@ -1054,101 +1101,225 @@ function openAiLyricsModal() {
       lyrics:   lyrics,
       style:    q('#aiLyStyle').value.trim(),
       language: q('#aiLyLanguage').value,
+      dialect:  q('#aiLyDialect').value,
     });
     try { localStorage.setItem(SONG_DRAFT_KEY, JSON.stringify(merged)); } catch (e) {}
     dirty = false;
+    window.__songDraftFresh = true;
     modal.remove();
     openCreateSongModal();
     showNotice('Lyrics added to AI Song - choose a singer, then press Generate', 'success');
   };
 }
 
+/* ---------- Floating hover tips ----------
+   Any element with data-tip="text" (or data-tip-from="#selector", which
+   reads live text from another element) shows a floating dialog box next
+   to the mouse while hovered / focused. Replaces always-visible helper
+   text so panels stay compact. */
+function initFloatingTips() {
+  if (window._floatTipInit) return;
+  window._floatTipInit = true;
+
+  const st = document.createElement('style');
+  st.textContent = `
+    #floatTip { position: fixed; z-index: 2147483000; left: 0; top: 0; max-width: 300px;
+      padding: 9px 12px; border-radius: 8px; font: 12.5px/1.45 system-ui, -apple-system, 'Segoe UI', sans-serif;
+      color: #f3f4f6; background: #1b2230; border: 1px solid rgba(120,160,255,.55);
+      box-shadow: 0 8px 28px rgba(0,0,0,.45); pointer-events: none; opacity: 0;
+      transform: translateY(4px); transition: opacity .12s ease, transform .12s ease; white-space: normal; }
+    #floatTip.on { opacity: 1; transform: none; }
+    .sc-i { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px;
+      margin-left: 5px; border-radius: 50%; border: 1px solid currentColor; font: italic 700 9px/1 Georgia, serif;
+      opacity: .55; vertical-align: middle; cursor: help; }
+    [data-tip]:hover > label .sc-i, [data-tip]:hover .sc-i { opacity: 1; }
+  `;
+  document.head.appendChild(st);
+
+  const tip = document.createElement('div');
+  tip.id = 'floatTip';
+  tip.setAttribute('role', 'tooltip');
+  document.body.appendChild(tip);
+
+  let cur = null;
+  const textFor = (el) => {
+    if (el.dataset.tipFrom) {
+      const s = document.querySelector(el.dataset.tipFrom);
+      return s ? s.textContent.trim() : '';
+    }
+    return el.dataset.tip || '';
+  };
+  const place = (x, y) => {
+    const pad = 14, r = tip.getBoundingClientRect();
+    let left = x + pad, top = y + pad + 4;
+    if (left + r.width > window.innerWidth - 8) left = Math.max(8, x - r.width - pad);
+    if (top + r.height > window.innerHeight - 8) top = Math.max(8, y - r.height - pad);
+    tip.style.left = left + 'px';
+    tip.style.top = top + 'px';
+  };
+  const hide = () => { cur = null; tip.classList.remove('on'); };
+  const show = (el, x, y) => {
+    const t = textFor(el);
+    if (!t) { hide(); return; }
+    cur = el;
+    tip.textContent = t;
+    tip.classList.add('on');
+    place(x, y);
+  };
+  const find = (n) => (n && n.closest) ? n.closest('[data-tip],[data-tip-from]') : null;
+
+  document.addEventListener('mouseover', (e) => {
+    const el = find(e.target);
+    if (el === cur) return;
+    if (!el) { hide(); return; }
+    show(el, e.clientX, e.clientY);
+  });
+  document.addEventListener('mousemove', (e) => {
+    if (!cur) return;
+    if (!document.body.contains(cur)) { hide(); return; }
+    place(e.clientX, e.clientY);
+  });
+  document.addEventListener('mouseout', (e) => {
+    if (cur && !cur.contains(e.relatedTarget)) hide();
+  });
+  document.addEventListener('mousedown', hide);
+  document.addEventListener('focusin', (e) => {
+    const el = find(e.target);
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    show(el, r.left + 12, r.bottom - 6);
+  });
+  document.addEventListener('focusout', hide);
+}
+
 function openCreateSongModal() {
+  initFloatingTips();
   document.querySelectorAll('.song-modal').forEach(m => m.remove());
 
   const modal = document.createElement('div');
-  modal.className = 'editor-modal song-modal';
+  modal.className = 'editor-modal song-modal song-create';
 
   const instrumentsHtml = INSTRUMENT_OPTIONS.map((name, i) => `
     <label><input type="checkbox" class="songInstrument" value="${name}"> ${name}</label>
   `).join('');
 
   modal.innerHTML = `
+    <style>
+      .song-create .song-box { width: min(760px, 96vw) !important; max-width: 96vw !important;
+        max-height: 94vh !important; overflow-y: auto; box-sizing: border-box; padding: 12px 16px 14px; }
+      .sc-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
+      .sc-head h3 { margin: 0; }
+      .sc-presets { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 6px 8px;
+        margin-bottom: 10px; border: 1px solid rgba(128,128,128,.28); border-radius: 8px; }
+      .sc-presets select { flex: 1 1 150px; min-width: 0; }
+      .sc-presets .btn { padding: 4px 10px; }
+      .sc-presets .preset-check { font-size: 12px; white-space: nowrap; }
+      .sc-sec { border: 1px solid rgba(128,128,128,.28); border-radius: 10px; padding: 8px 12px 10px; margin: 0 0 10px; }
+      .sc-sec > h4 { margin: 0 0 8px; font-size: 11px; letter-spacing: .08em; text-transform: uppercase; opacity: .7; }
+      .sc-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; }
+      .sc-full { grid-column: 1 / -1; }
+      .song-create .song-field { margin: 0; min-width: 0; }
+      .song-create .song-field > label, .sc-lab { display: block; font-size: 12px; margin-bottom: 3px; opacity: .92; }
+      .song-create .sc-grid input[type=text], .song-create .sc-grid select, .song-create .sc-grid textarea {
+        width: 100%; box-sizing: border-box; }
+      .sc-row { display: flex; gap: 8px; align-items: center; }
+      .sc-row select { flex: 1 1 0; min-width: 0; width: auto !important; }
+      .sc-dial { flex: 1 1 0; min-width: 0; }
+      .song-create #songLyrics { height: clamp(100px, 22vh, 220px) !important; min-height: 0 !important; resize: vertical; }
+      .sc-tools { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+      .sc-tools .btn, .sc-btnrow .btn { padding: 4px 10px; }
+      .sc-btnrow { display: flex; align-items: center; gap: 6px; }
+      .sc-name { display: block; font-size: 11px; opacity: .75; overflow: hidden; text-overflow: ellipsis;
+        white-space: nowrap; margin-top: 3px; }
+      .sc-chips { display: flex; flex-wrap: wrap; gap: 5px 6px; }
+      .sc-chip { display: inline-flex; align-items: center; gap: 5px; padding: 2px 9px; font-size: 12px;
+        border: 1px solid rgba(128,128,128,.4); border-radius: 999px; cursor: pointer; user-select: none; }
+      .sc-chip:has(input:checked) { background: rgba(80,140,255,.22); border-color: rgba(80,140,255,.75); }
+      .sc-chip input { margin: 0; }
+      .sc-check { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+      .song-create .editor-actions { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; margin-top: 2px; }
+      @media (max-width: 560px) { .sc-grid { grid-template-columns: 1fr; } }
+    </style>
     <div class="editor-box song-box">
-      <h3>Create Song</h3>
-      <div class="song-presets">
+      <div class="sc-head"><h3>Create Song</h3></div>
+
+      <div class="sc-presets song-presets">
         <label for="songPresetSelect">Saved setups:</label>
         <select id="songPresetSelect"><option value="">Loading...</option></select>
         <button class="btn" type="button" id="songPresetLoad">Load</button>
         <button class="btn" type="button" id="songPresetSave">Save setup...</button>
         <button class="btn" type="button" id="songPresetDelete">Delete</button>
-        <label class="preset-check" title="Also save / use the title and lyrics text (saved setups, drafts and the song folder)">
-          <input type="checkbox" id="songPresetLyrics" checked> include title &amp; lyrics
+        <label class="preset-check" data-tip="Also save / use the title and lyrics text (saved setups, drafts and the song folder).">
+          <input type="checkbox" id="songPresetLyrics" checked> title &amp; lyrics <i class="sc-i">i</i>
         </label>
       </div>
-      <div class="song-panels">
 
-        <div class="song-panel">
-          <h4>Lyrics</h4>
-          <div class="song-field">
+      <div class="sc-sec">
+        <h4>Lyrics</h4>
+        <div class="sc-grid">
+          <div class="song-field sc-full">
             <label for="songTitle">Title</label>
             <input type="text" id="songTitle" placeholder="Song title">
           </div>
-          <div class="song-field">
-            <label for="songLanguage">Language <span class="muted">(sung language &amp; reading direction)</span></label>
-            <select id="songLanguage">
-              <option value="auto">Auto - detect from the lyrics</option>
-              <option value="ar">Arabic - عربي (right to left)</option>
-              <option value="en">English</option>
-              <option value="fa">Persian - فارسی (right to left)</option>
-              <option value="ur">Urdu - اردو (right to left)</option>
-              <option value="tr">Turkish</option>
-              <option value="fr">French</option>
-              <option value="es">Spanish</option>
-              <option value="de">German</option>
-              <option value="it">Italian</option>
-              <option value="pt">Portuguese</option>
-              <option value="hi">Hindi</option>
-              <option value="ru">Russian</option>
-              <option value="ja">Japanese</option>
-              <option value="ko">Korean</option>
-              <option value="zh">Chinese</option>
-            </select>
+          <div class="song-field sc-full" data-tip="Sung language and reading direction. Auto detects it from the lyrics. The dialect box appears for Arabic and sets the singer's accent.">
+            <label for="songLanguage">Language <i class="sc-i">i</i></label>
+            <div class="sc-row">
+              <select id="songLanguage">
+                <option value="auto">Auto - detect from the lyrics</option>
+                <option value="ar">Arabic - عربي (right to left)</option>
+                <option value="en">English</option>
+                <option value="fa">Persian - فارسی (right to left)</option>
+                <option value="ur">Urdu - اردو (right to left)</option>
+                <option value="tr">Turkish</option>
+                <option value="fr">French</option>
+                <option value="es">Spanish</option>
+                <option value="de">German</option>
+                <option value="it">Italian</option>
+                <option value="pt">Portuguese</option>
+                <option value="hi">Hindi</option>
+                <option value="ru">Russian</option>
+                <option value="ja">Japanese</option>
+                <option value="ko">Korean</option>
+                <option value="zh">Chinese</option>
+              </select>
+              <div class="sc-dial" id="songDialectRow">
+                <select id="songDialect" aria-label="Arabic dialect">
+                  <option value="egyptian">Egyptian - مصري</option>
+                  <option value="gulf">Gulf - خليجي</option>
+                  <option value="levantine">Levantine - شامي</option>
+                  <option value="iraqi">Iraqi - عراقي</option>
+                  <option value="maghrebi">Maghrebi - مغاربي</option>
+                  <option value="msa">Modern Standard - فصحى</option>
+                </select>
+              </div>
+            </div>
           </div>
-          <div class="song-field">
-            <label for="songLyrics">Verses, Chorus, Bridge, etc.</label>
+          <div class="song-field sc-full" data-tip="Verses, Chorus, Bridge, etc. Mark sections with tags like [Verse 1], [Chorus], [Bridge] on their own line.">
+            <label for="songLyrics">Lyrics <i class="sc-i">i</i></label>
             <textarea id="songLyrics" data-dir-fixed dir="auto" spellcheck="false"
               placeholder="[Verse 1]&#10;...&#10;&#10;[Chorus]&#10;...&#10;&#10;[Verse 2]&#10;...&#10;&#10;[Bridge]&#10;..."></textarea>
           </div>
-          <div class="song-field song-lyrics-tools">
+          <div class="song-field sc-full sc-tools">
             <input type="file" id="songLyricsFile" accept=".txt,.text,text/plain" hidden>
-            <button class="btn" type="button" id="songLyricsPick">Load lyrics from file...</button>
+            <button class="btn" type="button" id="songLyricsPick" data-tip="Fill the lyrics box from a .txt file on this computer.">Load lyrics from file...</button>
             <span id="songLenNote" class="muted"></span>
           </div>
         </div>
+      </div>
 
-        <div class="song-panel">
-          <h4>Style</h4>
-          <div class="song-field">
-            <label for="songBackend">Backend</label>
+      <div class="sc-sec">
+        <h4>Sound</h4>
+        <div class="sc-grid">
+          <div class="song-field" data-tip-from="#songBackendNote">
+            <label for="songBackend">Backend <i class="sc-i">i</i></label>
             <select id="songBackend">
               <option value="ace">ACE-Step — lyrics + sung vocals</option>
               <option value="musicgen">MusicGen — instrumental only, faster</option>
             </select>
-            <div id="songBackendNote" class="muted" style="margin-top:4px; font-size:11px;"></div>
-            <label id="songStemsRow" style="display:block; margin-top:8px; font-size:12px;">
-              <input type="checkbox" id="songStems" checked> Also create a separate backtrack (music only)
-            </label>
-            <div id="songStemsNote" class="muted" style="margin-top:2px; font-size:11px;">
-              Makes two files: the full song and a clean instrumental backtrack of the same length and style. Takes about twice as long. Both are volume-matched.
-            </div>
+            <div id="songBackendNote" hidden></div>
           </div>
-          <div class="song-field">
-            <label for="songStyle">Genre / mood / description</label>
-            <input type="text" id="songStyle" placeholder="e.g. upbeat pop rock, 120bpm, anthemic">
-          </div>
-          <div class="song-field">
-            <label for="songSinger">Singer</label>
+          <div class="song-field" data-tip="Who sings. Auto lets the model choose; Instrumental produces no vocals.">
+            <label for="songSinger">Singer <i class="sc-i">i</i></label>
             <select id="songSinger">
               <option value="auto">Auto</option>
               <option value="male">Male</option>
@@ -1157,19 +1328,54 @@ function openCreateSongModal() {
               <option value="instrumental">Instrumental (no vocals)</option>
             </select>
           </div>
-          <div class="song-field">
-            <label>Instruments</label>
-            <div class="song-instruments">${instrumentsHtml}</div>
+          <div class="song-field sc-full">
+            <label for="songStyle">Genre / mood / description</label>
+            <input type="text" id="songStyle" placeholder="e.g. upbeat pop rock, 120bpm, anthemic">
           </div>
+          <div class="song-field sc-full">
+            <label>Instruments</label>
+            <div class="sc-chips song-instruments">${instrumentsHtml}</div>
+          </div>
+          <div class="song-field" id="songMusicRow" data-tip="Generate new music from your style, or sing the lyrics over a backing track you provide.">
+            <label for="songMusicSource">Music <i class="sc-i">i</i></label>
+            <select id="songMusicSource">
+              <option value="generate">Generate new music</option>
+              <option value="backing">Use my own backing track</option>
+            </select>
+          </div>
+          <div class="song-field" id="songVoiceRow" data-tip="Optional. A 10-30 s clip of the voice you want (e.g. a previous song's vocals). Steers the singer toward it every time; not an exact clone.">
+            <label>Voice reference <i class="sc-i">i</i></label>
+            <input type="file" id="songVoiceFile" accept="audio/*,.mp3,.wav,.flac,.m4a,.aac,.ogg,.opus,.wma" hidden>
+            <div class="sc-btnrow">
+              <button class="btn" type="button" id="songVoicePick">Choose voice sample...</button>
+              <button class="btn" type="button" id="songVoiceClear" style="display:none;">Remove</button>
+            </div>
+            <span id="songVoiceName" class="sc-name"></span>
+          </div>
+          <div class="song-field sc-full" id="songBackingBox" style="display:none;"
+               data-tip="Lyrics are sung over your track (its tempo and structure) instead of new music. Instruments and backtrack are not used. Mixing takes a few extra minutes.">
+            <input type="file" id="songBackingFile" accept="audio/*,.mp3,.wav,.flac,.m4a,.aac,.ogg,.opus,.wma" hidden>
+            <div class="sc-btnrow">
+              <button class="btn" type="button" id="songBackingPick">Choose backing track...</button>
+              <span id="songBackingName" class="muted"></span>
+            </div>
+            <audio id="songBackingPlayer" controls style="display:none; width:100%; margin-top:6px;"></audio>
+            <label class="sc-check" style="margin-top:6px;" data-tip="Keeps your music exactly as it is and lays the singing on top of it.">
+              <input type="checkbox" id="songMixOriginal" checked> Put the singing on top of my original track <i class="sc-i">i</i>
+            </label>
+          </div>
+          <label id="songStemsRow" class="sc-check sc-full" data-tip="Makes two files: the full song and a clean instrumental backtrack of the same length and style. Takes about twice as long. Both are volume-matched.">
+            <input type="checkbox" id="songStems" checked> Also create a separate backtrack (music only) <i class="sc-i">i</i>
+          </label>
         </div>
-
       </div>
+
       <div class="editor-actions">
-        <button class="btn" id="songBrowseOutput">Browse Output</button>
-        <button class="btn" id="songSave" title="Remember these fields in this browser (loads automatically next time)">Save Draft</button>
-        <button class="btn" id="songClear">Clear</button>
-        <button class="btn accent" id="songGenerate">Generate</button>
-        <button class="btn" id="songCancel">Cancel</button>
+        <button class="btn" id="songBrowseOutput" data-tip="Open the folder where generated songs are saved.">Browse Output</button>
+        <button class="btn" id="songSave" data-tip="Remember these fields in this browser (loads automatically next time).">Save Draft</button>
+        <button class="btn" id="songClear" data-tip="Empty every field in this window.">Clear</button>
+        <button class="btn accent" id="songGenerate" data-tip="Start generating the song with these settings.">Generate</button>
+        <button class="btn" id="songCancel" data-tip="Close this window without generating.">Cancel</button>
       </div>
     </div>`;
 
@@ -1189,6 +1395,19 @@ function openCreateSongModal() {
   });
 
   modal.querySelector('#songBrowseOutput').onclick = () => browseRemote('songs');
+
+  /* ----- Arabic dialect dropdown: only shown when the song is Arabic ----- */
+  function updateDialectVisibility() {
+    const row = modal.querySelector('#songDialectRow');
+    if (!row) return;
+    const lang = modal.querySelector('#songLanguage').value;
+    const text = modal.querySelector('#songLyrics').value;
+    const isArabic = lang === 'ar' || (lang === 'auto' && /[\u0600-\u06FF\u0750-\u077F]{3}/.test(text));
+    row.style.display = isArabic ? '' : 'none';
+  }
+  modal.querySelector('#songLanguage').addEventListener('change', updateDialectVisibility);
+  modal.querySelector('#songLyrics').addEventListener('input', updateDialectVisibility);
+  updateDialectVisibility();
 
   /* ----- Estimated song length (mirrors the server's estimate) ----- */
   function updateLenNote() {
@@ -1259,7 +1478,7 @@ function openCreateSongModal() {
     return data;
   }
 
-  async function refreshPresets(selectName) {
+  async function refreshPresets(selectName, pickLast) {
     try {
       const data = await presetApi('/api/song_presets');
       const list = data.presets || [];
@@ -1267,9 +1486,15 @@ function openCreateSongModal() {
         ? list.map(p => `<option value="${escapeHtml(p.name)}">${escapeHtml(p.name)}</option>`).join('')
         : '<option value="">- none saved yet -</option>';
       if (selectName) presetSelect.value = selectName;
+      else if (pickLast && list.length) {
+        // Startup: select the setup used last time (else the newest saved one).
+        const wanted = data.last && list.some(p => p.name === data.last) ? data.last : list[0].name;
+        presetSelect.value = wanted;
+      }
     } catch (e) {
       presetSelect.innerHTML = '<option value="">- could not load list -</option>';
     }
+    return presetSelect.value;
   }
 
   modal.querySelector('#songPresetSave').onclick = async () => {
@@ -1291,21 +1516,38 @@ function openCreateSongModal() {
     }
   };
 
-  modal.querySelector('#songPresetLoad').onclick = async () => {
+  const SETUP_DEFAULTS = { title: '', lyrics: '', language: 'auto', style: '', singer: 'auto',
+    backend: 'ace', instruments: [], dialect: 'egyptian', include_title_lyrics: true, backtrack: true };
+
+  async function loadSelectedPreset(fromDropdown, quiet, replace) {
     const name = presetSelect.value;
-    if (!name) { showNotice('Pick a saved setup first', 'warn'); return; }
+    if (!name) {
+      // Auto-load on the dropdown ignores the placeholder entries silently.
+      if (!fromDropdown) showNotice('Pick a saved setup first', 'warn');
+      return;
+    }
     try {
       const data = await presetApi('/api/song_presets/' + encodeURIComponent(name));
       // Merge, so a setup saved without lyrics does not wipe the lyrics you have typed.
-      applySongFields(modal, Object.assign(readSongFields(modal), data.settings || {}));
+      // replace=true (startup): every field comes from the setup, nothing stale is kept.
+      // Otherwise merge, so a setup saved without lyrics keeps what you typed.
+      const base = replace ? Object.assign({}, SETUP_DEFAULTS) : readSongFields(modal);
+      applySongFields(modal, Object.assign(base, data.settings || {}));
       applySongDirection(modal);
       updateBackendNote();
+      updateStemsVisibility();
       updateLenNote();
-      showNotice('Setup "' + name + '" loaded', 'success');
+      updateDialectVisibility();
+      if (!quiet) showNotice('Setup "' + name + '" loaded', 'success');
     } catch (e) {
       showNotice('Could not load setup: ' + e.message, 'error');
     }
-  };
+  }
+
+  // Picking a setup in the dropdown loads it straight away and fills the fields.
+  presetSelect.addEventListener('change', () => loadSelectedPreset(true));
+  // The Load button still works (handy to reload the same setup after editing).
+  modal.querySelector('#songPresetLoad').onclick = () => loadSelectedPreset(false);
 
   modal.querySelector('#songPresetDelete').onclick = async () => {
     const name = presetSelect.value;
@@ -1320,7 +1562,21 @@ function openCreateSongModal() {
     }
   };
 
-  refreshPresets();
+  // Startup: select the last-used setup and load ALL of its data (title, lyrics, style,
+  // singer, instruments, ...) so the dropdown name always matches what is in the boxes.
+  // The one exception: lyrics just sent over from the AI Lyrics window. Those are shown,
+  // and the dropdown says "current draft" so it never names a setup that is not loaded.
+  const freshDraft = !!window.__songDraftFresh;
+  window.__songDraftFresh = false;
+  refreshPresets(null, true).then(name => {
+    if (freshDraft) {
+      presetSelect.insertAdjacentHTML('afterbegin',
+        '<option value="">- current draft (not a saved setup) -</option>');
+      presetSelect.value = '';
+      return;
+    }
+    if (name) return loadSelectedPreset(true, true, true);
+  });
   updateLenNote();
 
   modal.querySelector('#songSave').onclick = () => {
@@ -1337,8 +1593,10 @@ function openCreateSongModal() {
   modal.querySelector('#songClear').onclick = () => {
     applySongFields(modal, { title: '', lyrics: '', language: 'auto', style: '', singer: 'auto', backend: 'ace', instruments: [] });
     try { localStorage.removeItem(SONG_DRAFT_KEY); } catch (e) {}
+    resetAudioInputs();
     updateBackendNote();
     updateLenNote();
+    updateDialectVisibility();
     showNotice('Song fields cleared', 'success');
   };
 
@@ -1352,15 +1610,81 @@ function openCreateSongModal() {
       : 'ACE-Step uses your Lyrics and Singer choice to generate sung vocals.';
   };
   const stemsRow = modal.querySelector('#songStemsRow');
-  const stemsNote = modal.querySelector('#songStemsNote');
+  const musicSource = modal.querySelector('#songMusicSource');
+  const musicRow = modal.querySelector('#songMusicRow');
+  const voiceRow = modal.querySelector('#songVoiceRow');
+  const backingBox = modal.querySelector('#songBackingBox');
+  const backingFile = modal.querySelector('#songBackingFile');
+  const voiceFile = modal.querySelector('#songVoiceFile');
+  // Own backing track / voice reference are ACE-Step features (MusicGen has no vocals).
+  const usingBacking = () => backendSelect.value === 'ace' && musicSource.value === 'backing';
   const updateStemsVisibility = () => {
-    const show = backendSelect.value === 'ace';
+    const isAce = backendSelect.value === 'ace';
+    // The separate "backtrack" copy is pointless when the user brought the music.
+    const show = isAce && !usingBacking();
     stemsRow.style.display = show ? 'block' : 'none';
-    stemsNote.style.display = show ? 'block' : 'none';
+    musicRow.style.display = isAce ? '' : 'none';
+    voiceRow.style.display = isAce ? '' : 'none';
+    backingBox.style.display = usingBacking() ? 'block' : 'none';
   };
+  musicSource.onchange = updateStemsVisibility;
   backendSelect.onchange = () => { updateBackendNote(); updateStemsVisibility(); };
   updateStemsVisibility();
   updateBackendNote();
+
+  /* ----- audio file pickers (backing track + voice reference) ----- */
+  const MAX_SONG_AUDIO_MB = 150;
+  let backingUrl = null;
+  const backingNameEl = modal.querySelector('#songBackingName');
+  const backingPlayer = modal.querySelector('#songBackingPlayer');
+  const voiceNameEl = modal.querySelector('#songVoiceName');
+  const voiceClearBtn = modal.querySelector('#songVoiceClear');
+  function fileLabel(f) { return ' ' + f.name + ' (' + (f.size / 1048576).toFixed(1) + ' MB)'; }
+  function resetAudioInputs() {
+    backingFile.value = '';
+    voiceFile.value = '';
+    backingNameEl.textContent = '';
+    voiceNameEl.textContent = '';
+    voiceClearBtn.style.display = 'none';
+    backingPlayer.removeAttribute('src');
+    backingPlayer.style.display = 'none';
+    if (backingUrl) { URL.revokeObjectURL(backingUrl); backingUrl = null; }
+    musicSource.value = 'generate';
+    updateStemsVisibility();
+  }
+  modal.querySelector('#songBackingPick').onclick = () => backingFile.click();
+  backingFile.onchange = () => {
+    if (backingUrl) { URL.revokeObjectURL(backingUrl); backingUrl = null; }
+    const f = backingFile.files && backingFile.files[0];
+    if (!f) { backingNameEl.textContent = ''; backingPlayer.style.display = 'none'; return; }
+    if (f.size > MAX_SONG_AUDIO_MB * 1048576) {
+      showNotice('That audio file is too large (' + MAX_SONG_AUDIO_MB + ' MB max)', 'warn');
+      backingFile.value = '';
+      backingNameEl.textContent = '';
+      backingPlayer.style.display = 'none';
+      return;
+    }
+    backingNameEl.textContent = fileLabel(f);
+    backingUrl = URL.createObjectURL(f);
+    backingPlayer.src = backingUrl;               // lets the user check it is the right track
+    backingPlayer.style.display = 'block';
+  };
+  modal.querySelector('#songVoicePick').onclick = () => voiceFile.click();
+  voiceFile.onchange = () => {
+    const f = voiceFile.files && voiceFile.files[0];
+    if (f && f.size > MAX_SONG_AUDIO_MB * 1048576) {
+      showNotice('That audio file is too large (' + MAX_SONG_AUDIO_MB + ' MB max)', 'warn');
+      voiceFile.value = '';
+    }
+    const g = voiceFile.files && voiceFile.files[0];
+    voiceNameEl.textContent = g ? fileLabel(g) : '';
+    voiceClearBtn.style.display = g ? '' : 'none';
+  };
+  voiceClearBtn.onclick = () => {
+    voiceFile.value = '';
+    voiceNameEl.textContent = '';
+    voiceClearBtn.style.display = 'none';
+  };
 
   modal.querySelector('#songGenerate').onclick = async () => {
     const backend = backendSelect.value;
@@ -1378,18 +1702,41 @@ function openCreateSongModal() {
     const instruments = Array.from(modal.querySelectorAll('.songInstrument:checked'))
       .map(el => el.value);
 
+    const ownTrack = usingBacking() ? backingFile.files[0] : null;
+    const voiceSample = backend === 'ace' ? voiceFile.files[0] : null;
+    if (usingBacking() && !ownTrack) {
+      showNotice('Choose your backing track first (or set Music back to "Generate new music")', 'warn');
+      return;
+    }
+    if (ownTrack && singer === 'instrumental') {
+      showNotice('A backing track is for sung lyrics - pick a singer other than Instrumental', 'warn');
+      return;
+    }
+
     const genBtn = modal.querySelector('#songGenerate');
     genBtn.disabled = true;
     let res;
     try {
-      const r = await fetch('/api/create_song', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title, lyrics, language, style, singer, instruments, backend,
-                               stems: backend === 'ace' && modal.querySelector('#songStems').checked,
-                               backtrack: modal.querySelector('#songStems').checked,
-                               include_title_lyrics: modal.querySelector('#songPresetLyrics').checked }),
-      });
+      const payload = { title, lyrics, language, style, singer, instruments, backend,
+                        stems: backend === 'ace' && modal.querySelector('#songStems').checked,
+                        backtrack: modal.querySelector('#songStems').checked,
+                        dialect: modal.querySelector('#songDialect').value,
+                        include_title_lyrics: modal.querySelector('#songPresetLyrics').checked,
+                        mix_original: modal.querySelector('#songMixOriginal').checked };
+      let init;
+      if (ownTrack || voiceSample) {
+        // Audio attached -> multipart: the usual fields travel as one JSON "payload".
+        const fd = new FormData();
+        fd.append('payload', JSON.stringify(payload));
+        if (ownTrack) fd.append('backing_track', ownTrack);
+        if (voiceSample) fd.append('voice_ref', voiceSample);
+        init = { method: 'POST', body: fd };          // browser sets the multipart header
+        setStatus('Uploading audio...');
+      } else {
+        init = { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                 body: JSON.stringify(payload) };
+      }
+      const r = await fetch('/api/create_song', init);
       res = await r.json();
     } catch (e) {
       showNotice('Request failed: ' + e.message, 'error');

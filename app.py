@@ -547,6 +547,10 @@ def upload():
         size=dest.stat().st_size,
         size_mb=round(dest.stat().st_size / (1024 * 1024), 2),
         srt_path=f"{Path(safe).stem}.srt",
+        # Complete path on the server where the SRT will be written
+        # (see _run_pipeline: outputs/<user>/SRT/<stem>/<stem>.srt).
+        srt_full_path=str((OUTPUT_DIR / session["user"] / "SRT" / Path(safe).stem
+                           / f"{Path(safe).stem}.srt").resolve()),
     )
 
 
@@ -1535,6 +1539,14 @@ def job_status(job_id):
         except Exception:
             srt_rel = Path(job["output"]).name  # fallback, better than nothing
 
+    # Complete (absolute) path of the SRT file, for the GUI's "Copy path".
+    srt_abs = None
+    if job.get("output") and str(job["output"]).endswith(".srt"):
+        try:
+            srt_abs = str(Path(job["output"]).resolve())
+        except Exception:
+            srt_abs = str(job["output"])
+
     # translate to shape app.js expects
     return jsonify(
         id=job_id,
@@ -1544,6 +1556,7 @@ def job_status(job_id):
         message=job["status"],
         result={
             "srt": srt_rel,
+            "srt_abs": srt_abs,
             "preview": job.get("srt", "")[:8000],
             "video": job["output"] if "video" in job and not job.get("keep_vocals") else None,
             "lyric_video": job["output"] if "video" in job and job.get("keep_vocals") else None,
@@ -1668,6 +1681,7 @@ ACE_STEP_POLL_SECONDS = 3
 # The lyrics are split at section boundaries ([verse], [chorus], ...) into
 # chunks of roughly ACE_STEP_CHUNK_SECONDS of audio each, generated one after
 # another with the SAME style/seed, then joined with a short crossfade.
+# (That is the OLD method; see SEAMLESS LONG SONGS below for the default.)
 # Songs that already fit in one chunk are generated in a single request.
 ACE_STEP_CHUNK_SECONDS = float(os.environ.get("ACE_STEP_CHUNK_SECONDS", "60") or 60)
 ACE_STEP_SEED = int(os.environ.get("ACE_STEP_SEED", "12345") or 12345)
@@ -1678,12 +1692,24 @@ ACE_STEP_CHUNK_RETRIES = 1
 
 
 # ============================================================
-# ACE-STEP SERVER CHECK (this app does NOT start ACE-Step)
+# ACE-STEP SERVER CHECK + AUTO-START
 # ------------------------------------------------------------
-# ACE-Step must be started separately on the PC that runs it, e.g. with
-# start_ace_step.bat. This app only checks that it is reachable.
+# Every AI button that needs ACE-Step (Create Song, backing-track cover,
+# ...) first checks that the ACE-Step server is answering. If it is NOT,
+# the job status shows "ACE-Step is not running - starting ACE-Step
+# start-up..." and this app launches it (start_ace_step.bat, or
+# 'uv run acestep-api' inside the ACE-Step-1.5 folder), then waits until
+# it answers before continuing. Auto-start only happens when
+# ACE_STEP_API_URL points at THIS PC (127.0.0.1 / localhost); for a remote
+# or Colab URL the app just reports that the server is unreachable.
 #   - /api/ace_status : used by the dashboard banner
+#   - /api/ace_start  : starts ACE-Step (dashboard 'Start server' button)
 #   - _require_ace_running() : called before every song request
+#
+# Optional environment variables:
+#   ACE_STEP_AUTOSTART=0   turn auto-start off
+#   ACE_STEP_START_CMD     full command to run instead of the .bat / uv
+#   ACE_STEP_DIR           path of the ACE-Step-1.5 folder
 # ============================================================
 
 ACE_START_HINT = (
@@ -1716,51 +1742,170 @@ def _ace_is_running() -> bool:
         return False
 
 
+ACE_AUTOSTART = os.environ.get("ACE_STEP_AUTOSTART", "1").strip() != "0"
+ACE_STARTING_MESSAGE = ("ACE-Step server is not running. Starting ACE-Step start-up now - "
+                        "please wait (about 3 minutes the first time)...")
+_ACE_START_LOCK = threading.Lock()
+_ACE_PROC = None          # the Popen of the ACE-Step process WE launched
+_ACE_STARTED_AT = 0.0
+
+
+def _ace_url_is_local() -> bool:
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(ACE_STEP_API_URL).hostname or "").lower()
+        return host in ("127.0.0.1", "localhost", "::1", "0.0.0.0")
+    except Exception:
+        return False
+
+
+def _ace_find_launcher():
+    """Work out HOW to start ACE-Step on this PC.
+    Returns (argv_list, working_dir) or None if nothing was found."""
+    custom = os.environ.get("ACE_STEP_START_CMD", "").strip()
+    if custom:
+        return (custom, str(BASE_DIR))          # a string -> run through the shell
+
+    roots = [BASE_DIR, BASE_DIR.parent, Path.cwd()]
+
+    # 1) start_ace_step.bat (or .sh) next to the app
+    names = ["start_ace_step.bat"] if sys.platform.startswith("win") else \
+            ["start_ace_step.sh", "start_ace_step.bat"]
+    for r in roots:
+        for n in names:
+            f = r / n
+            if f.is_file():
+                if f.suffix.lower() == ".bat":
+                    return (["cmd", "/c", str(f)], str(f.parent))
+                return (["bash", str(f)], str(f.parent))
+
+    # 2) the ACE-Step-1.5 folder -> 'uv run acestep-api'
+    dirs = []
+    if os.environ.get("ACE_STEP_DIR"):
+        dirs.append(Path(os.environ["ACE_STEP_DIR"]))
+    for r in roots:
+        dirs.append(r / "ACE-Step-1.5")
+    for d in dirs:
+        if d.is_dir():
+            uv = shutil.which("uv") or "uv"
+            return ([uv, "run", "acestep-api"], str(d))
+    return None
+
+
+def _ace_start_server():
+    """Launch ACE-Step in its own window. Never starts a second copy.
+    Returns (ok, message)."""
+    global _ACE_PROC, _ACE_STARTED_AT
+    if _ace_is_running() or _ace_port_open():
+        return True, "ACE-Step is already running / loading."
+    if not ACE_AUTOSTART:
+        return False, "auto-start is turned off (ACE_STEP_AUTOSTART=0)"
+    if not _ace_url_is_local():
+        return False, f"ACE-Step is on another machine ({ACE_STEP_API_URL}); start it there"
+
+    with _ACE_START_LOCK:
+        # another request may have started it while we waited for the lock
+        if _ace_is_running() or _ace_port_open():
+            return True, "ACE-Step is already running / loading."
+        if (_ACE_PROC is not None and _ACE_PROC.poll() is None
+                and time.time() - _ACE_STARTED_AT < 900):
+            return True, "ACE-Step start-up is already in progress."
+
+        found = _ace_find_launcher()
+        if not found:
+            return False, ("start_ace_step.bat / the ACE-Step-1.5 folder was not found "
+                           "next to the app")
+        cmd, cwd = found
+        try:
+            kw = dict(cwd=cwd, shell=isinstance(cmd, str))
+            if sys.platform.startswith("win"):
+                # its own console window, so the user can see progress and
+                # closing this app does not kill ACE-Step
+                kw["creationflags"] = subprocess.CREATE_NEW_CONSOLE
+            else:
+                kw["start_new_session"] = True
+                kw["stdout"] = open(BASE_DIR / "ace_step_server.log", "ab")
+                kw["stderr"] = subprocess.STDOUT
+            _ACE_PROC = subprocess.Popen(cmd, **kw)
+            _ACE_STARTED_AT = time.time()
+            print(f"[ACE] Starting ACE-Step: {cmd} (in {cwd})", flush=True)
+            return True, "ACE-Step start-up launched."
+        except Exception as e:
+            return False, f"could not launch ACE-Step ({e})"
+
+
 @app.route("/api/ace_status")
 @login_required
 def ace_status():
     """Used by the dashboard to show a warning banner if ACE-Step isn't reachable."""
+    starting = bool(_ACE_PROC is not None and _ACE_PROC.poll() is None
+                    and time.time() - _ACE_STARTED_AT < 900)
     try:
         _ace_http("GET", "/health", timeout=5)
-        return jsonify(running=True, url=ACE_STEP_API_URL)
+        return jsonify(running=True, starting=False, url=ACE_STEP_API_URL)
     except Exception as e:
-        return jsonify(running=False, url=ACE_STEP_API_URL, error=str(e),
+        return jsonify(running=False, starting=starting or _ace_port_open(),
+                       url=ACE_STEP_API_URL, error=str(e),
+                       message=ACE_STARTING_MESSAGE if starting else "",
                        hint=ACE_START_HINT)
 
 
 @app.route("/api/ace_start", methods=["POST"])
 @login_required
 def ace_start():
-    """Kept so an old dashboard 'Start server' button doesn't 404. This app
-    no longer starts ACE-Step itself."""
-    return jsonify(error="This app does not start ACE-Step. " + ACE_START_HINT), 400
+    """Start ACE-Step on this PC (if it is not already running)."""
+    if _ace_is_running():
+        return jsonify(running=True, starting=False, message="ACE-Step is already running.")
+    ok, info = _ace_start_server()
+    if not ok:
+        return jsonify(running=False, starting=False, error=info, hint=ACE_START_HINT), 400
+    return jsonify(running=False, starting=True, message=ACE_STARTING_MESSAGE, info=info)
 
 
 def _require_ace_running(progress=None, max_wait=900):
     """Called before each song request. Returns when ACE-Step answers.
-    If nothing is listening, fail at once with instructions. If the port is
-    open but /health isn't answering yet (models still loading), wait."""
+    If it is not running, tell the user ('starting ACE-Step start-up') and
+    start it, then wait for it to finish loading its models."""
     if _ace_is_running():
         return
+
+    launched = False
     if not _ace_port_open():
-        raise RuntimeError(
-            f"ACE-Step is not running at {ACE_STEP_API_URL}. " + ACE_START_HINT)
+        print("[ACE] " + ACE_STARTING_MESSAGE, flush=True)
+        if progress:
+            progress(18, ACE_STARTING_MESSAGE)
+        ok, info = _ace_start_server()
+        if not ok:
+            raise RuntimeError(
+                f"ACE-Step is not running at {ACE_STEP_API_URL} and could not be "
+                f"started automatically: {info}. " + ACE_START_HINT)
+        launched = True
+
     t0, last = time.time(), 0
     while time.time() - t0 < max_wait:
         if _ace_is_running():
+            if progress:
+                progress(18, "ACE-Step is ready.")
             return
+        # if the process we launched crashed straight away, stop waiting
+        proc = _ACE_PROC
+        if (launched and proc is not None and proc.poll() not in (None, 0)
+                and not _ace_port_open()):
+            raise RuntimeError(
+                f"ACE-Step start-up failed (exit code {proc.poll()}). "
+                "Look at its window / ace_step_server.log for the error. " + ACE_START_HINT)
         if progress and time.time() - last >= 10:
             last = time.time()
-            progress(18, f"Waiting for ACE-Step to finish loading... "
-                         f"{int(time.time() - t0)}s")
+            what = "start-up" if launched else "to finish loading"
+            progress(18, f"Waiting for ACE-Step {what}... {int(time.time() - t0)}s")
         time.sleep(2)
     raise RuntimeError(
-        f"ACE-Step is listening at {ACE_STEP_API_URL} but not answering after "
+        f"ACE-Step did not answer at {ACE_STEP_API_URL} after "
         f"{max_wait // 60} minutes. Check its window for errors.")
 
 
 def generate_song_audio(lyrics, style, instruments, singer, out_path,
-                         backend="ace", progress_cb=None, language=""):
+                         backend="ace", progress_cb=None, language="", ref_audio=None):
     """Generate a song and write it to out_path. `backend` selects which
     engine does the work — routed here from the dashboard's Backend
     dropdown in the Create Song modal:
@@ -1771,8 +1916,11 @@ def generate_song_audio(lyrics, style, instruments, singer, out_path,
     if backend == "musicgen":
         return generate_song_audio_musicgen(style, instruments, out_path,
                                              progress_cb=progress_cb)
+    # Check the ACE-Step server first; if it is down, say so and start it.
+    _require_ace_running(progress_cb)
     return generate_song_audio_ace(lyrics, style, instruments, singer, out_path,
-                                    progress_cb=progress_cb, language=language)
+                                    progress_cb=progress_cb, language=language,
+                                    ref_audio=ref_audio)
 
 
 def _ace_http(method, path, payload=None, timeout=60, base_url=None):
@@ -1803,7 +1951,82 @@ def _ace_http(method, path, payload=None, timeout=60, base_url=None):
         )
 
 
+def _ace_post_multipart(path, fields, files, timeout=600):
+    """POST multipart/form-data to the ACE-Step API. Used when audio has to be
+    UPLOADED to the server: a backing track (cover mode) or a voice reference.
+    Uploading (instead of sending a file path) works whether ACE-Step runs on
+    this PC or on a remote machine / Colab tunnel.
+      fields: {name: value}      files: {form_field_name: local_file_path}
+    Returns the raw response bytes, like _ace_http()."""
+    import urllib.request
+    import urllib.error
+    import mimetypes
+
+    boundary = "----MusicStudio" + uuid.uuid4().hex
+    bnd = boundary.encode("ascii")
+    crlf = b"\r\n"
+    body = bytearray()
+    for name, value in fields.items():
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            value = "true" if value else "false"
+        body += b"--" + bnd + crlf
+        body += f'Content-Disposition: form-data; name="{name}"'.encode("utf-8") + crlf + crlf
+        body += str(value).encode("utf-8") + crlf
+    for name, fpath in files.items():
+        fpath = Path(fpath)
+        ctype = mimetypes.guess_type(fpath.name)[0] or "application/octet-stream"
+        body += b"--" + bnd + crlf
+        body += (f'Content-Disposition: form-data; name="{name}"; '
+                 f'filename="{fpath.name}"').encode("utf-8") + crlf
+        body += f"Content-Type: {ctype}".encode("ascii") + crlf + crlf
+        body += fpath.read_bytes() + crlf
+    body += b"--" + bnd + b"--" + crlf
+
+    headers = {
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+        "ngrok-skip-browser-warning": "1",
+    }
+    if ACE_STEP_API_KEY:
+        headers["Authorization"] = f"Bearer {ACE_STEP_API_KEY}"
+    req = urllib.request.Request(ACE_STEP_API_URL + path, data=bytes(body),
+                                 headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as e:
+        msg = e.read().decode("utf-8", "replace")[:300]
+        raise RuntimeError(f"ACE-Step server returned HTTP {e.code}: {msg}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Can't reach the ACE-Step server at {ACE_STEP_API_URL} ({e.reason}).")
+
+
 import re as _re
+
+
+_TAG_TYPOS = {
+    "instramental": "instrumental", "instrumantal": "instrumental", "instrumetal": "instrumental",
+    "intrumental": "instrumental", "instrumenal": "instrumental", "insrumental": "instrumental",
+    "guatar": "guitar", "gitar": "guitar", "guiter": "guitar", "guittar": "guitar",
+    "saxaphone": "saxophone", "saxophon": "saxophone", "saxofone": "saxophone",
+    "violen": "violin", "pianno": "piano", "drumms": "drums",
+}
+_COMMAND_WORDS = ("inst", "solo", "intro", "outro", "break", "guitar", "sax", "piano", "drum",
+                  "violin", "bass", "string", "synth", "trumpet", "flute", "organ", "oud",
+                  "riff", "fill", "fade", "build", "drop")
+
+
+def _fix_tag_typos(tag):
+    """Bracket commands like [Instramental - Guatar Solo] are read by the model,
+    so obvious misspellings of musical words are corrected."""
+    def fix(m):
+        w = m.group(0)
+        r = _TAG_TYPOS.get(w.lower())
+        if not r:
+            return w
+        return r.capitalize() if w[:1].isupper() else r
+    return _re.sub(r"[A-Za-z]+", fix, tag)
 
 
 def _clean_lyrics_for_ace(lyrics):
@@ -1817,9 +2040,17 @@ def _clean_lyrics_for_ace(lyrics):
     tag_re = _re.compile(r"^\s*\[(.+?)\]\s*$")
     sections = []          # [tag_or_None, [text pieces]]
     for line in lyrics.replace("\r", "").split("\n"):
+        # Typos must not turn into sung words: a line with no letters at all
+        # (a stray "\" or "-") is dropped, and a line that starts with "["
+        # is always a section tag, even if it is like "[Intro]- Guitar Solo]".
+        if not _re.search(r"\w", line):
+            continue
+        if line.lstrip().startswith("[") and "]" in line:
+            inner = _re.sub(r"[\[\]]+", " ", line)
+            line = "[" + _re.sub(r"\s*[-–—]\s*", " - ", _re.sub(r"\s+", " ", inner)).strip(" -") + "]"
         m = tag_re.match(line)
         if m:
-            sections.append([m.group(1).strip(), []])
+            sections.append([_fix_tag_typos(m.group(1).strip()), []])
         elif line.strip():
             if not sections:
                 sections.append([None, []])
@@ -1834,12 +2065,16 @@ def _clean_lyrics_for_ace(lyrics):
         low = (tag or "").lower()
         # "Chorus - Group vocals" / "Verse 2: soft" -> head word "chorus"/"verse"
         head = _re.split(r"\s*[-:–—]\s*", low, maxsplit=1)[0]
-        base = _re.sub(r"[\s\d]+$", "", head)          # "verse 2" -> "verse"
+        base = _re.sub(r"[\s\d]+$", "", _re.sub(r"\s*[\(\[].*$", "", head))   # "verse 2 (soft)" -> "verse"
         if text:
             if base in known_sung:
                 final = tag
             else:                                       # None / instrumental / unknown
                 final = cycle[n_sung % 2]
+                # A bracket COMMAND (e.g. "[Guitar solo]") with words under it:
+                # keep the command as its own line, then sing the words.
+                if tag and any(w in low for w in _COMMAND_WORDS):
+                    out.append(f"[{tag}]")
             n_sung += 1
             # Keep the user's own short lines as they are; only re-wrap
             # over-long lines (a blob of text on one line can't be sung).
@@ -1877,29 +2112,51 @@ def _needed_seconds(lyrics_for_model, language=""):
     A sung line takes longer than its word count suggests (held notes, a
     breath between lines), and Arabic words are long and stretched when sung.
     Too short a duration = rushed, garbled or missing vocals.
-    Tune with ACE_STEP_SECONDS_PER_WORD (e.g. 1.2 if lyrics still get cut off,
-    0.7 if the song has too much empty music)."""
+    Tune with ACE_STEP_SECONDS_PER_WORD (e.g. 0.9 if lyrics still get cut off,
+    0.55 if the song still has too much empty music)."""
     forced = os.environ.get("ACE_STEP_SECONDS_PER_WORD", "").strip()
     if forced:
         wps = float(forced)
     else:
-        wps = 1.1 if _guess_vocal_language(lyrics_for_model, language) == "ar" else 0.85
-    total = 12.0                                   # intro + outro
+        wps = 1.1 if _guess_vocal_language(lyrics_for_model, language) == "ar" else 0.7
+    # Short intro + short outro, a brief breath between sections, and a solo /
+    # instrumental section only as long as it really needs to be.
+    # Tune with ACE_STEP_INTRO_OUTRO_SECONDS (default 8 for both together),
+    # ACE_STEP_SECTION_GAP_SECONDS (default 2) and ACE_STEP_SOLO_SECONDS (default 15).
+    total = float(os.environ.get("ACE_STEP_INTRO_OUTRO_SECONDS", "8") or 8)
+    gap = float(os.environ.get("ACE_STEP_SECTION_GAP_SECONDS", "2") or 2)
+    solo = float(os.environ.get("ACE_STEP_SOLO_SECONDS", "15") or 15)
     for line in lyrics_for_model.split("\n"):
         line = line.strip()
         if not line:
             continue
         if line.startswith("["):
             low = line.lower()
-            total += 10 if ("inst" in low or "intro" in low) else 4   # gap between sections
+            if "solo" in low:
+                total += solo                      # a real solo: reasonable length
+            elif "intro" in low or "outro" in low:
+                total += 6                         # short intro / outro, even if "instrumental"
+            elif "inst" in low or "break" in low:
+                total += solo
+            else:
+                total += gap
             continue
-        total += max(2.5, len(line.split()) * wps + 0.8)
+        total += max(2.2, len(line.split()) * wps + 0.6)
     return float(round(total))
 
 
+ACE_MIN_SONG_SECONDS = float(os.environ.get("ACE_STEP_MIN_SECONDS", "180") or 180)   # 3 min
+ACE_MAX_SONG_SECONDS = float(os.environ.get("ACE_STEP_MAX_SECONDS", "360") or 360)   # 6 min
+
+
 def _auto_duration(lyrics_for_model, language=""):
-    """Needed time, kept inside the 30s..360s range the server allows."""
-    return float(max(30, min(360, _needed_seconds(lyrics_for_model, language))))
+    """Song length: what the lyrics need, kept between 3 and 6 minutes
+    (ACE_STEP_MIN_SECONDS / ACE_STEP_MAX_SECONDS). Instrumental-only requests
+    don't get the 3-minute minimum."""
+    needed = _needed_seconds(lyrics_for_model, language)
+    if lyrics_for_model.strip().lower() == "[instrumental]":
+        return float(max(30, min(ACE_MAX_SONG_SECONDS, needed)))
+    return float(max(ACE_MIN_SONG_SECONDS, min(ACE_MAX_SONG_SECONDS, needed)))
 
 
 def _guess_vocal_language(text, language=""):
@@ -1932,10 +2189,18 @@ def _guess_vocal_language(text, language=""):
 
 
 def _ace_generate_one(lyrics, style, instruments, singer, out_path, progress_cb=None,
-                      seed=None, bpm=None, key_scale=None, language="", duration=None):
+                      seed=None, bpm=None, key_scale=None, language="", duration=None,
+                      src_audio=None, ref_audio=None, cover_strength=None):
     """Generate ONE piece of audio (a whole short song, or one chunk of a long
     song) and write it to out_path, by calling a running ACE-Step 1.5 REST
-    API server (local or remote)."""
+    API server (local or remote).
+
+    Optional audio inputs (uploaded to the server as multipart):
+      src_audio  -> the user's own backing track. Switches ACE-Step to
+                    task_type="cover": it keeps that track's tempo / structure /
+                    harmony and sings the lyrics over it instead of inventing music.
+      ref_audio  -> a voice/style reference clip, so the singer sounds like it.
+    """
 
     warn_prefix = ""
 
@@ -1982,6 +2247,16 @@ def _ace_generate_one(lyrics, style, instruments, singer, out_path, progress_cb=
         if _dia:
             tags = (f"{_dia} Arabic dialect, {_dia} accent, colloquial {_dia} pronunciation, "
                     f"not Modern Standard Arabic, not Gulf Arabic, " + tags)
+    # Arrangement hints: keep intro/outro short and fill the gaps between sung
+    # phrases with brief improvisation instead of long instrumental stretches.
+    # (A style prompt is a soft hint; the length estimate above is what really
+    # keeps the song tight.)
+    if singer != "instrumental":
+        _low = lyrics_for_model.lower()
+        if "solo" in _low or "[inst" in _low:
+            tags += ", short intro, short outro, brief instrumental fills between vocal phrases, solo kept short"
+        else:
+            tags += ", short intro, short outro, brief instrumental fills between vocal phrases, no long instrumental breaks"
     duration = duration or ACE_STEP_DURATION_SECONDS or _auto_duration(lyrics_for_model, vocal_language)
     needed = _needed_seconds(lyrics_for_model, vocal_language)
     if singer != "instrumental" and needed > duration + 5:
@@ -2020,7 +2295,21 @@ def _ace_generate_one(lyrics, style, instruments, singer, out_path, progress_cb=
         payload["bpm"] = int(float(bpm))
     if key_scale:
         payload["key_scale"] = key_scale
-    submit = json.loads(_ace_http("POST", "/release_task", payload).decode("utf-8"))
+    if src_audio or ref_audio:
+        files = {}
+        if src_audio:
+            payload["task_type"] = "cover"
+            payload["audio_cover_strength"] = (ACE_COVER_STRENGTH if cover_strength is None
+                                               else float(cover_strength))
+            files["src_audio"] = src_audio
+        if ref_audio:
+            files["reference_audio"] = ref_audio
+        print(f"[ACE-Step] uploading audio: {sorted(files)} "
+              f"task_type={payload.get('task_type', 'text2music')}", flush=True)
+        raw_reply = _ace_post_multipart("/release_task", payload, files)
+    else:
+        raw_reply = _ace_http("POST", "/release_task", payload)
+    submit = json.loads(raw_reply.decode("utf-8"))
     task_id = ((submit or {}).get("data") or {}).get("task_id")
     if not task_id:
         raise RuntimeError(f"ACE-Step did not accept the task: {submit!r}")
@@ -2129,7 +2418,7 @@ def _join_audio_chunks(paths, out_path, crossfade):
         parts, prev = [], "[0:a]"
         for k in range(1, n):
             lab = f"[x{k}]"
-            parts.append(f"{prev}[{k}:a]acrossfade=d={crossfade}:c1=tri:c2=tri{lab}")
+            parts.append(f"{prev}[{k}:a]acrossfade=d={crossfade}:c1=qsin:c2=qsin{lab}")
             prev = lab
         attempts.append((";".join(parts), prev))
     attempts.append(("".join(f"[{k}:a]" for k in range(n)) + f"concat=n={n}:v=0:a=1[out]", "[out]"))
@@ -2144,8 +2433,410 @@ def _join_audio_chunks(paths, out_path, crossfade):
     raise RuntimeError(f"ffmpeg could not join the song chunks: {last_err}")
 
 
+# ============================================================
+# SEAMLESS LONG SONGS  (one continuous music bed, voice added after)
+# ------------------------------------------------------------
+# The old way generated every chunk as its OWN finished song (own intro,
+# own ending, own tempo/key drift, own loudness) and crossfaded them for
+# 1 second, so you heard separate pieces. The seamless way:
+#
+#   1) MUSIC FIRST, IN ONE PIECE: the whole song's music is a single
+#      [instrumental] request, so there is nothing to join (no seams, no
+#      gaps). Only if the server cannot do that (too long / timeout) does it
+#      fall back to one bed per chunk: same style / seed, tempo + key of the
+#      first bed locked, each bed trimmed to real music and loudness-matched,
+#      then joined with a long equal-power crossfade.
+#   3) VOICE LAST: for each chunk the lyrics are sung over THAT bed
+#      (ACE-Step cover mode, same as "own backing track"), the singing is
+#      lifted out with Demucs, placed at the right time on the joined
+#      timeline, and mixed onto the single continuous music track.
+#
+# The music is therefore one piece; only the voice is made in parts, and
+# those parts start/end at lyric-section boundaries (natural pauses).
+# Costs roughly twice the time of the old way (music + voice passes).
+#
+# Tuning (environment variables):
+#   ACE_STEP_SEAMLESS      1 (default) = this method, 0 = old chunk-and-join
+#   ACE_STEP_SEAM_SECONDS  crossfade length; 0 (default) = 8 beats, 3-8 s
+#   ACE_STEP_BED_MODE      single (default) = all the music in one request,
+#                          chunks = always one bed per chunk
+#   ACE_STEP_SINGLE_BED_MAX_SECONDS  longest one-piece music request (420)
+# ============================================================
+ACE_SEAMLESS = os.environ.get("ACE_STEP_SEAMLESS", "1").strip() != "0"
+# SINGLE PASS (default ON): generate the whole song - music AND vocals - in ONE
+# ACE-Step request, never split into parts. Slower on CPU, but one continuous
+# song with no seams. Set ACE_STEP_SINGLE_PASS=0 to go back to the chunked /
+# seamless methods for long songs.
+ACE_SINGLE_PASS = os.environ.get("ACE_STEP_SINGLE_PASS", "1").strip() != "0"
+ACE_SEAM_SECONDS = float(os.environ.get("ACE_STEP_SEAM_SECONDS", "0") or 0)
+ACE_BED_LUFS = -18.0
+# Vocal clarity (see _polish_vocals / _mix_vocals_over_track).
+#   ACE_STEP_VOCAL_OVER_MUSIC_DB : how much LOUDER the voice is than the music,
+#       measured in LUFS (default 3). The music is NOT turned down - the voice is
+#       brought up. Raise to 4-5 if the words are still buried, lower to 1-2 if
+#       the voice sounds too much on top.
+#   ACE_STEP_VOCAL_CHUNK_LUFS    : level every sung part is evened out to first.
+ACE_VOCAL_OVER_MUSIC_DB = float(os.environ.get("ACE_STEP_VOCAL_OVER_MUSIC_DB", "3") or 3)
+ACE_VOCAL_CHUNK_LUFS = float(os.environ.get("ACE_STEP_VOCAL_CHUNK_LUFS", "-16") or -16)
+# "single" (default): the WHOLE song's music is ONE request, so there is nothing
+#   to join and therefore no seams. If the server can't do it (too long / timeout)
+#   it falls back to "chunks" (several beds, trimmed + crossfaded).
+# "chunks": always use several beds.
+ACE_BED_MODE = os.environ.get("ACE_STEP_BED_MODE", "single").strip().lower()
+ACE_SINGLE_BED_MAX_SECONDS = float(os.environ.get("ACE_STEP_SINGLE_BED_MAX_SECONDS", "420") or 420)
+
+
+def _run_ffmpeg(args):
+    ff = _ffmpeg_or_raise()
+    proc = subprocess.run([ff, "-y"] + [str(a) for a in args], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace",
+                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if proc.returncode != 0:
+        raise RuntimeError("ffmpeg failed: " + (proc.stderr or "")[-400:])
+
+
+def _pcm_wav_seconds(path):
+    import wave
+    with wave.open(str(path), "rb") as w:
+        return w.getnframes() / float(w.getframerate())
+
+
+def _demucs_available():
+    if getattr(sys, "frozen", False):
+        return True
+    import importlib.util
+    return importlib.util.find_spec("demucs") is not None and \
+        importlib.util.find_spec("numpy") is not None
+
+
+def _estimate_bpm_key(path):
+    """(bpm, 'A minor') measured from a WAV, or (None, None) if librosa is missing."""
+    try:
+        import numpy as np
+        import librosa
+        y, sr = librosa.load(str(path), sr=22050, mono=True, duration=90)
+        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+        bpm = float(np.atleast_1d(tempo)[0])
+        if bpm <= 0:
+            return None, None
+        while bpm < 70:
+            bpm *= 2
+        while bpm > 180:
+            bpm /= 2
+        chroma = librosa.feature.chroma_cqt(y=y, sr=sr).mean(axis=1)
+        major = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
+        minor = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+        names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+        best_c, best_k = -2.0, None
+        for i in range(12):
+            for prof, mode in ((major, "major"), (minor, "minor")):
+                c = float(np.corrcoef(chroma, np.roll(prof, i))[0, 1])
+                if c > best_c:
+                    best_c, best_k = c, f"{names[i]} {mode}"
+        return int(round(bpm)), (best_k if best_c >= 0.55 else None)
+    except Exception as e:
+        print(f"[ACE-Step] tempo/key detection skipped: {e}", flush=True)
+        return None, None
+
+
+def _bed_levels_db(a, sr=44100, win=0.05):
+    """Per-50ms loudness (dB) of a (frames, ch) float array."""
+    import numpy as np
+    hop = int(sr * win)
+    n = len(a) // hop
+    mono = a[:n * hop].mean(axis=1) if a.ndim > 1 else a[:n * hop]
+    return 20 * np.log10(np.sqrt((mono.reshape(n, hop) ** 2).mean(axis=1)) + 1e-9), hop
+
+
+def _prepare_bed_segment(src, dst):
+    """Make a music bed ready to be joined: cut the quiet lead-in and the
+    fade-out/dead air at its ends (judged against the bed's OWN music level,
+    not a fixed dB - ACE-Step's noise floor sits around -48 dB, which a fixed
+    threshold misses), then match loudness. Joining trimmed beds means the
+    crossfade overlaps real music with real music, so there is no dip or
+    silent gap at the seam. 44.1 kHz stereo PCM."""
+    import wave
+    import numpy as np
+    dst = Path(dst)
+    tmp = dst.with_name(dst.stem + "_tmp.wav")
+    trimmed = dst.with_name(dst.stem + "_trim.wav")
+    _run_ffmpeg(["-i", src, "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le", tmp])
+    with wave.open(str(tmp), "rb") as w:
+        ch, raw = w.getnchannels(), w.readframes(w.getnframes())
+    a = np.frombuffer(raw, dtype="<i2").astype(np.float32).reshape(-1, ch) / 32768.0
+    db, hop = _bed_levels_db(a)
+    n = len(db)
+    if n < 20:
+        raise RuntimeError("A generated music part is too short.")
+    ref = float(np.percentile(db, 75))               # the bed's normal music level
+    live = db >= ref - 15                            # "real music" windows
+    ok = live[:-1] & live[1:]                        # two in a row (ignore clicks)
+    idx = np.where(ok)[0]
+    if len(idx) == 0:
+        raise RuntimeError("A generated music part came out silent.")
+    i0 = min(int(idx[0]), int(n * 0.30))             # never cut more than 30% per end
+    i1 = max(int(idx[-1]) + 2, int(n * 0.70))
+    cut = a[i0 * hop:min(len(a), i1 * hop)].copy()
+    f = min(int(0.03 * 44100), len(cut) // 4)        # 30 ms edge fades, no clicks
+    if f > 0:
+        ramp = np.linspace(0, 1, f, dtype=np.float32)[:, None]
+        cut[:f] *= ramp
+        cut[-f:] *= ramp[::-1]
+    with wave.open(str(trimmed), "wb") as w:
+        w.setnchannels(ch)
+        w.setsampwidth(2)
+        w.setframerate(44100)
+        w.writeframes((np.clip(cut, -1, 1) * 32767).astype("<i2").tobytes())
+    inner = db[i0:i1]
+    dead = float((inner < ref - 30).sum()) * 0.05
+    print(f"[ACE-Step] bed trimmed: {len(a) / 44100:.1f}s -> {len(cut) / 44100:.1f}s "
+          f"(cut {i0 * 0.05:.1f}s head, {(n - i1) * 0.05:.1f}s tail); "
+          f"{dead:.1f}s of dead air left inside", flush=True)
+    _run_ffmpeg(["-i", trimmed, "-af", f"loudnorm=I={ACE_BED_LUFS}:TP=-1.5:LRA=11",
+                 "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le", dst])
+    tmp.unlink(missing_ok=True)
+    trimmed.unlink(missing_ok=True)
+    if not dst.exists() or dst.stat().st_size < 1000:
+        raise RuntimeError("A generated music part came out silent.")
+
+
+def _join_beds(paths, out_path, xf):
+    """Join beds into ONE track with long equal-power crossfades."""
+    n = len(paths)
+    if n == 1:
+        shutil.copyfile(paths[0], out_path)
+        return
+    parts, prev, args = [], "[0:a]", []
+    for k in range(1, n):
+        lab = f"[x{k}]"
+        parts.append(f"{prev}[{k}:a]acrossfade=d={xf:.3f}:c1=qsin:c2=qsin{lab}")
+        prev = lab
+    for p in paths:
+        args += ["-i", p]
+    args += ["-filter_complex", ";".join(parts), "-map", prev,
+             "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le", out_path]
+    _run_ffmpeg(args)
+
+
+def _place_vocals(vocal_paths, starts, total_seconds, out_path):
+    """Lay each vocal part on one silent timeline at its start time (short
+    fades on the edges) and write it as a single vocal track."""
+    import wave
+    import numpy as np
+    sr = 44100
+    total = int(total_seconds * sr) + sr
+    mix = np.zeros((total, 2), dtype=np.float32)
+    fade = int(0.25 * sr)
+    for p, st in zip(vocal_paths, starts):
+        with wave.open(str(p), "rb") as w:
+            ch, rate, raw = w.getnchannels(), w.getframerate(), w.readframes(w.getnframes())
+        if rate != sr:
+            raise RuntimeError(f"Unexpected vocal sample rate {rate}")
+        a = np.frombuffer(raw, dtype="<i2").astype(np.float32).reshape(-1, ch) / 32768.0
+        if ch == 1:
+            a = np.repeat(a, 2, axis=1)
+        fi, fo = min(fade, len(a) // 2), min(int(0.8 * sr), len(a) // 2)
+        if fi > 0:
+            a[:fi] *= (0.5 - 0.5 * np.cos(np.linspace(0, np.pi, fi))).astype(np.float32)[:, None]
+        if fo > 0:
+            a[-fo:] *= (0.5 + 0.5 * np.cos(np.linspace(0, np.pi, fo))).astype(np.float32)[:, None]
+        s = int(st * sr)
+        e = min(total, s + len(a))
+        if e > s:
+            mix[s:e] += a[:e - s]
+    pcm = (np.clip(mix, -1.0, 1.0) * 32767.0).astype("<i2")
+    with wave.open(str(out_path), "wb") as w:
+        w.setnchannels(2)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes(pcm.tobytes())
+
+
+def _dead_air_report(path, min_len=1.0):
+    """List of (start_s, length_s) where the music drops far below its normal level."""
+    try:
+        import wave
+        import numpy as np
+        _run_ffmpeg(["-i", path, "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le",
+                     str(path) + "_chk.wav"])
+        with wave.open(str(path) + "_chk.wav", "rb") as w:
+            ch, raw = w.getnchannels(), w.readframes(w.getnframes())
+        Path(str(path) + "_chk.wav").unlink(missing_ok=True)
+        a = np.frombuffer(raw, dtype="<i2").astype(np.float32).reshape(-1, ch) / 32768.0
+        db, _ = _bed_levels_db(a)
+        low = db < float(np.percentile(db, 75)) - 25
+        out, i = [], 0
+        while i < len(low):
+            if low[i]:
+                j = i
+                while j < len(low) and low[j]:
+                    j += 1
+                if (j - i) * 0.05 >= min_len:
+                    out.append((round(i * 0.05, 1), round((j - i) * 0.05, 1)))
+                i = j
+            else:
+                i += 1
+        return out
+    except Exception as e:
+        print(f"[ACE-Step] dead-air check skipped: {e}", flush=True)
+        return []
+
+
+def _generate_long_song_seamless(chunks, style, instruments, singer, out_path, progress_cb,
+                                 language="", ref_audio=None, bed_out=None):
+    """Music first (one continuous bed), voice second. See the block comment above."""
+    def _p(v, s):
+        if progress_cb:
+            progress_cb(v, s)
+
+    out_path = Path(out_path)
+    work = out_path.parent / "chunks"
+    work.mkdir(parents=True, exist_ok=True)
+    n = len(chunks)
+    stem = out_path.stem
+    bpm = ACE_STEP_BPM or None
+    key = ACE_STEP_KEY or None
+    needs = [max(20.0, _needed_seconds(t, language)) for t in chunks]
+
+    def _with_retry(label, fn):
+        attempt = 0
+        while True:
+            t0 = time.time()
+            try:
+                return fn()
+            except RuntimeError as e:
+                took = time.time() - t0
+                if attempt >= ACE_STEP_CHUNK_RETRIES or took > 540:
+                    raise RuntimeError(f"{label} failed after {int(took)}s: {e}. "
+                                       f"Finished parts are in {work}. If this was a timeout, "
+                                       "restart ACE-Step and use a smaller ACE_STEP_CHUNK_SECONDS.")
+                attempt += 1
+                print(f"[ACE-Step] {label} failed ({e}); retrying...", flush=True)
+                time.sleep(5)
+
+    def _cut(src, start, length, dst):
+        _run_ffmpeg(["-ss", f"{start:.3f}", "-t", f"{length:.3f}", "-i", src,
+                     "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le", dst])
+
+    # ---------------- 1) the music: ONE continuous bed ----------------------------
+    bed_path = work / f"{stem}_bed_joined.wav"
+    segs, lens, starts = [], [], []
+
+    # 1a) preferred: the whole song's music in ONE request -> no joins at all.
+    # Each chunk's share of the timeline follows its lyric length; one intro and
+    # one outro for the whole song (each per-chunk estimate includes 12 s of both).
+    weights = [max(12.0, x - 12.0) for x in needs]
+    lead, tail = 8.0, 6.0
+    total_est = lead + sum(weights) + tail
+    single_ok = False
+    if ACE_BED_MODE != "chunks" and total_est <= ACE_SINGLE_BED_MAX_SECONDS:
+        raw = work / f"{stem}_bed_single_raw.wav"
+        try:
+            if not (bed_path.exists() and bed_path.stat().st_size > 1000):
+                print(f"[ACE-Step] seamless: generating ALL the music in one piece "
+                      f"(~{total_est:.0f}s)", flush=True)
+                _ace_generate_one(
+                    "[instrumental]", style, instruments, "instrumental", str(raw),
+                    progress_cb=lambda v, s: _p(10 + 35 * min(max(float(v), 0), 100) / 100.0,
+                                                f"Music (one piece): {s}"),
+                    seed=ACE_STEP_SEED, bpm=bpm, key_scale=key, language=language,
+                    duration=total_est)
+                _prepare_bed_segment(str(raw), str(bed_path))
+            L = _pcm_wav_seconds(bed_path)
+            scale = L / total_est              # trimming may have shortened the bed
+            pad = 3.0                          # windows overlap so no line gets cut off
+            acc = lead
+            for i in range(n):
+                s0 = 0.0 if i == 0 else acc * scale
+                acc += weights[i]
+                s1 = L if i == n - 1 else min(L, acc * scale + pad)
+                if s1 - s0 < 10.0:
+                    s0 = max(0.0, s1 - 10.0)
+                seg = work / f"{stem}_win{i + 1:02d}.wav"
+                _cut(str(bed_path), s0, s1 - s0, str(seg))
+                segs.append(seg)
+                starts.append(s0)
+                lens.append(s1 - s0)
+            single_ok = True
+        except RuntimeError as e:
+            print(f"[ACE-Step] one-piece music failed ({e}); falling back to joined parts",
+                  flush=True)
+            segs, lens, starts = [], [], []
+
+    # 1b) fallback: one bed per chunk, trimmed to real music and crossfaded.
+    if not single_ok:
+        print(f"[ACE-Step] seamless: {n} music parts, joined", flush=True)
+        for i, text in enumerate(chunks):
+            raw = work / f"{stem}_bed{i + 1:02d}_raw.wav"
+            seg = work / f"{stem}_bed{i + 1:02d}.wav"
+            if not (seg.exists() and seg.stat().st_size > 1000):
+                def _cb(v, s, i=i):
+                    _p(10 + 30 * (i + min(max(float(v), 0), 100) / 100.0) / n,
+                       f"Music {i + 1}/{n}: {s}")
+
+                # +8 s: the quiet lead-in / fade-out of every bed is cut off afterwards
+                _with_retry(f"Music part {i + 1}/{n}", lambda: _ace_generate_one(
+                    "[instrumental]", style, instruments, "instrumental", str(raw),
+                    progress_cb=_cb, seed=ACE_STEP_SEED, bpm=bpm, key_scale=key,
+                    language=language, duration=needs[i] + 8))
+                _prepare_bed_segment(str(raw), str(seg))
+            if i == 0 and (not bpm or not key):
+                d_bpm, d_key = _estimate_bpm_key(seg)
+                bpm = bpm or d_bpm
+                key = key or d_key
+                print(f"[ACE-Step] locking tempo={bpm} key={key} for the other parts", flush=True)
+            segs.append(seg)
+        _p(42, "Joining the music into one continuous track...")
+        lens = [_pcm_wav_seconds(s) for s in segs]
+        xf = ACE_SEAM_SECONDS or (min(8.0, max(3.0, 8 * 60.0 / bpm)) if bpm else 4.0)
+        xf = max(0.5, min(xf, min(lens) / 3.0))
+        t = 0.0
+        for L_ in lens:
+            starts.append(t)
+            t += L_ - xf
+        _join_beds([str(s) for s in segs], str(bed_path), xf)
+
+    total = _pcm_wav_seconds(bed_path)
+    dead = _dead_air_report(str(bed_path))
+    if dead:
+        print(f"[ACE-Step] WARNING: the music itself has quiet stretches at "
+              f"{dead[:6]} (start s, length s) - generated that way by the model", flush=True)
+
+    # ---------------- 2) the voice, over each part of the ONE bed -------------------
+    vocals = []
+    for i, text in enumerate(chunks):
+        cov = work / f"{stem}_cover{i + 1:02d}.wav"
+        voc = work / f"{stem}_vocals{i + 1:02d}.wav"
+        voc16 = work / f"{stem}_vocals{i + 1:02d}_pcm.wav"
+        if not (voc16.exists() and voc16.stat().st_size > 1000):
+            def _cb(v, s, i=i):
+                _p(45 + 45 * (i + min(max(float(v), 0), 100) / 100.0) / n,
+                   f"Voice {i + 1}/{n}: {s}")
+
+            _with_retry(f"Voice part {i + 1}/{n}", lambda: _ace_generate_one(
+                text, style, [], singer, str(cov), progress_cb=_cb, seed=ACE_STEP_SEED,
+                language=language, duration=lens[i], src_audio=str(segs[i]),
+                ref_audio=ref_audio))
+            _make_backtrack_from_song(
+                cov, voc, lambda m, i=i: _p(45 + 45 * (i + 0.8) / n, f"Voice {i + 1}/{n}: {m}"),
+                stem_name="vocals")
+            # clean up + even out this part's voice (EQ, compression, level) so every
+            # chunk of the song is equally clear and equally loud
+            _polish_vocals(voc, voc16, ACE_VOCAL_CHUNK_LUFS)
+        vocals.append(voc16)
+
+    # ---------------- 3) one vocal track on the one music track ---------------------
+    _p(92, "Putting the singing on the continuous music...")
+    vocal_full = work / f"{stem}_vocals_full.wav"
+    _place_vocals(vocals, starts, total, vocal_full)
+    _mix_vocals_over_track(bed_path, vocal_full, out_path, polish=False)  # already polished per chunk
+    if bed_out:
+        shutil.copyfile(bed_path, bed_out)
+    _p(98, "Song joined.")
+
+
 def generate_song_audio_ace(lyrics, style, instruments, singer, out_path, progress_cb=None,
-                            language="", duration=None):
+                            language="", duration=None, ref_audio=None, bed_out=None):
     """Generate a song with ACE-Step. Long songs are split into section-based
     chunks (each short enough for CPU), generated one by one with the same
     seed/style, then joined with a crossfade. Short songs use one request."""
@@ -2155,10 +2846,16 @@ def generate_song_audio_ace(lyrics, style, instruments, singer, out_path, progre
             progress_cb(value, status)
 
     one_kw = dict(seed=ACE_STEP_SEED, bpm=ACE_STEP_BPM or None, key_scale=ACE_STEP_KEY or None,
-                  language=language, duration=duration)
+                  language=language, duration=duration, ref_audio=ref_audio)
 
     # Instrumental, or the user forced a fixed length: single request.
     if singer == "instrumental" or ACE_STEP_DURATION_SECONDS:
+        return _ace_generate_one(lyrics, style, instruments, singer, out_path,
+                                 progress_cb=progress_cb, **one_kw)
+
+    # Single pass: the whole song in ONE request (length is chosen automatically
+    # from the lyrics, up to the 360 s the server allows).
+    if ACE_SINGLE_PASS:
         return _ace_generate_one(lyrics, style, instruments, singer, out_path,
                                  progress_cb=progress_cb, **one_kw)
 
@@ -2166,6 +2863,16 @@ def generate_song_audio_ace(lyrics, style, instruments, singer, out_path, progre
     if len(chunks) <= 1:
         return _ace_generate_one(lyrics, style, instruments, singer, out_path,
                                  progress_cb=progress_cb, **one_kw)
+
+    # Long song: build ONE continuous music bed first, add the voice after
+    # (see SEAMLESS LONG SONGS above). Needs Demucs + numpy; otherwise the
+    # old chunk-and-join method below is used.
+    if ACE_SEAMLESS and _demucs_available():
+        return _generate_long_song_seamless(
+            chunks, style, instruments, singer, out_path, progress_cb,
+            language=language, ref_audio=ref_audio, bed_out=bed_out)
+    print("[ACE-Step] seamless mode unavailable (needs demucs + numpy) - "
+          "using the old chunk-and-join method", flush=True)
 
     out_path = Path(out_path)
     chunk_dir = out_path.parent / "chunks"
@@ -2210,7 +2917,18 @@ def generate_song_audio_ace(lyrics, style, instruments, singer, out_path, progre
         paths.append(cp)
 
     _p(92, f"Joining {n} chunks...")
-    _join_audio_chunks(paths, out_path, ACE_STEP_CROSSFADE_SECONDS)
+    # Cut each chunk's quiet lead-in / fade-out (the source of silent gaps),
+    # match their loudness, and crossfade longer than before.
+    try:
+        trimmed = []
+        for pth in paths:
+            tp = Path(pth).with_name(Path(pth).stem + "_trimmed.wav")
+            _prepare_bed_segment(str(pth), str(tp))
+            trimmed.append(tp)
+        paths = trimmed
+    except Exception as e:
+        print(f"[ACE-Step] trim before join skipped: {e}", flush=True)
+    _join_audio_chunks(paths, out_path, max(ACE_STEP_CROSSFADE_SECONDS, 3.0))
     _p(98, "Song joined.")
 
 
@@ -2266,10 +2984,12 @@ def _normalize_loudness(path, target_lufs=-14.0):
     return False
 
 
-def _make_backtrack_from_song(song_path, back_path, status=None):
+def _make_backtrack_from_song(song_path, back_path, status=None, stem_name="no_vocals"):
     """Remove the vocals from the finished song with Demucs and save the
     result as back_path (a WAV). Same audio as the song, so the music is
-    identical. Raises RuntimeError with the real Demucs message on failure."""
+    identical. Raises RuntimeError with the real Demucs message on failure.
+    stem_name="vocals" keeps the singing instead (used by the backing-track
+    mode to lift the voice out of the generated version)."""
     import glob
 
     def _s(msg):
@@ -2322,9 +3042,9 @@ def _make_backtrack_from_song(song_path, back_path, status=None):
                     hint = "  FIX: pip install torchcodec   (or: pip install \"torchaudio<2.9\")"
                 raise RuntimeError(f"Demucs failed (exit {proc.returncode}): {err}{hint}")
 
-        found = glob.glob(os.path.join(out_dir, "**", "no_vocals.*"), recursive=True)
+        found = glob.glob(os.path.join(out_dir, "**", f"{stem_name}.*"), recursive=True)
         if not found:
-            raise RuntimeError("Demucs finished but produced no 'no_vocals' file.")
+            raise RuntimeError(f"Demucs finished but produced no '{stem_name}' file.")
         src = found[0]
         if src.lower().endswith(".wav"):
             shutil.copyfile(src, str(back_path))
@@ -2342,7 +3062,7 @@ def _make_backtrack_from_song(song_path, back_path, status=None):
 
 
 def _generate_song_and_backtrack(folder, stem, lyrics, style, instruments, singer,
-                                 language, _p):
+                                 language, _p, ref_audio=None):
     """Returns (main_output_path, tracks_dict, final_status_text)."""
     folder = Path(folder)
     song_path = folder / f"{stem}_full_song.wav"
@@ -2350,10 +3070,22 @@ def _generate_song_and_backtrack(folder, stem, lyrics, style, instruments, singe
 
     # ---- 1) full song (voice + music), same path as a normal song -------------
     _p(6, "File 1/2: generating the full song (voice + music)...")
+    back_path.unlink(missing_ok=True)
     generate_song_audio_ace(
         lyrics, style, instruments, singer, str(song_path),
         progress_cb=lambda v, s: _p(6 + min(float(v), 100) * 0.50, "Full song: " + s),
-        language=language)
+        language=language, ref_audio=ref_audio, bed_out=str(back_path))
+
+    # Long songs built the seamless way already have the exact music bed:
+    # use it as the backtrack instead of separating the vocals again.
+    if back_path.exists() and back_path.stat().st_size > 1000:
+        if ACE_NORMALIZE:
+            _p(94, "Matching the volume of both files...")
+            _normalize_loudness(song_path, ACE_TARGET_LUFS)
+            _normalize_loudness(back_path, ACE_TARGET_LUFS)
+        return (song_path,
+                {"full_song": str(song_path), "backtrack": str(back_path)},
+                "Complete!")
 
     # ---- 2) backtrack: take the vocals OUT of the song we just made ----------
     # Same audio, voice removed (Demucs) => the music is IDENTICAL to the full
@@ -2385,6 +3117,266 @@ def _generate_song_and_backtrack(folder, stem, lyrics, style, instruments, singe
     return (song_path,
             {"full_song": str(song_path), "backtrack": str(back_path)},
             "Complete!" + warn)
+
+
+# ============================================================
+# SING ON MY OWN BACKING TRACK  (+ optional voice reference)
+# ------------------------------------------------------------
+# Instead of inventing new music every time, the user loads a backing track
+# in the Create Song window and the lyrics are sung OVER IT:
+#
+#   1) The track is converted to a clean WAV (and cut at ACE_STEP_BACKING_MAX_SECONDS).
+#   2) ACE-Step runs in "cover" mode with that WAV as the source, so the sung
+#      version follows the track's tempo, structure and harmony.
+#   3) If "put the singing on top of my original track" is on (default), the
+#      vocals are lifted out of ACE-Step's version with Demucs and mixed onto
+#      the ORIGINAL file, so the music in the result is your own, untouched.
+#
+# Output files in the song folder:
+#   <stem>_full_song.wav   singing + your track (or ACE-Step's version if mixing is off)
+#   <stem>_backtrack.wav   your original track (converted to WAV, not altered)
+#   <stem>_vocals.wav      the isolated singing
+#   <stem>_ace_version.wav ACE-Step's own rendering (only when mixing is on)
+#
+# Tuning (environment variables):
+#   ACE_STEP_COVER_STRENGTH      1.0 = follow the track as closely as possible
+#                                (lower, e.g. 0.7, lets the model change more)
+#   ACE_STEP_BACKING_MAX_SECONDS longest track used (default 360 = 6 min)
+# ============================================================
+ACE_COVER_STRENGTH = float(os.environ.get("ACE_STEP_COVER_STRENGTH", "1.0") or 1.0)
+ACE_BACKING_MAX_SECONDS = float(os.environ.get("ACE_STEP_BACKING_MAX_SECONDS", "360") or 360)
+SONG_AUDIO_EXTS = {".wav", ".mp3", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".wma"}
+SONG_AUDIO_MAX_BYTES = 150 * 1024 * 1024
+
+
+def _save_song_audio_upload(file_storage, folder, label):
+    """Save an uploaded audio file as <folder>/<label>.<ext>. Raises ValueError
+    with a message that is safe to show the user."""
+    ext = Path(file_storage.filename or "").suffix.lower()
+    if ext not in SONG_AUDIO_EXTS:
+        label = label.replace("_", " ")
+        raise ValueError(f"The {label} file must be an audio file "
+                         f"({', '.join(sorted(SONG_AUDIO_EXTS))}).")
+    dest = Path(folder) / f"{label}{ext}"
+    file_storage.save(dest)
+    if dest.stat().st_size > SONG_AUDIO_MAX_BYTES:
+        dest.unlink(missing_ok=True)
+        label = label.replace("_", " ")
+        raise ValueError(f"The {label} file is too large "
+                         f"(max {SONG_AUDIO_MAX_BYTES // (1024 * 1024)} MB).")
+    return dest
+
+
+def _ffmpeg_or_raise():
+    ff = shutil.which("ffmpeg")
+    if ff is None:
+        for d in (BASE_DIR, BASE_DIR / "_internal", Path(getattr(sys, "_MEIPASS", BASE_DIR))):
+            if (d / "ffmpeg.exe").exists() or (d / "ffmpeg").exists():
+                os.environ["PATH"] = str(d) + os.pathsep + os.environ.get("PATH", "")
+                ff = shutil.which("ffmpeg")
+                break
+    if ff is None:
+        raise RuntimeError("ffmpeg was not found. Put ffmpeg.exe next to the app or on PATH.")
+    return ff
+
+
+def _prepare_backing_track(src, dst, max_seconds):
+    """Convert any audio file to a 44.1 kHz stereo WAV, cut at max_seconds.
+    Returns the length in seconds."""
+    ff = _ffmpeg_or_raise()
+    proc = subprocess.run(
+        [ff, "-y", "-i", str(src), "-vn", "-t", str(int(max_seconds)),
+         "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le", str(dst)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if proc.returncode != 0 or not Path(dst).exists() or Path(dst).stat().st_size < 1000:
+        raise RuntimeError("Could not read the backing track as audio: "
+                           + (proc.stderr or "")[-300:])
+    # Plain PCM WAV written just above, so the standard library can read its
+    # length (no dependency on soundfile being installed).
+    import wave
+    with wave.open(str(dst), "rb") as w:
+        return w.getnframes() / float(w.getframerate())
+
+
+def _measure_lufs(path):
+    """Integrated loudness (LUFS) of an audio file, or None if it can't be measured
+    (silent file, no ffmpeg)."""
+    import json as _json
+    try:
+        ff = _ffmpeg_or_raise()
+        proc = subprocess.run(
+            [ff, "-hide_banner", "-nostats", "-i", str(path), "-af",
+             "loudnorm=I=-24:print_format=json", "-f", "null", "-"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        m = _re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", proc.stderr or "", _re.S)
+        if not m:
+            return None
+        v = float(_json.loads(m.group(0))["input_i"])
+        return v if v > -70 else None
+    except Exception:
+        return None
+
+
+# Voice chain: remove rumble + low-mid mud, add presence where consonants live (the
+# part that makes WORDS understandable), gentle compression so quiet words come up
+# to the level of the loud ones, then a limiter against peaks.
+_VOCAL_CHAIN = ("highpass=f=90,"
+                "equalizer=f=250:t=q:w=1:g=-2,"
+                "equalizer=f=3500:t=q:w=1:g=3,"
+                "treble=g=1.5:f=8000,"
+                "acompressor=threshold=0.125:ratio=3:attack=8:release=120:makeup=2,")
+
+
+def _polish_vocals(src, dst, lufs=-16.0):
+    """Make an isolated voice clear and professional-sounding: EQ for
+    intelligibility, compression for an even level, loudness set to `lufs`,
+    limiter on the peaks. Writes 44.1 kHz stereo 16-bit WAV to dst."""
+    chain = (_VOCAL_CHAIN + f"loudnorm=I={lufs}:TP=-1.5:LRA=7,"
+             "alimiter=limit=0.89")
+    try:
+        _run_ffmpeg(["-i", src, "-af", chain, "-ar", "44100", "-ac", "2",
+                     "-c:a", "pcm_s16le", dst])
+    except RuntimeError as e:
+        print(f"[ACE-Step] vocal polish skipped ({e}); using the plain voice", flush=True)
+        _run_ffmpeg(["-i", src, "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le", dst])
+
+
+def _mix_vocals_over_track(track_path, vocals_path, out_path, music_gain=1.0, vocal_gain=1.0,
+                           polish=True, vocal_over_music_db=None):
+    """Lay the isolated vocals on top of the track so the words are clearly heard.
+
+    The MUSIC KEEPS ITS LEVEL (music_gain=1.0). The voice is made clear and then
+    set to sit `vocal_over_music_db` LUFS above the music (ACE_STEP_VOCAL_OVER_MUSIC_DB),
+    the way a mixed record has its lead vocal on top. The finished mix is then
+    limited and normalized as a whole.
+      polish=True  : run the voice through _polish_vocals first (use for a raw voice).
+      polish=False : the voice was already polished (seamless mode does it per chunk).
+    """
+    import math
+    if vocal_over_music_db is None:
+        vocal_over_music_db = ACE_VOCAL_OVER_MUSIC_DB
+    ff = _ffmpeg_or_raise()
+    tmp_files = []
+    try:
+        voc = str(vocals_path)
+        if polish:
+            pv = str(out_path) + "_vocpol.wav"
+            tmp_files.append(pv)
+            _polish_vocals(voc, pv, ACE_VOCAL_CHUNK_LUFS)
+            voc = pv
+
+        # How loud is the music, how loud is the voice -> bring the voice to
+        # (music loudness + vocal_over_music_db). Music is never touched.
+        music_l, voc_l = _measure_lufs(track_path), _measure_lufs(voc)
+        if music_l is not None and voc_l is not None:
+            gain_db = max(-12.0, min(15.0, (music_l + vocal_over_music_db) - voc_l))
+        else:
+            gain_db = 0.0
+        gain_db += 20.0 * math.log10(max(vocal_gain, 1e-6))
+        print(f"[ACE-Step] mix: music {music_l if music_l is not None else '?'} LUFS, "
+              f"voice {voc_l if voc_l is not None else '?'} LUFS -> voice {gain_db:+.1f} dB "
+              f"(target {vocal_over_music_db:+.1f} dB over the music)", flush=True)
+
+        fmt = "aformat=sample_rates=44100:channel_layouts=stereo"
+        tail = (f"alimiter=limit=0.89,"
+                f"loudnorm=I={ACE_TARGET_LUFS}:TP=-1.5:LRA=11,aresample=44100[out]")
+        # normalize=0 keeps both inputs at full level (default amix halves them);
+        # older ffmpeg builds don't know it, so fall back without it.
+        last_err = ""
+        for amix in ("amix=inputs=2:duration=first:dropout_transition=0:normalize=0",
+                     "amix=inputs=2:duration=first:dropout_transition=0"):
+            graph = (f"[0:a]{fmt},volume={music_gain}[m];"
+                     f"[1:a]{fmt},volume={gain_db:.2f}dB[v];"
+                     f"[m][v]{amix},{tail}")
+            proc = subprocess.run(
+                [ff, "-y", "-i", str(track_path), "-i", voc,
+                 "-filter_complex", graph, "-map", "[out]", "-c:a", "pcm_s16le", str(out_path)],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if proc.returncode == 0 and Path(out_path).exists() and Path(out_path).stat().st_size > 1000:
+                return
+            last_err = proc.stderr or ""
+        raise RuntimeError("ffmpeg could not mix the vocals onto the track: " + last_err[-300:])
+    finally:
+        for f in tmp_files:
+            try:
+                Path(f).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def _generate_song_on_backing_track(folder, stem, lyrics, style, singer, language,
+                                    backing_path, voice_ref, mix_original, _p):
+    """Returns (main_output_path, tracks_dict, final_status_text)."""
+    folder = Path(folder)
+    back_path = folder / f"{stem}_backtrack.wav"
+    vocals_path = folder / f"{stem}_vocals.wav"
+    full_path = folder / f"{stem}_full_song.wav"
+    # With mixing on, ACE-Step's own rendering is kept under its own name.
+    ace_path = folder / (f"{stem}_ace_version.wav" if mix_original else f"{stem}_full_song.wav")
+
+    _p(6, "Reading your backing track...")
+    seconds = _prepare_backing_track(backing_path, back_path, ACE_BACKING_MAX_SECONDS)
+    if seconds < 10:
+        raise RuntimeError(f"The backing track is only {seconds:.0f}s long - "
+                           "ACE-Step needs at least about 10 seconds.")
+    notes = []
+    if seconds >= ACE_BACKING_MAX_SECONDS - 1:
+        notes.append(f"track was cut to the first {int(ACE_BACKING_MAX_SECONDS // 60)} minutes")
+    lyr = _clean_lyrics_for_ace(lyrics)
+    need = _needed_seconds(lyr, _guess_vocal_language(lyr, language))
+    if need > seconds + 5:
+        notes.append(f"the lyrics need about {need / 60:.1f} min but your track is "
+                     f"{seconds / 60:.1f} min, so the singing may be rushed")
+
+    _p(10, f"Singing the lyrics over your {seconds:.0f}s track (ACE-Step cover mode)...")
+    # Instruments are NOT sent: the music already exists. bpm/key are NOT sent
+    # either, so the model takes them from the track itself.
+    _ace_generate_one(
+        lyrics, style, [], singer, str(ace_path),
+        progress_cb=lambda v, s: _p(10 + min(float(v), 100) * 0.50, "On your track: " + s),
+        seed=ACE_STEP_SEED, language=language, duration=seconds,
+        src_audio=str(back_path), ref_audio=voice_ref)
+
+    if not mix_original:
+        if ACE_NORMALIZE:
+            _normalize_loudness(ace_path, ACE_TARGET_LUFS)
+        status = "Complete!" + (" Note: " + "; ".join(notes) if notes else "")
+        return (ace_path, {"full_song": str(ace_path), "backtrack": str(back_path)}, status)
+
+    _p(62, "Lifting the singing out of the generated version (1-3 min)...")
+    try:
+        _make_backtrack_from_song(ace_path, vocals_path,
+                                  lambda msg: _p(72, "Vocals: " + str(msg)),
+                                  stem_name="vocals")
+        _p(90, "Putting the singing on top of your original track...")
+        _mix_vocals_over_track(back_path, vocals_path, full_path)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        try:
+            (folder / "mix_error.txt").write_text(str(e), encoding="utf-8")
+        except Exception:
+            pass
+        # Fall back to ACE-Step's own version so the run isn't wasted.
+        shutil.copyfile(ace_path, full_path)
+        if ACE_NORMALIZE:
+            _normalize_loudness(full_path, ACE_TARGET_LUFS)
+        return (full_path,
+                {"full_song": str(full_path), "backtrack": str(back_path)},
+                "Song saved, but your ORIGINAL music could not be mixed in "
+                f"(full_song is ACE-Step's version of your track): {e}")
+
+    if ACE_NORMALIZE:
+        _p(96, "Matching the volume...")
+        _normalize_loudness(full_path, ACE_TARGET_LUFS)
+    status = "Complete!" + (" Note: " + "; ".join(notes) if notes else "")
+    return (full_path,
+            {"full_song": str(full_path), "backtrack": str(back_path),
+             "vocals": str(vocals_path), "ace_version": str(ace_path)},
+            status)
 
 
 # Populated on first use by generate_song_audio_musicgen() — same reasoning
@@ -2622,7 +3614,8 @@ def _write_lyrics_with_ai(style, subject, language, title=""):
         "only if they contain sung words.\n"
         "- Under each tag write short sung lines of about 4 to 8 words, one line per row.\n"
         "- 2 verses of 4 lines, a chorus of 4 lines that repeats, a bridge of 2 to 4 lines. "
-        "Keep the whole song under about 30 lines so it fits in 3 minutes.\n"
+        "Write about 32 to 44 lines in total so the song runs roughly 3.5 to 5 minutes; \n"
+        "never more than 6 minutes.\n"
         "- Match the requested musical style in mood, imagery and rhythm. Use natural "
         "rhyme and a memorable chorus. Stay on the given subject.\n"
         "- Do not write stage directions or text in parentheses."
@@ -2697,7 +3690,18 @@ def generate_lyrics_ai():
 @app.route("/api/create_song", methods=["POST"])
 @login_required
 def create_song():
-    data = request.get_json(force=True) or {}
+    backing_file = voice_file = None
+    if request.mimetype == "multipart/form-data":
+        # With audio attached, the page sends the usual JSON fields as one
+        # "payload" form field, plus optional files: backing_track, voice_ref.
+        try:
+            data = json.loads(request.form.get("payload") or "{}")
+        except Exception:
+            return jsonify(error="Bad request data"), 400
+        backing_file = request.files.get("backing_track")
+        voice_file = request.files.get("voice_ref")
+    else:
+        data = request.get_json(force=True) or {}
 
     lyrics = (data.get("lyrics") or "").strip()
     if not lyrics:
@@ -2721,6 +3725,32 @@ def create_song():
     if backend not in ("ace", "musicgen"):
         return jsonify(error=f"Unknown backend: {backend}"), 400
 
+    # Own backing track / voice reference (ACE-Step only).
+    use_backing = bool(backing_file and backing_file.filename)
+    use_voice = bool(voice_file and voice_file.filename)
+    if (use_backing or use_voice) and backend != "ace":
+        return jsonify(error="A backing track or voice reference only works with the "
+                             "ACE-Step backend."), 400
+    if use_backing and singer == "instrumental":
+        return jsonify(error="A backing track is for sung lyrics - pick a singer other "
+                             "than Instrumental."), 400
+    mix_original = _as_bool(data.get("mix_original"), True)
+
+    backing_path = voice_path = None
+    in_dir = None
+    if use_backing or use_voice:
+        updir, _ = user_dirs(session["user"])
+        in_dir = updir / "song_inputs" / uuid.uuid4().hex[:12]
+        in_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            if use_backing:
+                backing_path = _save_song_audio_upload(backing_file, in_dir, "backing_track")
+            if use_voice:
+                voice_path = _save_song_audio_upload(voice_file, in_dir, "voice_reference")
+        except ValueError as e:
+            shutil.rmtree(in_dir, ignore_errors=True)
+            return jsonify(error=str(e)), 400
+
     job_id = uuid.uuid4().hex[:12]
     with LOCK:
         JOBS[job_id] = {
@@ -2739,7 +3769,10 @@ def create_song():
     threading.Thread(
         target=_run_create_song_job,
         args=(job_id, title, lyrics, style, instruments, singer, backend, language, stems,
-              include_title_lyrics),
+              include_title_lyrics,
+              str(backing_path) if backing_path else None,
+              str(voice_path) if voice_path else None,
+              mix_original),
         daemon=True,
     ).start()
 
@@ -2757,7 +3790,8 @@ def _as_bool(value, default=True):
 
 
 def _run_create_song_job(job_id, title, lyrics, style, instruments, singer, backend="ace",
-                         language="", stems=True, include_title_lyrics=True):
+                         language="", stems=True, include_title_lyrics=True,
+                         backing_path=None, voice_path=None, mix_original=True):
     try:
         with LOCK:
             user = JOBS[job_id].get("user", "shared")
@@ -2789,21 +3823,49 @@ def _run_create_song_job(job_id, title, lyrics, style, instruments, singer, back
             "language": language or "auto",
             "with_backtrack": bool(stems),
             "include_title_lyrics": bool(include_title_lyrics),
+            "own_backing_track": bool(backing_path),
+            "voice_reference": bool(voice_path),
+            "mix_original": bool(mix_original),
         }, indent=2), encoding="utf-8")
+
+        # Move the uploaded audio into the song folder (kept as a record of
+        # what this song was made from) and clean the temporary upload folder.
+        backing_in = voice_in = None
+        for src, label in ((backing_path, "input_backing_track"), (voice_path, "input_voice_reference")):
+            if not src:
+                continue
+            dest = songs_folder / (label + Path(src).suffix.lower())
+            shutil.move(src, str(dest))
+            if label == "input_backing_track":
+                backing_in = dest
+            else:
+                voice_in = dest
+        for src in (backing_path, voice_path):
+            if src:
+                shutil.rmtree(Path(src).parent, ignore_errors=True)
+                break
 
         tracks = None
         final_status = "Complete!"
-        if stems and backend == "ace" and singer != "instrumental":
+        if backing_in:
+            # The lyrics are sung over the user's own track (see the
+            # "SING ON MY OWN BACKING TRACK" section above).
+            out_path, tracks, final_status = _generate_song_on_backing_track(
+                songs_folder, stem, lyrics, style, singer, language,
+                str(backing_in), str(voice_in) if voice_in else None, mix_original, _p)
+        elif stems and backend == "ace" and singer != "instrumental":
             # full_song.wav + backtrack.wav, both made directly (no separation)
             out_path, tracks, final_status = _generate_song_and_backtrack(
-                songs_folder, stem, lyrics, style, instruments, singer, language, _p)
+                songs_folder, stem, lyrics, style, instruments, singer, language, _p,
+                ref_audio=str(voice_in) if voice_in else None)
         else:
             _p(15, f"Generating song with {backend}...")
             # .wav, not .mp3 — both backends output WAV audio.
             out_path = songs_folder / f"{stem}.wav"
             generate_song_audio(lyrics, style, instruments, singer,
                                  str(out_path), backend=backend, progress_cb=_p,
-                                 language=language)
+                                 language=language,
+                                 ref_audio=str(voice_in) if voice_in else None)
 
         with LOCK:
             JOBS[job_id]["progress"] = 100
@@ -2852,13 +3914,37 @@ def _preset_path(name):
     return stem, _preset_dir() / f"{stem}.json"
 
 
+def _last_preset_file():
+    return _preset_dir() / "_last.txt"      # .txt, so it never shows up in the *.json listing
+
+
+def _set_last_preset(stem):
+    try:
+        _last_preset_file().write_text(stem, encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _get_last_preset():
+    """Name of the setup the user last chose (None if unset or since deleted)."""
+    try:
+        f = _last_preset_file()
+        if f.exists():
+            name = f.read_text(encoding="utf-8").strip()
+            if name and (_preset_dir() / f"{name}.json").exists():
+                return name
+    except Exception:
+        pass
+    return None
+
+
 @app.route("/api/song_presets", methods=["GET"])
 @login_required
 def list_song_presets():
     items = []
     for f in sorted(_preset_dir().glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
         items.append({"name": f.stem, "saved": int(f.stat().st_mtime)})
-    return jsonify(presets=items)
+    return jsonify(presets=items, last=_get_last_preset())
 
 
 @app.route("/api/song_presets", methods=["POST"])
@@ -2893,7 +3979,24 @@ def save_song_preset():
     if len(blob.encode("utf-8")) > PRESET_MAX_BYTES:
         return jsonify(error="Setup is too large to save"), 400
     path.write_text(blob, encoding="utf-8")
+    _set_last_preset(stem)
     return jsonify(ok=True, name=stem)
+
+
+@app.route("/api/song_presets/_last", methods=["GET"])
+@login_required
+def load_last_song_preset():
+    """Startup helper: the full setup (incl. lyrics) the user last chose,
+    or the most recently saved one if none was chosen yet.
+    Returns {} (200) when the user has no saved setups at all."""
+    name = _get_last_preset()
+    if not name:
+        files = sorted(_preset_dir().glob("*.json"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+        name = files[0].stem if files else None
+    if not name:
+        return jsonify({})
+    return load_song_preset(name)
 
 
 @app.route("/api/song_presets/<name>", methods=["GET"])
@@ -2908,6 +4011,7 @@ def load_song_preset(name):
         st = preset.setdefault("settings", {})
         for k in PRESET_BOOL_KEYS:
             st[k] = _as_bool(st.get(k), True)
+        _set_last_preset(stem)
         return jsonify(preset)
     except Exception:
         return jsonify(error="That saved setup is damaged"), 500
@@ -2976,6 +4080,23 @@ def output_preview():
     return (target.read_text(encoding="utf-8"),
             200,
             {"Content-Type": "text/plain; charset=utf-8"})
+
+
+@app.route("/api/output_abs")
+@login_required
+def output_abs():
+    """Return the complete on-disk path for a file under the user's
+    outputs folder (given the relative path app.js keeps in state.srt).
+    Used by the GUI's "Copy path" button after a page reload."""
+    rel = request.args.get("path", "")
+    if not rel:
+        return jsonify(error="No path"), 400
+    _, outdir = user_dirs(session["user"])
+    outdir_resolved = outdir.resolve()
+    target = (outdir / rel).resolve()
+    if outdir_resolved not in target.parents and target != outdir_resolved:
+        return jsonify(error="Bad path"), 400
+    return jsonify(path=str(target), exists=target.exists())
 
 
 @app.route("/api/job/<job_id>/cancel", methods=["POST"])
@@ -3103,12 +4224,12 @@ def _open_browser(port):
 if __name__ == "__main__":
     ip = _lan_ip()
 
-    # ACE-Step is NOT started by this app. Start it separately on this PC.
+    # ACE-Step is started automatically the first time an AI button needs it.
     if _ace_is_running():
         print(f"[ACE] ACE-Step is reachable at {ACE_STEP_API_URL}", flush=True)
     else:
-        print(f"[ACE] ACE-Step is NOT running at {ACE_STEP_API_URL}. "
-              "Start it separately (start_ace_step.bat) before creating songs.",
+        print(f"[ACE] ACE-Step is not running at {ACE_STEP_API_URL}. "
+              "It will be started automatically when you use an AI button.",
               flush=True)
 
     try:

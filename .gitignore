@@ -39,4 +39,5 @@ Thumbs.db
 ACE-Step/
 ACE-Step-1.5/
 .venv/
-.venv-old/
+.venv-old/prereqs/
+*.bak*
