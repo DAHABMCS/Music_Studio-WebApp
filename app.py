@@ -818,21 +818,43 @@ import difflib as _difflib
 from datetime import datetime as _dt
 
 
+_TITLE_WORDS = (r"karaoke|instrumental|backing\s*track|no[\s_]?vocals?|minus[\s_]?one|"
+                r"sing[\s_]?along|lyrics?")
 _TITLE_SUFFIX_RE = _re.compile(
-    r"[\s_\-\u2013\u2014()\[\]]*"
-    r"(karaoke|instrumental|backing\s*track|no[\s_]?vocals?|minus[\s_]?one|lyrics?)"
-    r"([\s_]*version)?[\s_\-()\[\]]*$", _re.I)
+    r"[\s_\-\u2013\u2014:|]*(" + _TITLE_WORDS + r")([\s_]*(version|track|video|mix))?[\s_\-:|]*$", _re.I)
+_TITLE_PREFIX_RE = _re.compile(
+    r"^[\s_\-:|]*(" + _TITLE_WORDS + r")([\s_]*(version|track|video|mix))?[\s_]*[\-\u2013\u2014:|]+[\s_]*", _re.I)
+_TITLE_BRACKET_RE = _re.compile(
+    r"[\s_]*[\[(][^\])]*\b(" + _TITLE_WORDS + r")\b[^\])]*[\])]", _re.I)
 
 
 def _display_title(stem):
     """File name -> song title for PDF headings. The karaoke export names its file
-    '<song> karaoke', which must not become part of the printed title."""
-    t = str(stem).replace("_", " ").strip()
+    '<song> karaoke'; words like karaoke / instrumental / backing track / lyrics are
+    never part of the printed title (trailing, leading, or in (brackets))."""
+    original = str(stem).replace("_", " ").strip()
+    t = original
     prev = None
     while prev != t:
         prev = t
+        t = _TITLE_BRACKET_RE.sub("", t)
+        t = _TITLE_PREFIX_RE.sub("", t)
         t = _TITLE_SUFFIX_RE.sub("", t).strip()
-    return t or str(stem).replace("_", " ").strip()
+    return t or original
+
+
+_CLOSING_LINE_RE = _re.compile(
+    r"(thank(s| you)( so much)?( very much)? for (watching|listening|viewing)|"
+    r"(like|please)[ ,&and]*subscribe|subscribe to|sing[ -]?along|"
+    r"karaoke (version|track|video)|backing track|instrumental version)", _re.I)
+
+
+def _is_marker_line(text):
+    """[Instrumental], (music), 'Thank you for watching!' ... : not lyrics."""
+    t = text.strip()
+    if _re.fullmatch(r"[\[(].*[\])]", t):
+        return True
+    return len(t) <= 70 and bool(_CLOSING_LINE_RE.search(t))
 
 
 def _parse_srt_blocks(srt_text):
@@ -858,7 +880,7 @@ def _parse_srt_blocks(srt_text):
     return out
 
 
-def _group_into_sections(blocks, gap=3.5, max_lines=8):
+def _group_into_sections(blocks, gap=5.5, max_lines=12):
     """Split cues into stanzas on silent gaps, then label them.
     Stanzas that (near-)repeat are Chorus; a one-off stanza between two
     choruses after at least two verses is Bridge; the rest are Verse N."""
@@ -877,7 +899,6 @@ def _group_into_sections(blocks, gap=3.5, max_lines=8):
         else:
             merged.append(st)
     stanzas = merged
-
     norm = [" ".join(st).lower() for st in stanzas]
     is_chorus = [False] * len(stanzas)
     for i in range(len(stanzas)):
@@ -995,7 +1016,7 @@ def export_lyric_sheet_pdf(srt_path, audio_path, stem, out_path, meta=None):
     blocks = _parse_srt_blocks(Path(srt_path).read_text(encoding="utf-8"))
     if not blocks:
         raise RuntimeError("No cues found in SRT — cannot build lyric sheet.")
-    blocks = [b for b in blocks if not _re.fullmatch(r"\s*[\[(].*[\])]\s*", b[2])]   # [Instrumental] etc.
+    blocks = [b for b in blocks if not _is_marker_line(b[2])]
     if not blocks:
         raise RuntimeError("Only instrumental markers found - no lyrics to print.")
     sections = _group_into_sections(blocks)
@@ -1036,16 +1057,11 @@ def export_lyric_sheet_pdf(srt_path, audio_path, stem, out_path, meta=None):
     bits.append(dur_s)
     story += [Spacer(1, 6), Paragraph(" &middot; ".join(bits), st_meta), Spacer(1, 18)]
 
-    rows, last_chorus = [], max((i for i, (l, _) in enumerate(sections) if l == "Chorus"), default=-1)
-    seen_chorus = 0
+    rows = []
     for i, (label, lines) in enumerate(sections):
         is_ch = label == "Chorus"
         body_style = st_chor if is_ch else (st_brdg if label == "Bridge" else st_body)
         lines = [escape(l) for l in lines]
-        if is_ch:
-            seen_chorus += 1
-            if i == last_chorus and seen_chorus > 1 and len(lines) > 2:
-                lines = lines[:2] + ['<font name="%s" size="9" color="#888888">(repeat 2x, fade)</font>' % FS]
         body = Paragraph("<br/>".join(lines), body_style)
         rows.append([Paragraph(label.upper(), st_lbl_ch if is_ch else st_lbl), body])
 
