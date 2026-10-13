@@ -2190,7 +2190,8 @@ def _guess_vocal_language(text, language=""):
 
 def _ace_generate_one(lyrics, style, instruments, singer, out_path, progress_cb=None,
                       seed=None, bpm=None, key_scale=None, language="", duration=None,
-                      src_audio=None, ref_audio=None, cover_strength=None):
+                      src_audio=None, ref_audio=None, cover_strength=None,
+                      infer_steps=None):
     """Generate ONE piece of audio (a whole short song, or one chunk of a long
     song) and write it to out_path, by calling a running ACE-Step 1.5 REST
     API server (local or remote).
@@ -2278,7 +2279,7 @@ def _ace_generate_one(lyrics, style, instruments, singer, out_path, progress_cb=
         "prompt": tags,
         "lyrics": lyrics_for_model,
         "audio_duration": duration,
-        "inference_steps": ACE_STEP_INFER_STEPS,
+        "inference_steps": int(infer_steps or ACE_STEP_INFER_STEPS),
         "batch_size": 1,
         "vocal_language": vocal_language,
         "audio_format": "wav",
@@ -2935,21 +2936,38 @@ def generate_song_audio_ace(lyrics, style, instruments, singer, out_path, progre
 # ============================================================
 # SONG + SEPARATE BACKTRACK  (full_song.wav + backtrack.wav)
 # ------------------------------------------------------------
-# Two normal generations with the fast ACE-Step model (works on CPU):
-#   1) FULL SONG  - lyrics + vocals + music, exactly as before
-#   2) BACKTRACK  - same style / instruments / seed / tempo / key, but
-#                   [instrumental] and the same length as the song.
-# The backtrack is generated directly (nothing is separated or removed),
-# so every instrument is intact. It is a close relative of the music in the
-# full song, NOT the identical arrangement - they are two separate runs.
-# Both files are loudness-matched with ffmpeg so they play at a similar,
-# comfortable volume (turn off with ACE_STEP_NORMALIZE=0).
+# Two COMPLETE, INDEPENDENT productions (nothing is ever separated or
+# stripped out of another file):
+#   RUN 1) FULL SONG  - lyrics + vocals + music.
+#   RUN 2) BACKTRACK  - once the full song is finished, ACE-Step is run
+#          AGAIN as a brand-new music-only production ([instrumental]),
+#          so it is arranged, rendered and mixed as a real backing track
+#          and is NOT a vocal-removed copy of the song (which sounds thin
+#          and has voice "ghosts"). To keep it a close relative of the song
+#          it re-uses the song's style / instruments / seed and is locked
+#          to the song's measured tempo + key and exact length.
+# Both files then get the same loudness mastering (ACE_STEP_NORMALIZE=0
+# turns that off). If run 2 fails, the song is still kept and the error is
+# written to backtrack_error.txt - the app NEVER falls back to Demucs here.
+#
+# Tuning (environment variables):
+#   ACE_STEP_BACKTRACK_STEPS        inference steps for run 2 (default: same as
+#                                   the song; raise e.g. to 32-50 ONLY if your
+#                                   ACE-Step server runs a base/SFT model - the
+#                                   turbo model should stay at 8)
+#   ACE_STEP_BACKTRACK_MATCH_TEMPO  1 = lock run 2 to the song's measured BPM/key
+#                                   (needs librosa; default 1)
+#   ACE_STEP_BACKTRACK_HINT         extra style words for the music-only run
 # ============================================================
 ACE_BACKTRACK_HINT = os.environ.get(
     "ACE_STEP_BACKTRACK_HINT",
     "full band arrangement, all instruments clearly audible, balanced mix, high quality")
 ACE_NORMALIZE = os.environ.get("ACE_STEP_NORMALIZE", "1").strip() != "0"
 ACE_TARGET_LUFS = float(os.environ.get("ACE_STEP_TARGET_LUFS", "-14") or -14)
+ACE_BACKTRACK_STEPS = int(os.environ.get("ACE_STEP_BACKTRACK_STEPS", "0") or 0) or None
+ACE_BACKTRACK_MATCH_TEMPO = os.environ.get("ACE_STEP_BACKTRACK_MATCH_TEMPO", "1").strip() != "0"
+# Words that keep the music-only run from inventing a sung part.
+ACE_BACKTRACK_NO_VOCAL_TAGS = "instrumental, no vocals, no singing, no humming, no choir"
 
 
 def _wav_seconds(path):
@@ -3061,40 +3079,88 @@ def _make_backtrack_from_song(song_path, back_path, status=None, stem_name="no_v
         shutil.rmtree(out_dir, ignore_errors=True)
 
 
+def _generate_backtrack_rerun(song_path, back_path, style, instruments, language, _p):
+    """RUN 2: a fresh, complete music-only production made by ACE-Step.
+    Nothing is taken from the song file except its length, tempo and key
+    (so the two files line up). Raises RuntimeError if generation fails."""
+    song_path, back_path = Path(song_path), Path(back_path)
+
+    # Same length as the finished song (the default length of an
+    # "[instrumental]" request is only ~30 s, so it must be passed explicitly).
+    secs = _wav_seconds(song_path)
+    if not secs:
+        try:
+            secs = _pcm_wav_seconds(song_path)
+        except Exception:
+            secs = 0.0
+    duration = None
+    if secs > 0:
+        duration = min(float(secs), float(ACE_MAX_SONG_SECONDS))
+        if secs > ACE_MAX_SONG_SECONDS + 1:
+            print(f"[ACE-Step] backtrack limited to {ACE_MAX_SONG_SECONDS:.0f}s "
+                  f"(song is {secs:.0f}s)", flush=True)
+
+    # Lock tempo + key to the song so the backtrack can be played/sung with it.
+    bpm, key = ACE_STEP_BPM or None, ACE_STEP_KEY or None
+    if ACE_BACKTRACK_MATCH_TEMPO and not (bpm and key):
+        d_bpm, d_key = _estimate_bpm_key(song_path)
+        bpm, key = bpm or d_bpm, key or d_key
+    print(f"[ACE-Step] backtrack run: duration={duration} bpm={bpm} key={key}", flush=True)
+
+    # Full-band, music-only style prompt.
+    music_style = ", ".join(p for p in (
+        (style or "").strip(), ACE_BACKTRACK_NO_VOCAL_TAGS, ACE_BACKTRACK_HINT) if p)
+
+    tmp = back_path.with_name(back_path.stem + "_raw.wav")
+    tmp.unlink(missing_ok=True)
+    attempt = 0
+    while True:
+        try:
+            _ace_generate_one(
+                "[instrumental]", music_style, instruments, "instrumental", str(tmp),
+                progress_cb=_p, seed=ACE_STEP_SEED, bpm=bpm, key_scale=key,
+                language=language, duration=duration, infer_steps=ACE_BACKTRACK_STEPS)
+            break
+        except RuntimeError as e:
+            if attempt >= ACE_STEP_CHUNK_RETRIES:
+                raise
+            attempt += 1
+            print(f"[ACE-Step] backtrack run failed ({e}); retrying...", flush=True)
+            time.sleep(5)
+    tmp.replace(back_path)
+
+
 def _generate_song_and_backtrack(folder, stem, lyrics, style, instruments, singer,
                                  language, _p, ref_audio=None):
-    """Returns (main_output_path, tracks_dict, final_status_text)."""
+    """Returns (main_output_path, tracks_dict, final_status_text).
+
+    RUN 1 makes <stem>_full_song.wav (music + vocals). When it is finished,
+    RUN 2 makes <stem>_backtrack.wav as a separate music-only production.
+    The backtrack is never created by removing the voice from the song."""
     folder = Path(folder)
     song_path = folder / f"{stem}_full_song.wav"
     back_path = folder / f"{stem}_backtrack.wav"
+    (folder / "backtrack_error.txt").unlink(missing_ok=True)
 
-    # ---- 1) full song (voice + music), same path as a normal song -------------
-    _p(6, "File 1/2: generating the full song (voice + music)...")
+    # ---- RUN 1: full song (voice + music) ---------------------------------------
+    _p(6, "File 1/2: producing the full song (voice + music)...")
     back_path.unlink(missing_ok=True)
     generate_song_audio_ace(
         lyrics, style, instruments, singer, str(song_path),
-        progress_cb=lambda v, s: _p(6 + min(float(v), 100) * 0.50, "Full song: " + s),
-        language=language, ref_audio=ref_audio, bed_out=str(back_path))
+        progress_cb=lambda v, s: _p(6 + min(float(v), 100) * 0.46, "Full song: " + s),
+        language=language, ref_audio=ref_audio)      # no bed_out: backtrack is a re-run
+    # The song is complete: make its loudness final before anything else.
+    if ACE_NORMALIZE:
+        _p(53, "Mastering the full song...")
+        _normalize_loudness(song_path, ACE_TARGET_LUFS)
 
-    # Long songs built the seamless way already have the exact music bed:
-    # use it as the backtrack instead of separating the vocals again.
-    if back_path.exists() and back_path.stat().st_size > 1000:
-        if ACE_NORMALIZE:
-            _p(94, "Matching the volume of both files...")
-            _normalize_loudness(song_path, ACE_TARGET_LUFS)
-            _normalize_loudness(back_path, ACE_TARGET_LUFS)
-        return (song_path,
-                {"full_song": str(song_path), "backtrack": str(back_path)},
-                "Complete!")
-
-    # ---- 2) backtrack: take the vocals OUT of the song we just made ----------
-    # Same audio, voice removed (Demucs) => the music is IDENTICAL to the full
-    # song. (Generating a second "[instrumental]" song can never match, because
-    # the prompt/lyrics/length differ, so the model invents new music.)
-    _p(58, "File 2/2: removing the vocals to make the backtrack (same music)...")
+    # ---- RUN 2: re-run ACE-Step for the music-only backtrack --------------------
+    _p(55, "File 2/2: full song done - re-running to produce the backtrack "
+           "as a separate music production...")
     try:
-        _make_backtrack_from_song(song_path, back_path,
-                                  lambda msg: _p(70, "Backtrack: " + str(msg)))
+        _generate_backtrack_rerun(
+            song_path, back_path, style, instruments, language,
+            lambda v, s: _p(55 + min(float(v), 100) * 0.38, "Backtrack: " + s))
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -3103,20 +3169,16 @@ def _generate_song_and_backtrack(folder, stem, lyrics, style, instruments, singe
             (folder / "backtrack_error.txt").write_text(str(e), encoding="utf-8")
         except Exception:
             pass
-        if ACE_NORMALIZE:
-            _normalize_loudness(song_path, ACE_TARGET_LUFS)
         return (song_path, {"full_song": str(song_path)},
-                f"Full song saved, but the BACKTRACK FAILED: {e}")
-    warn = ""
+                f"Full song saved, but the BACKTRACK RUN FAILED: {e}")
 
     if ACE_NORMALIZE:
-        _p(94, "Matching the volume of both files...")
-        _normalize_loudness(song_path, ACE_TARGET_LUFS)
+        _p(94, "Mastering the backtrack (same loudness as the song)...")
         _normalize_loudness(back_path, ACE_TARGET_LUFS)
 
     return (song_path,
             {"full_song": str(song_path), "backtrack": str(back_path)},
-            "Complete!" + warn)
+            "Complete!")
 
 
 # ============================================================
@@ -3854,7 +3916,7 @@ def _run_create_song_job(job_id, title, lyrics, style, instruments, singer, back
                 songs_folder, stem, lyrics, style, singer, language,
                 str(backing_in), str(voice_in) if voice_in else None, mix_original, _p)
         elif stems and backend == "ace" and singer != "instrumental":
-            # full_song.wav + backtrack.wav, both made directly (no separation)
+            # full_song.wav, then a SEPARATE re-run for backtrack.wav (no vocal removal)
             out_path, tracks, final_status = _generate_song_and_backtrack(
                 songs_folder, stem, lyrics, style, instruments, singer, language, _p,
                 ref_audio=str(voice_in) if voice_in else None)
