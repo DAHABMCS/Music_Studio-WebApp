@@ -163,6 +163,56 @@ def _is_local_request():
     return request.remote_addr in _LOCAL_IPS
 
 
+def _win_bring_explorer_to_front(folder_name, timeout=4.0):
+    """Windows only. After os.startfile() the Explorer window often opens
+    BEHIND the app (Windows' foreground lock) and just flashes in the
+    taskbar. Find the window by its folder name and raise it."""
+    try:
+        import ctypes
+        from ctypes import wintypes as wt
+        user32 = ctypes.windll.user32
+        enum_proc = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+        want = (folder_name or "").lower()
+
+        def _find():
+            hits = []
+
+            def _cb(hwnd, _lparam):
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                cls = ctypes.create_unicode_buffer(256)
+                user32.GetClassNameW(hwnd, cls, 256)
+                if cls.value != "CabinetWClass":          # an Explorer window
+                    return True
+                n = user32.GetWindowTextLengthW(hwnd)
+                buf = ctypes.create_unicode_buffer(n + 1)
+                user32.GetWindowTextW(hwnd, buf, n + 1)
+                if want and want in buf.value.lower():
+                    hits.append(hwnd)
+                return True
+
+            user32.EnumWindows(enum_proc(_cb), 0)
+            return hits[0] if hits else None
+
+        hwnd = None
+        deadline = time.time() + timeout
+        while time.time() < deadline and not hwnd:
+            hwnd = _find()
+            if not hwnd:
+                time.sleep(0.15)
+        if not hwnd:
+            return
+        # A tap of ALT unlocks SetForegroundWindow for this process.
+        user32.keybd_event(0x12, 0, 0, 0)
+        user32.keybd_event(0x12, 0, 2, 0)
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, 9)                    # SW_RESTORE
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+    except Exception as e:
+        print(f"[browse] could not raise the Explorer window: {e}", flush=True)
+
+
 def _open_native_folder(path):
     """Open `path` in the OS's native file explorer on THIS machine.
     Only ever call this after confirming the request is local — see
@@ -170,6 +220,10 @@ def _open_native_folder(path):
     try:
         if sys.platform.startswith("win"):
             os.startfile(str(path))  # noqa: F821 (Windows-only builtin)
+            # Windows will not let a background program take the screen, so
+            # Explorer would only FLASH in the taskbar. Bring its window up.
+            threading.Thread(target=_win_bring_explorer_to_front,
+                             args=(Path(path).name,), daemon=True).start()
         elif sys.platform == "darwin":
             subprocess.run(["open", str(path)], check=True)
         else:
