@@ -900,32 +900,57 @@ def _estimate_key_tempo(audio_path, max_seconds=120):
 
 
 def _pick_unicode_fonts():
-    """Register a serif family that has the ℗ glyph. Returns
-    (regular, bold, italic, sans, has_phonogram). Falls back to the
-    built-in Times/Helvetica (and '(P)' instead of ℗)."""
+    """Register fonts for the lyric sheet. Returns
+    (regular, bold, italic, sans, has_phonogram_symbol).
+    Search order: fonts shipped in <app>/assets/fonts, Linux DejaVu,
+    Windows Times New Roman/Arial (cover Latin, Greek, Cyrillic, Arabic,
+    Hebrew), macOS. The phonogram sign (U+2117) is drawn from a separate
+    symbol font ("LS-Sym") only if one on this PC really contains it;
+    otherwise the sheet prints "(P)". Built-in Times/Helvetica is the
+    last resort, so this never fails."""
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
-    candidates = [
-        ("/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
-         "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
-         "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Italic.ttf",
-         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
-        ("C:/Windows/Fonts/cambria.ttc", None, None, None),
-        ("C:/Windows/Fonts/seguisym.ttf", None, None, None),
-        ("/Library/Fonts/Arial Unicode.ttf", None, None, None),
+
+    win = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts"
+    bundled = ASSETS_DIR / "fonts"
+    dejavu = Path("/usr/share/fonts/truetype/dejavu")
+    families = [
+        (bundled / "DejaVuSerif.ttf", bundled / "DejaVuSerif-Bold.ttf",
+         bundled / "DejaVuSerif-Italic.ttf", bundled / "DejaVuSans.ttf"),
+        (dejavu / "DejaVuSerif.ttf", dejavu / "DejaVuSerif-Bold.ttf",
+         dejavu / "DejaVuSerif-Italic.ttf", dejavu / "DejaVuSans.ttf"),
+        (win / "times.ttf", win / "timesbd.ttf", win / "timesi.ttf", win / "arial.ttf"),
+        (Path("/Library/Fonts/Times New Roman.ttf"), Path("/Library/Fonts/Times New Roman Bold.ttf"),
+         Path("/Library/Fonts/Times New Roman Italic.ttf"), Path("/Library/Fonts/Arial.ttf")),
     ]
-    for reg, bold, ital, sans in candidates:
+    names = ("LS-Serif", "LS-Serif-B", "LS-Serif-I", "LS-Sans")
+    result = ("Times-Roman", "Times-Bold", "Times-Italic", "Helvetica")
+    for fam in families:
+        if not fam[0].is_file():
+            continue
         try:
-            if not Path(reg).exists() or reg.endswith(".ttc"):
-                continue
-            pdfmetrics.registerFont(TTFont("LS-Serif", reg))
-            pdfmetrics.registerFont(TTFont("LS-Serif-B", bold if bold and Path(bold).exists() else reg))
-            pdfmetrics.registerFont(TTFont("LS-Serif-I", ital if ital and Path(ital).exists() else reg))
-            pdfmetrics.registerFont(TTFont("LS-Sans", sans if sans and Path(sans).exists() else reg))
-            return "LS-Serif", "LS-Serif-B", "LS-Serif-I", "LS-Sans", True
+            for nm, path, fallback in zip(names, fam, (fam[0], fam[0], fam[0], fam[0])):
+                pdfmetrics.registerFont(TTFont(nm, str(path if path.is_file() else fallback)))
+            result = names
+            break
+        except Exception as e:
+            print(f"[lyric_sheet] font family skipped ({fam[0]}): {e}")
+
+    has_p = False
+    sym_candidates = [bundled / "DejaVuSans.ttf", dejavu / "DejaVuSans.ttf",
+                      win / "seguisym.ttf", win / "arialuni.ttf", win / "segoeui.ttf",
+                      Path("/Library/Fonts/Arial Unicode.ttf")]
+    for f in sym_candidates:
+        try:
+            if f.is_file():
+                tt = TTFont("LS-Sym", str(f))
+                if 0x2117 in tt.face.charToGlyph:
+                    pdfmetrics.registerFont(tt)
+                    has_p = True
+                    break
         except Exception:
             continue
-    return "Times-Roman", "Times-Bold", "Times-Italic", "Helvetica", False
+    return (*result, has_p)
 
 
 def export_lyric_sheet_pdf(srt_path, audio_path, stem, out_path, meta=None):
@@ -1012,7 +1037,7 @@ def export_lyric_sheet_pdf(srt_path, audio_path, stem, out_path, meta=None):
     if meta.get("producer"):  left.append(f"Produced by {escape(meta['producer'])}")
     if meta.get("publisher"): right.append(f"Published by {escape(meta['publisher'])}")
     if meta.get("label"):
-        right.append(("\u2117" if has_p else "(P)") + f" {year} {escape(meta['label'])}")
+        right.append(('<font name="LS-Sym">\u2117</font>' if has_p else "(P)") + f" {year} {escape(meta['label'])}")
     footer = [Spacer(1, 14), HRFlowable(width="100%", thickness=0.5, color=faint), Spacer(1, 6)]
     if left or right:
         footer.append(Table([[Paragraph("<br/>".join(left), st_credit),
@@ -2105,6 +2130,8 @@ def _ace_find_launcher():
         return (custom, str(BASE_DIR))          # a string -> run through the shell
 
     roots = [BASE_DIR, BASE_DIR.parent, Path.cwd()]
+    if os.environ.get("MUSIC_STUDIO_INSTALL_DIR"):          # set by launcher.py (installed build)
+        roots.append(Path(os.environ["MUSIC_STUDIO_INSTALL_DIR"]))
 
     # 1) start_ace_step.bat (or .sh) next to the app
     names = ["start_ace_step.bat"] if sys.platform.startswith("win") else \
