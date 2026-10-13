@@ -818,6 +818,23 @@ import difflib as _difflib
 from datetime import datetime as _dt
 
 
+_TITLE_SUFFIX_RE = _re.compile(
+    r"[\s_\-\u2013\u2014()\[\]]*"
+    r"(karaoke|instrumental|backing\s*track|no[\s_]?vocals?|minus[\s_]?one|lyrics?)"
+    r"([\s_]*version)?[\s_\-()\[\]]*$", _re.I)
+
+
+def _display_title(stem):
+    """File name -> song title for PDF headings. The karaoke export names its file
+    '<song> karaoke', which must not become part of the printed title."""
+    t = str(stem).replace("_", " ").strip()
+    prev = None
+    while prev != t:
+        prev = t
+        t = _TITLE_SUFFIX_RE.sub("", t).strip()
+    return t or str(stem).replace("_", " ").strip()
+
+
 def _parse_srt_blocks(srt_text):
     """Minimal standalone SRT parser -> [(start_sec, end_sec, text)]."""
     def _t(s):
@@ -841,7 +858,7 @@ def _parse_srt_blocks(srt_text):
     return out
 
 
-def _group_into_sections(blocks, gap=2.0, max_lines=8):
+def _group_into_sections(blocks, gap=3.5, max_lines=8):
     """Split cues into stanzas on silent gaps, then label them.
     Stanzas that (near-)repeat are Chorus; a one-off stanza between two
     choruses after at least two verses is Bridge; the rest are Verse N."""
@@ -853,6 +870,13 @@ def _group_into_sections(blocks, gap=2.0, max_lines=8):
         cur.append(t)
     if cur:
         stanzas.append(cur)
+    merged = []
+    for st in stanzas:                      # a lone line belongs to the stanza before it
+        if merged and len(st) == 1:
+            merged[-1].extend(st)
+        else:
+            merged.append(st)
+    stanzas = merged
 
     norm = [" ".join(st).lower() for st in stanzas]
     is_chorus = [False] * len(stanzas)
@@ -971,6 +995,9 @@ def export_lyric_sheet_pdf(srt_path, audio_path, stem, out_path, meta=None):
     blocks = _parse_srt_blocks(Path(srt_path).read_text(encoding="utf-8"))
     if not blocks:
         raise RuntimeError("No cues found in SRT — cannot build lyric sheet.")
+    blocks = [b for b in blocks if not _re.fullmatch(r"\s*[\[(].*[\])]\s*", b[2])]   # [Instrumental] etc.
+    if not blocks:
+        raise RuntimeError("Only instrumental markers found - no lyrics to print.")
     sections = _group_into_sections(blocks)
 
     key, bpm = meta.get("key"), meta.get("tempo")
@@ -980,7 +1007,7 @@ def export_lyric_sheet_pdf(srt_path, audio_path, stem, out_path, meta=None):
     dur = meta.get("duration") or blocks[-1][1]
     dur_s = f"{int(dur // 60)}:{int(dur % 60):02d}"
 
-    title = meta.get("title") or stem.replace("_", " ").strip()
+    title = meta.get("title") or _display_title(stem)
     artist = meta.get("artist") or ""
     year = meta.get("year") or _dt.now().year
 
@@ -1055,10 +1082,10 @@ def export_lyric_sheet_pdf(srt_path, audio_path, stem, out_path, meta=None):
     def _page(c, d):
         c.saveState()
         c.setFont(FS, 7.5); c.setFillColor(faint)
-        c.drawString(20 * mm, A4[1] - 12 * mm, label_txt.upper())
-        c.drawRightString(A4[0] - 20 * mm, A4[1] - 12 * mm, escape(title))
-        c.setStrokeColor(faint); c.setLineWidth(0.4)
-        c.line(20 * mm, A4[1] - 14 * mm, A4[0] - 20 * mm, A4[1] - 14 * mm)
+        if label_txt:
+            c.drawString(20 * mm, A4[1] - 12 * mm, label_txt.upper())
+            c.setStrokeColor(faint); c.setLineWidth(0.4)
+            c.line(20 * mm, A4[1] - 14 * mm, A4[0] - 20 * mm, A4[1] - 14 * mm)
         c.drawCentredString(A4[0] / 2, 10 * mm, str(d.page))
         c.restoreState()
 
@@ -1173,7 +1200,7 @@ def _run_lyrics_job(job_id, input_path, srt_path, chord_method, sheet_meta=None)
         mp3_path = lyrics_folder / f"{stem}.mp3"
 
         detected, total = engine.export_lyrics_and_mp3(
-            input_path, cues, stem,
+            input_path, cues, _display_title(stem),
             str(pdf_path), str(mp3_path),
             chord_method=chord_method,
             status_callback=lambda msg: _p(50, msg),
@@ -1382,7 +1409,7 @@ def _run_lyrics_and_tab_job(job_id, input_path, srt_path, chord_method,
         lyrics_mp3 = lyrics_folder / f"{stem}.mp3"
 
         detected, total = engine.export_lyrics_and_mp3(
-            input_path, cues, stem,
+            input_path, cues, _display_title(stem),
             str(lyrics_pdf), str(lyrics_mp3),
             chord_method=chord_method,
             status_callback=lambda msg: _p(25, msg),
@@ -1693,7 +1720,7 @@ def _run_full_transcription_job(job_id, input_path):
             music_module.create_piano_sheet_pdf(
                 tab_notes, chords, tempo_bpm, piano_pdf,
                 total_duration_seconds=total_duration_seconds,
-                title=f"{stem} — Piano Arrangement",
+                title=f"{_display_title(stem)} — Piano Arrangement",
             )
             piano_pdf_ok = True
         except Exception as piano_err:
@@ -1711,7 +1738,7 @@ def _run_full_transcription_job(job_id, input_path):
             )
             music_module.draw_fingerstyle_tab_pdf(
                 fingerstyle_events, tempo_bpm, fingerstyle_pdf,
-                title=f"{stem} — Fingerstyle Guitar TAB (Travis Picking)",
+                title=f"{_display_title(stem)} — Fingerstyle Guitar TAB (Travis Picking)",
             )
             fingerstyle_pdf_ok = True
         except Exception as fs_err:
