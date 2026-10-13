@@ -28,7 +28,7 @@ a = Analysis(
     ],
     "extra_dist_files": [
         "C:/Users/dahab/Music_Studio-webapp/uploads",
-        "C:/Users/dahab/OneDrive/Desktop/start_ace_server.bat",
+        "C:/Users/dahab/OneDrive/Desktop/start_ace_step.bat",
         "C:/Users/dahab/OneDrive/Desktop/music_studio_config.bat"
     ],
     "exclude_modules": [
@@ -101,6 +101,13 @@ a = Analysis(
         "librosa.decompose",
         "librosa.beat",
         "librosa.effects",
+        "lazy_loader",
+        "soxr",
+        "pooch",
+        "msgpack",
+        "decorator",
+        "audioread",
+        "sklearn.utils._cython_blas",
         "soundfile",
         "numba",
         "numba.core",
@@ -193,7 +200,7 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-    
+
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,

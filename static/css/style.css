@@ -135,25 +135,34 @@ body:has(.app-shell) .app-header {
 }
 
 .app-title {
+  position: relative;
   display: flex;
   align-items: center;
-  gap: 12px;
-  font-size: 22px;
-  font-weight: 800;
+  justify-content: center;   /* "Music Studio" sits in the middle */
+  min-height: 64px;
   color: #ffffff;
 }
 
 .app-logo {
-  height: 34px;
-  width: 34px;
-  border-radius: 6px;
-  object-fit: cover;
+  position: absolute;        /* pinned to the left edge of the header */
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  height: 56px;
+  width: auto;               /* keep the logo's own proportions */
+  object-fit: contain;
 }
 
-.app-title-text { letter-spacing: .3px; }
+.app-title-text {
+  font-size: 40px;           /* larger title */
+  font-weight: 800;
+  letter-spacing: .5px;
+  text-align: center;
+}
 
 .app-subtitle {
   margin-top: 4px;
+  text-align: center;
   font-size: 12px;
   color: var(--muted);
 }

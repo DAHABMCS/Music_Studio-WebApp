@@ -803,6 +803,279 @@ def _generate_video(req, keep_vocals: bool):
     return jsonify(job_id=job_id)
 
 
+# ============================================================
+# LYRIC SHEET PDF  (second PDF produced by the lyrics export)
+# ------------------------------------------------------------
+# The existing export (SubtitleEngine.export_lyrics_and_mp3) makes the
+# chord-annotated lyrics PDF. This builds an ADDITIONAL, publisher-style
+# lyric sheet from the same SRT: title, artist, key/tempo/length line,
+# labelled sections (Verse / Chorus / Bridge) in a left gutter, and a
+# credits + rights footer. Output: <stem>_lyric_sheet.pdf next to the
+# other lyrics outputs.
+# ============================================================
+import re as _re
+import difflib as _difflib
+from datetime import datetime as _dt
+
+
+def _parse_srt_blocks(srt_text):
+    """Minimal standalone SRT parser -> [(start_sec, end_sec, text)]."""
+    def _t(s):
+        h, m, rest = s.strip().replace(",", ".").split(":")
+        return int(h) * 3600 + int(m) * 60 + float(rest)
+
+    out = []
+    for block in _re.split(r"\r?\n\s*\r?\n", srt_text.strip()):
+        lines = [l for l in block.splitlines() if l.strip()]
+        for i, l in enumerate(lines):
+            if "-->" in l:
+                try:
+                    a, b = l.split("-->")
+                    text = " ".join(x.strip() for x in lines[i + 1:])
+                    text = _re.sub(r"<[^>]+>", "", text).strip()
+                    if text:
+                        out.append((_t(a), _t(b), text))
+                except Exception:
+                    pass
+                break
+    return out
+
+
+def _group_into_sections(blocks, gap=2.0, max_lines=8):
+    """Split cues into stanzas on silent gaps, then label them.
+    Stanzas that (near-)repeat are Chorus; a one-off stanza between two
+    choruses after at least two verses is Bridge; the rest are Verse N."""
+    stanzas, cur = [], []
+    for i, (s, e, t) in enumerate(blocks):
+        if cur and (s - blocks[i - 1][1] > gap or len(cur) >= max_lines):
+            stanzas.append(cur)
+            cur = []
+        cur.append(t)
+    if cur:
+        stanzas.append(cur)
+
+    norm = [" ".join(st).lower() for st in stanzas]
+    is_chorus = [False] * len(stanzas)
+    for i in range(len(stanzas)):
+        for j in range(i + 1, len(stanzas)):
+            if _difflib.SequenceMatcher(None, norm[i], norm[j]).ratio() >= 0.75:
+                is_chorus[i] = is_chorus[j] = True
+
+    labelled, verse_n = [], 0
+    chorus_idx = [i for i, c in enumerate(is_chorus) if c]
+    for i, st in enumerate(stanzas):
+        if is_chorus[i]:
+            labelled.append(("Chorus", st))
+        elif (verse_n >= 2 and chorus_idx and chorus_idx[0] < i < chorus_idx[-1]
+              and len(st) <= 4):
+            labelled.append(("Bridge", st))
+        else:
+            verse_n += 1
+            labelled.append((f"Verse {verse_n}", st))
+    return labelled
+
+
+def _estimate_key_tempo(audio_path, max_seconds=120):
+    """Best-effort key + tempo with librosa. Returns (key_str|None, bpm|None)."""
+    try:
+        import numpy as np
+        import librosa
+        y, sr = librosa.load(audio_path, sr=22050, mono=True, duration=max_seconds)
+        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+        bpm = int(round(float(np.atleast_1d(tempo)[0])))
+        chroma = librosa.feature.chroma_cqt(y=librosa.effects.harmonic(y), sr=sr).mean(axis=1)
+        maj = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
+        mnr = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+        names = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
+        best = (-2, None)
+        for k in range(12):
+            for prof, mode in ((maj, "major"), (mnr, "minor")):
+                c = np.corrcoef(chroma, np.roll(prof, k))[0, 1]
+                if c > best[0]:
+                    best = (c, f"{names[k]} {mode}")
+        return best[1], bpm
+    except Exception as e:
+        print(f"[lyric_sheet] key/tempo estimate skipped: {e}")
+        return None, None
+
+
+def _pick_unicode_fonts():
+    """Register a serif family that has the ℗ glyph. Returns
+    (regular, bold, italic, sans, has_phonogram). Falls back to the
+    built-in Times/Helvetica (and '(P)' instead of ℗)."""
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    candidates = [
+        ("/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+         "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
+         "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Italic.ttf",
+         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+        ("C:/Windows/Fonts/cambria.ttc", None, None, None),
+        ("C:/Windows/Fonts/seguisym.ttf", None, None, None),
+        ("/Library/Fonts/Arial Unicode.ttf", None, None, None),
+    ]
+    for reg, bold, ital, sans in candidates:
+        try:
+            if not Path(reg).exists() or reg.endswith(".ttc"):
+                continue
+            pdfmetrics.registerFont(TTFont("LS-Serif", reg))
+            pdfmetrics.registerFont(TTFont("LS-Serif-B", bold if bold and Path(bold).exists() else reg))
+            pdfmetrics.registerFont(TTFont("LS-Serif-I", ital if ital and Path(ital).exists() else reg))
+            pdfmetrics.registerFont(TTFont("LS-Sans", sans if sans and Path(sans).exists() else reg))
+            return "LS-Serif", "LS-Serif-B", "LS-Serif-I", "LS-Sans", True
+        except Exception:
+            continue
+    return "Times-Roman", "Times-Bold", "Times-Italic", "Helvetica", False
+
+
+def export_lyric_sheet_pdf(srt_path, audio_path, stem, out_path, meta=None):
+    """Build the lyric-sheet PDF. `meta` may supply: title, artist, key,
+    tempo, duration (seconds), writers, producer, publisher, label, year.
+    Credit lines with no data are left out rather than printed blank."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.lib import colors
+    from reportlab.platypus import (BaseDocTemplate, PageTemplate, Frame,
+                                    Paragraph, Spacer, Table, TableStyle,
+                                    HRFlowable, KeepTogether)
+    from reportlab.lib.enums import TA_CENTER, TA_RIGHT
+    from xml.sax.saxutils import escape
+
+    meta = dict(meta or {})
+    blocks = _parse_srt_blocks(Path(srt_path).read_text(encoding="utf-8"))
+    if not blocks:
+        raise RuntimeError("No cues found in SRT — cannot build lyric sheet.")
+    sections = _group_into_sections(blocks)
+
+    key, bpm = meta.get("key"), meta.get("tempo")
+    if not (key and bpm):
+        k2, b2 = _estimate_key_tempo(audio_path)
+        key, bpm = key or k2, bpm or b2
+    dur = meta.get("duration") or blocks[-1][1]
+    dur_s = f"{int(dur // 60)}:{int(dur % 60):02d}"
+
+    title = meta.get("title") or stem.replace("_", " ").strip()
+    artist = meta.get("artist") or ""
+    year = meta.get("year") or _dt.now().year
+
+    F, FB, FI, FS, has_p = _pick_unicode_fonts()
+    ink, soft, faint = colors.HexColor("#1a1a1a"), colors.HexColor("#555555"), colors.HexColor("#888888")
+    accent = colors.HexColor("#185FA5")
+
+    st_title = ParagraphStyle("t", fontName=FB, fontSize=26, leading=31, alignment=TA_CENTER, textColor=ink)
+    st_artist = ParagraphStyle("a", fontName=FS, fontSize=11, leading=14, alignment=TA_CENTER, textColor=soft)
+    st_meta = ParagraphStyle("m", fontName=FS, fontSize=8.5, leading=11, alignment=TA_CENTER, textColor=faint)
+    st_lbl = ParagraphStyle("l", fontName=FS, fontSize=8, leading=13, textColor=faint)
+    st_lbl_ch = ParagraphStyle("lc", parent=st_lbl, textColor=accent)
+    st_body = ParagraphStyle("b", fontName=F, fontSize=12, leading=21, textColor=ink)
+    st_chor = ParagraphStyle("c", parent=st_body, fontName=FB)
+    st_brdg = ParagraphStyle("br", parent=st_body, fontName=FI, textColor=soft)
+    st_note = ParagraphStyle("n", fontName=FS, fontSize=8.5, leading=12, textColor=faint)
+    st_credit = ParagraphStyle("cr", fontName=FS, fontSize=8.5, leading=13, textColor=soft)
+    st_credit_r = ParagraphStyle("crr", parent=st_credit, alignment=TA_RIGHT)
+
+    story = [Paragraph(escape(title), st_title)]
+    if artist:
+        story += [Spacer(1, 4), Paragraph(escape(artist), st_artist)]
+    bits = []
+    if key: bits.append(f"Key: {key}")
+    if bpm: bits.append(f"Tempo: {bpm} BPM")
+    bits.append(dur_s)
+    story += [Spacer(1, 6), Paragraph(" &middot; ".join(bits), st_meta), Spacer(1, 18)]
+
+    rows, last_chorus = [], max((i for i, (l, _) in enumerate(sections) if l == "Chorus"), default=-1)
+    seen_chorus = 0
+    for i, (label, lines) in enumerate(sections):
+        is_ch = label == "Chorus"
+        body_style = st_chor if is_ch else (st_brdg if label == "Bridge" else st_body)
+        lines = [escape(l) for l in lines]
+        if is_ch:
+            seen_chorus += 1
+            if i == last_chorus and seen_chorus > 1 and len(lines) > 2:
+                lines = lines[:2] + ['<font name="%s" size="9" color="#888888">(repeat 2x, fade)</font>' % FS]
+        body = Paragraph("<br/>".join(lines), body_style)
+        rows.append([Paragraph(label.upper(), st_lbl_ch if is_ch else st_lbl), body])
+
+    tbl = Table(rows, colWidths=[24 * mm, None])
+    ts = [("VALIGN", (0, 0), (-1, -1), "TOP"),
+          ("TOPPADDING", (0, 0), (-1, -1), 2), ("BOTTOMPADDING", (0, 0), (-1, -1), 12),
+          ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0)]
+    for r, (label, _) in enumerate(sections):
+        if label == "Chorus":
+            ts += [("LINEBEFORE", (1, r), (1, r), 1.2, accent), ("LEFTPADDING", (1, r), (1, r), 8)]
+    tbl.setStyle(TableStyle(ts))
+    story.append(tbl)
+
+    left, right = [], []
+    if meta.get("writers"):   left.append(f"Words and music by {escape(meta['writers'])}")
+    if meta.get("producer"):  left.append(f"Produced by {escape(meta['producer'])}")
+    if meta.get("publisher"): right.append(f"Published by {escape(meta['publisher'])}")
+    if meta.get("label"):
+        right.append(("\u2117" if has_p else "(P)") + f" {year} {escape(meta['label'])}")
+    footer = [Spacer(1, 14), HRFlowable(width="100%", thickness=0.5, color=faint), Spacer(1, 6)]
+    if left or right:
+        footer.append(Table([[Paragraph("<br/>".join(left), st_credit),
+                              Paragraph("<br/>".join(right), st_credit_r)]],
+                            colWidths=[None, None],
+                            style=[("VALIGN", (0, 0), (-1, -1), "TOP"),
+                                   ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                                   ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
+        footer.append(Spacer(1, 6))
+    footer.append(Paragraph("All rights reserved. Used by permission. "
+                            "Reproduction without license is prohibited.", st_note))
+    story.append(KeepTogether(footer))
+
+    label_txt = meta.get("label") or ""
+    def _page(c, d):
+        c.saveState()
+        c.setFont(FS, 7.5); c.setFillColor(faint)
+        c.drawString(20 * mm, A4[1] - 12 * mm, label_txt.upper())
+        c.drawRightString(A4[0] - 20 * mm, A4[1] - 12 * mm, escape(title))
+        c.setStrokeColor(faint); c.setLineWidth(0.4)
+        c.line(20 * mm, A4[1] - 14 * mm, A4[0] - 20 * mm, A4[1] - 14 * mm)
+        c.drawCentredString(A4[0] / 2, 10 * mm, str(d.page))
+        c.restoreState()
+
+    doc = BaseDocTemplate(str(out_path), pagesize=A4, title=f"{title} - lyric sheet",
+                          leftMargin=20 * mm, rightMargin=20 * mm,
+                          topMargin=24 * mm, bottomMargin=18 * mm)
+    doc.addPageTemplates([PageTemplate(id="p", onPage=_page,
+                          frames=[Frame(20 * mm, 18 * mm, A4[0] - 40 * mm, A4[1] - 42 * mm, id="f",
+                                        leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0)])])
+    doc.build(story)
+    return len(sections)
+
+
+_SHEET_META_KEYS = ("title", "artist", "key", "tempo", "writers",
+                    "producer", "publisher", "label", "year")
+
+
+def _sheet_meta_from_request(data):
+    """Optional lyric-sheet fields from the POST body (all may be omitted)."""
+    meta = {k: str(data[k]).strip() for k in _SHEET_META_KEYS
+            if data.get(k) not in (None, "")}
+    if "tempo" in meta:
+        try:
+            meta["tempo"] = int(float(meta["tempo"]))
+        except ValueError:
+            meta.pop("tempo")
+    return meta
+
+
+def _make_lyric_sheet(srt_path, input_path, stem, folder, meta):
+    """Build the extra PDF. Never lets a failure here kill the main export."""
+    out = Path(folder) / f"{stem}_lyric_sheet.pdf"
+    try:
+        export_lyric_sheet_pdf(srt_path, input_path, stem, out, meta)
+        return str(out)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"[lyric_sheet] skipped: {e}", flush=True)
+        return None
+
+
 @app.route("/api/export_lyrics", methods=["POST"])
 @login_required
 def generate_lyrics():
@@ -822,6 +1095,7 @@ def generate_lyrics():
         return jsonify(error="SRT not found — generate subtitles first"), 404
 
     chord_method = data.get("chord_method", "advanced")
+    sheet_meta = _sheet_meta_from_request(data)
 
     job_id = uuid.uuid4().hex[:12]
     with LOCK:
@@ -838,14 +1112,14 @@ def generate_lyrics():
 
     threading.Thread(
         target=_run_lyrics_job,
-        args=(job_id, str(input_path), str(srt_path), chord_method),
+        args=(job_id, str(input_path), str(srt_path), chord_method, sheet_meta),
         daemon=True,
     ).start()
 
     return jsonify(job_id=job_id)
 
 
-def _run_lyrics_job(job_id, input_path, srt_path, chord_method):
+def _run_lyrics_job(job_id, input_path, srt_path, chord_method, sheet_meta=None):
     try:
         engine = SubtitleEngine()
 
@@ -880,11 +1154,16 @@ def _run_lyrics_job(job_id, input_path, srt_path, chord_method):
             status_callback=lambda msg: _p(50, msg),
         )
 
+        # Additional PDF: publisher-style lyric sheet (see export_lyric_sheet_pdf)
+        _p(90, "Building lyric sheet PDF...")
+        sheet_pdf = _make_lyric_sheet(srt_path, input_path, stem, lyrics_folder, sheet_meta)
+
         with LOCK:
             JOBS[job_id]["progress"]   = 100
             JOBS[job_id]["status"]     = "Complete!"
             JOBS[job_id]["output"]     = str(pdf_path)
             JOBS[job_id]["pdf"]        = str(pdf_path)
+            JOBS[job_id]["sheet_pdf"]  = sheet_pdf
             JOBS[job_id]["mp3"]        = str(mp3_path)
             JOBS[job_id]["chords_detected"] = f"{detected}/{total}"
             JOBS[job_id]["_ts"]        = time.time()
@@ -1017,6 +1296,7 @@ def generate_lyrics_and_tab():
     end_sec = data.get("end_sec")
     end_sec = float(end_sec) if end_sec is not None else None
     use_demucs = bool(data.get("use_demucs", True))
+    sheet_meta = _sheet_meta_from_request(data)
 
     job_id = uuid.uuid4().hex[:12]
     with LOCK:
@@ -1034,7 +1314,7 @@ def generate_lyrics_and_tab():
     threading.Thread(
         target=_run_lyrics_and_tab_job,
         args=(job_id, str(input_path), str(srt_path), chord_method,
-              start_sec, end_sec, use_demucs),
+              start_sec, end_sec, use_demucs, sheet_meta),
         daemon=True,
     ).start()
 
@@ -1042,7 +1322,7 @@ def generate_lyrics_and_tab():
 
 
 def _run_lyrics_and_tab_job(job_id, input_path, srt_path, chord_method,
-                             start_sec, end_sec, use_demucs):
+                             start_sec, end_sec, use_demucs, sheet_meta=None):
     """Runs the lyrics export (0-50% of the progress bar) then the
     guitar tab export (50-100%). Outputs still land in their original,
     separate folders — Lyrics/<stem>/ and Tabs/<stem>/ — so the
@@ -1082,6 +1362,8 @@ def _run_lyrics_and_tab_job(job_id, input_path, srt_path, chord_method,
             chord_method=chord_method,
             status_callback=lambda msg: _p(25, msg),
         )
+        _p(40, "Building lyric sheet PDF...")
+        sheet_pdf = _make_lyric_sheet(srt_path, input_path, stem, lyrics_folder, sheet_meta)
         _p(50, "Lyrics done — starting guitar solo tab...")
 
         # ---- Part 2: Export Guitar Solo Tab (PDF) — 50% to 100% ----
@@ -1107,6 +1389,7 @@ def _run_lyrics_and_tab_job(job_id, input_path, srt_path, chord_method,
             JOBS[job_id]["status"]     = "Complete!"
             JOBS[job_id]["output"]     = str(lyrics_pdf)
             JOBS[job_id]["pdf"]        = str(lyrics_pdf)
+            JOBS[job_id]["sheet_pdf"]  = sheet_pdf
             JOBS[job_id]["mp3"]        = str(lyrics_mp3)
             JOBS[job_id]["tab_pdf"]    = str(tab_pdf)
             JOBS[job_id]["chords_detected"] = f"{detected}/{total}"
@@ -1615,6 +1898,7 @@ def job_status(job_id):
             "video": job["output"] if "video" in job and not job.get("keep_vocals") else None,
             "lyric_video": job["output"] if "video" in job and job.get("keep_vocals") else None,
             "pdf": job.get("pdf"),
+            "sheet_pdf": job.get("sheet_pdf"),
             "mp3": job.get("mp3"),
             "tab_pdf": job.get("tab_pdf"),
             "folder": job.get("folder"),

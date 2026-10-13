@@ -2,23 +2,37 @@
 .venv/
 venv/
 env/
+.venv-old/
+.buildenv/
 
 # Python
 __pycache__/
 *.py[cod]
 *.egg-info/
 
-# Large media (move these to Git LFS or cloud storage if needed)
+# Large media
 *.mp4
 *.wav
 *.mp3
 *.flac
+*.afpk
 
 # Outputs
 outputs/
-# Build output
+installer_output/
 build/
 dist/
+
+# Prerequisites / binaries
+prereqs/
+extras/
+*.exe
+*.dll
+
+# IDE
+.idea/
+.vscode/
+PyCharm_2026.2.23/
 
 # Logs
 *.log
@@ -31,13 +45,15 @@ jobs.json
 # User data
 uploads/
 users.json.bak*
-# OS/IDE
+
+# Backups
+*.bak
+*.bak*
+
+# OS
 .DS_Store
 Thumbs.db
-.vscode/
-.idea/
+
+# Third-party drop-ins
 ACE-Step/
 ACE-Step-1.5/
-.venv/
-.venv-old/prereqs/
-*.bak*
