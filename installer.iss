@@ -19,12 +19,14 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayName={#AppName}
 DisableProgramGroupPage=yes
-
+SetupIconFile=guitar.ico
+UninstallDisplayIcon={app}\guitar.ico
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; Flags: unchecked
 
 [Files]
 Source: "dist\MusicStudio\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
+Source: "guitar.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\MusicStudio.exe"
@@ -32,6 +34,8 @@ Name: "{autoprograms}\{#AppName} - Repair setup"; Filename: "{app}\MusicStudio.e
 Name: "{autoprograms}\{#AppName} - Start ACE-Step (optional, for AI Song)"; Filename: "{app}\start_ace_step.bat"; Check: FileExists(ExpandConstant('{app}\start_ace_step.bat'))
 Name: "{autoprograms}\{#AppName} - Install ACE-Step (optional)"; Filename: "{app}\install_ace_step.bat"; Check: FileExists(ExpandConstant('{app}\install_ace_step.bat'))
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\MusicStudio.exe"; Tasks: desktopicon
+Name: "{autoprograms}\{#AppName}"; Filename: "{app}\MusicStudio.exe"; IconFilename: "{app}\guitar.ico"
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\MusicStudio.exe"; IconFilename: "{app}\guitar.ico"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\MusicStudio.exe"; Description: "Start {#AppName} now (first start sets up all components)"; Flags: nowait postinstall skipifsilent
