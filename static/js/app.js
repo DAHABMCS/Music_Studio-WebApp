@@ -24,23 +24,6 @@ const $ = (id) => document.getElementById(id);
 
 /* ============================================================
    ACTION-BUTTON STATUS COLORS
-   ------------------------------------------------------------
-   Every job-triggering button starts red (.btn-ready), turns yellow
-   (.btn-processing) while its job runs, then green (.btn-done) once
-   it finishes. That status is kept in state.buttonStatus AND applied
-   to the DOM together (see setActionButtonState) — previously only
-   the DOM class was set, with nothing persisted, so a page reload had
-   no way to know a button had finished successfully and it silently
-   fell back to red every time (see resetAllButtonStates in
-   restoreSession). Persisting it here and re-applying it in
-   restoreSession fixes that.
-
-   Each of the 5 "Browse ... Folder" buttons is paired with one (or
-   two, for Karaoke/Lyric Video sharing one folder) action button and
-   mirrors its red/yellow — but its OWN green only ever comes from
-   actually being clicked to review that folder (see browseRemote),
-   not automatically from the job finishing. That green then persists
-   until the paired job is run again.
    ============================================================ */
 const ACTION_TO_KIND = {
   btnSrt:        'srt',
@@ -75,9 +58,6 @@ function resetAllButtonStates() {
   Object.values(KIND_TO_BROWSE_BTN).forEach(id => setButtonState(id, 'btn-ready'));
 }
 
-/* Sets one action button's status in BOTH the DOM and state.buttonStatus
-   (so it can be persisted/restored), then re-derives its paired Browse
-   button's color from the current situation. */
 function setActionButtonState(buttonId, statusWord) {
   state.buttonStatus[buttonId] = statusWord;
   setButtonState(buttonId, 'btn-' + statusWord);
@@ -85,10 +65,6 @@ function setActionButtonState(buttonId, statusWord) {
   if (kind) refreshBrowseButtonColor(kind);
 }
 
-/* A Browse button mirrors "processing" from whichever of its paired
-   action button(s) is currently running; otherwise it's green if
-   already reviewed, or red/ready otherwise. Called any time a paired
-   action button's status changes, or reviewed[] changes. */
 function refreshBrowseButtonColor(kind) {
   const browseBtnId = KIND_TO_BROWSE_BTN[kind];
   if (!browseBtnId) return;
@@ -105,10 +81,6 @@ function refreshBrowseButtonColor(kind) {
   }
 }
 
-/* Re-applies every persisted color from state.buttonStatus/reviewed —
-   used right after restoring a snapshot on page load, so a page
-   reload shows exactly what was true before it closed instead of
-   resetting everything to red. */
 function applyPersistedButtonColors() {
   ACTION_BUTTON_IDS.forEach(id => {
     setButtonState(id, 'btn-' + (state.buttonStatus[id] || 'ready'));
@@ -117,12 +89,44 @@ function applyPersistedButtonColors() {
 }
 
 /* ============================================================
+   PROCESSING OVERLAY
+   ============================================================ */
+function showProcessingOverlay(songName) {
+  document.querySelectorAll('.processing-overlay').forEach(el => el.remove());
+
+  const overlay = document.createElement('div');
+  overlay.className = 'processing-overlay';
+  overlay.style.cssText = `
+    position: fixed; inset: 0; z-index: 10000; 
+    display: flex; align-items: center; justify-content: center; 
+    background: rgba(0,0,0,0.7); backdrop-filter: blur(2px);
+  `;
+  overlay.innerHTML = `
+    <div style="background: #1e2229; padding: 24px 32px; border-radius: 12px; border: 1px solid #333; text-align: center; box-shadow: 0 10px 40px rgba(0,0,0,0.5);">
+      <h2 style="margin: 0 0 12px; font-size: 20px; color: #fff;">Currently Processing</h2>
+      <div style="font-size: 28px; font-weight: bold; color: #ffd700; margin-bottom: 8px;" id="overlaySongName">${songName}</div>
+      <div style="font-size: 14px; color: #aaa;" id="overlayStatus">Starting...</div>
+      <div style="margin-top: 16px; height: 6px; background: #333; border-radius: 3px; overflow: hidden;">
+        <div id="overlayProgressBar" style="height: 100%; width: 0%; background: #e8b100; transition: width 0.3s;"></div>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+}
+
+function updateProcessingOverlay(status, progress) {
+  const statusEl = document.getElementById('overlayStatus');
+  const barEl = document.getElementById('overlayProgressBar');
+  if (statusEl) statusEl.textContent = status;
+  if (barEl) barEl.style.width = progress + '%';
+}
+
+function hideProcessingOverlay() {
+  document.querySelectorAll('.processing-overlay').forEach(el => el.remove());
+}
+
+/* ============================================================
    SESSION PERSISTENCE
-   ------------------------------------------------------------
-   Keeps the user's place across browser closes / tab reloads.
-   - localStorage snapshot: uploaded file, background, srt, jobId,
-     form field values. Restored on load.
-   - If a job was running, we resume polling /api/job/<id>.
    ============================================================ */
 const STORAGE_KEY = 'musicStudio.session.v1';
 
@@ -162,7 +166,6 @@ async function restoreSession() {
   } catch { snap = null; }
   if (!snap) return;
 
-  // 1. Restore in-memory state
   state.uploaded   = snap.uploaded   || null;
   state.background = snap.background || null;
   state.srt        = snap.srt        || null;
@@ -178,15 +181,8 @@ async function restoreSession() {
     snap.reviewed || {}
   );
 
-  // Re-apply every button's persisted color exactly as it was before
-  // the browser closed — previously this called resetAllButtonStates()
-  // here, which forced every action button back to red regardless of
-  // whether its job had actually finished successfully; only the
-  // Browse buttons' green ("reviewed") survived a reload. Using the
-  // restored buttonStatus map instead fixes that.
   applyPersistedButtonColors();
 
-  // 2. Restore form fields
   const f = snap.form || {};
   if (f.language     && $('language'))           $('language').value = f.language;
   if (f.model        && $('model'))              $('model').value = f.model;
@@ -196,7 +192,6 @@ async function restoreSession() {
   if (f.bgPath       && $('backgroundPath'))     $('backgroundPath').value = f.bgPath;
   if (f.inputPath    && $('inputFilePath'))      $('inputFilePath').value = f.inputPath;
 
-  // 3. If a job was running, resume polling or show final result
   if (state.jobId) {
     try {
       const r = await fetch(`/api/job/${state.jobId}`);
@@ -207,6 +202,14 @@ async function restoreSession() {
         setProgress(j.progress || 0);
         setStatus(j.message || 'Resuming…');
         if (state.activeButtonId) setActionButtonState(state.activeButtonId, 'processing');
+
+        // Determine song name for overlay
+        let songName = "Unknown Song";
+        if (state.uploaded && state.uploaded.filename) {
+            songName = state.uploaded.filename.replace(/\.[^.]+$/, '');
+        }
+        showProcessingOverlay(songName);
+
         pollJob();
         setStatus('Resumed previous job');
         saveSession();
@@ -224,19 +227,16 @@ async function restoreSession() {
         state.jobId = null;
         saveSession();
       } else {
-        // cancelled / unknown — drop it
         if (state.activeButtonId) setActionButtonState(state.activeButtonId, 'ready');
         state.jobId = null;
         saveSession();
       }
     } catch (e) {
-      // Server lost the job (restart) — clear it
       state.jobId = null;
       saveSession();
     }
   }
 
-  // 4. Restore the SRT preview if we had one on screen
   if (state.srt) {
     try {
       const r = await fetch(`/api/output_preview?path=${encodeURIComponent(state.srt)}`);
@@ -255,13 +255,7 @@ async function restoreSession() {
   }
 }
 
-/* ---------- Non-blocking notifications ----------
-   Replaces alert()/confirm()-style popups. Those are native, blocking
-   dialogs — the whole page (including the running-job status/progress
-   updates) is frozen until someone clicks OK, which is disruptive for
-   messages that don't need a decision (e.g. "Karaoke video ready").
-   These toasts show the same information but never block input and
-   dismiss themselves automatically; clicking one dismisses it early. */
+/* ---------- Non-blocking notifications ---------- */
 let _noticeContainer = null;
 function _ensureNoticeContainer() {
   if (_noticeContainer && document.body.contains(_noticeContainer)) return _noticeContainer;
@@ -379,7 +373,7 @@ function lockButtons(lock) {
   setGearSpinning(lock);
 }
 
-/* ---------- Gear animation: plays only while a job is running ---------- */
+/* ---------- Gear animation ---------- */
 function setGearSpinning(on) {
   const v = $('gearVideo');
   if (!v) return;
@@ -397,13 +391,16 @@ async function pollJob() {
   try {
     const r = await fetch(`/api/job/${state.jobId}`);
     const j = await r.json();
+
     setProgress(j.progress);
     setStatus(j.message || j.status);
+    updateProcessingOverlay(j.message || j.status, j.progress);
 
     if (j.status === 'done') {
       state.jobId = null;
       lockButtons(false);
       stopTimer();
+      hideProcessingOverlay();
       if (state.activeButtonId) setActionButtonState(state.activeButtonId, 'done');
       handleResult(j.result);
       saveSession();
@@ -413,6 +410,7 @@ async function pollJob() {
       state.jobId = null;
       lockButtons(false);
       stopTimer();
+      hideProcessingOverlay();
       if (state.activeButtonId) setActionButtonState(state.activeButtonId, 'ready');
       showNotice('Error: ' + j.error, 'error');
       saveSession();
@@ -431,10 +429,18 @@ function startJob(res, buttonId) {
   }
   state.jobId = res.job_id;
   state.activeButtonId = buttonId || null;
+
+  let songName = "Unknown Song";
+  if (state.uploaded && state.uploaded.filename) {
+    songName = state.uploaded.filename.replace(/\.[^.]+$/, '');
+  } else if (buttonId === 'btnCreateSong') {
+    songName = "AI Song Generation";
+  }
+
+  showProcessingOverlay(songName);
+
   const kind = ACTION_TO_KIND[buttonId];
   if (kind) {
-    // A fresh run invalidates any earlier "reviewed" green for this
-    // kind's Browse button — the folder is about to change.
     state.reviewed[kind] = false;
   }
   if (buttonId) setActionButtonState(buttonId, 'processing');
@@ -455,7 +461,7 @@ function handleResult(result) {
     state.srt = result.srt;
   }
   if (result.srt_abs && $('outputFilePath')) {
-    $('outputFilePath').value = result.srt_abs;   // complete path, not just the name
+    $('outputFilePath').value = result.srt_abs;
   }
   if (result.video) showNotice('Karaoke video ready: ' + result.video, 'success');
   if (result.lyric_video) showNotice('Lyric video ready: ' + result.lyric_video, 'success');
@@ -483,7 +489,7 @@ $('btnSrt').onclick = async () => {
       path: state.uploaded.path,
       language: $('language').value,
       model: $('model').value,
-      isolate_vocals: true, // always isolate vocals before transcribing — no longer user-toggled
+      isolate_vocals: true,
     }),
   });
   startJob(await r.json(), 'btnSrt');
@@ -561,6 +567,7 @@ $('btnStop').onclick = async () => {
   lockButtons(false);
   stopTimer();
   setStatus('Stopped');
+  hideProcessingOverlay();
   saveSession();
 };
 
@@ -589,9 +596,6 @@ async function copySrtPath() {
   let v = ($('outputFilePath').value || '').trim();
   if (!v) { showNotice('No output path yet', 'warn'); return; }
 
-  // The box can still hold a bare "Song.srt" (older saved session, or the
-  // file hasn't been generated yet). Ask the server for the complete path
-  // so what lands on the clipboard is never just the file name.
   if (!_isAbsolutePath(v)) {
     try {
       const r = await fetch(`/api/output_abs?path=${encodeURIComponent(state.srt || v)}`);
@@ -602,10 +606,6 @@ async function copySrtPath() {
     } catch (e) { /* fall through with what we have */ }
   }
 
-  // navigator.clipboard only exists in secure contexts (https, or
-  // localhost). This dashboard is typically opened over plain http on
-  // a LAN IP, where navigator.clipboard is undefined, so fall back to a
-  // hidden-textarea + execCommand copy in that case.
   if (navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(v)
       .then(() => setStatus('SRT path copied: ' + v))
@@ -633,14 +633,7 @@ function copyViaFallback(text) {
   }
 }
 
-/* ---------- Remote folder browser (in-page, no window.open) ----------
-   NOTE: this used to be `window.open('/api/browse/${kind}', '_blank')`,
-   which opened a NEW BROWSER TAB pointed at a backend route that in turn
-   opened a native Explorer/Finder window on the SERVER machine. That's
-   what caused the "browser closes" / hangs behavior — the new tab was
-   waiting on a request tied to a GUI window on a remote machine you
-   can't see or interact with. This version fetches a JSON file list and
-   renders it inline, in the current page. */
+/* ---------- Remote folder browser ---------- */
 async function browseRemote(kind) {
   let data;
   try {
@@ -655,18 +648,10 @@ async function browseRemote(kind) {
     return;
   }
 
-  // Reviewing the folder is what "confirms" it — the Browse button
-  // turns green right here and stays green (surviving reloads, via
-  // saveSession) until this kind's job is run again, regardless of
-  // what the paired action button is doing at that moment.
   state.reviewed[kind] = true;
   setButtonState(KIND_TO_BROWSE_BTN[kind], 'btn-done');
   saveSession();
 
-  // If the server is running on this same machine, /api/browse just
-  // opened the real OS folder window directly — nothing more to show
-  // in the page. Only render the in-page listing when it couldn't
-  // (e.g. this request came from another device on the network).
   if (data.opened) {
     setStatus(`Opened ${data.path} folder`);
     return;
@@ -675,11 +660,10 @@ async function browseRemote(kind) {
 }
 
 function openBrowseModal(kind, data) {
-  // Remove any existing browse modal first
   document.querySelectorAll('.browse-modal').forEach(m => m.remove());
 
   const modal = document.createElement('div');
-  modal.className = 'editor-modal browse-modal'; // reuse existing modal styling
+  modal.className = 'editor-modal browse-modal';
 
   const itemsHtml = (data.files && data.files.length)
     ? data.files.map(f => `
@@ -703,7 +687,7 @@ function openBrowseModal(kind, data) {
   document.body.appendChild(modal);
   modal.querySelector('#browseClose').onclick = () => modal.remove();
   modal.addEventListener('click', (e) => {
-    if (e.target === modal) modal.remove(); // click outside box to close
+    if (e.target === modal) modal.remove();
   });
 }
 
@@ -713,20 +697,7 @@ function escapeHtml(str) {
   return div.innerHTML;
 }
 
-/* ---------- Create Song modal ----------
-   Two panels: Lyrics (verses/chorus/etc, free text) and Style (genre,
-   instruments, singer). "Generate" posts both to /api/create_song and
-   feeds the job into the same status/progress/polling pipeline every
-   other action button uses (see startJob/pollJob). "Browse Output"
-   just calls the existing browseRemote('songs') used by the
-   "Browse Songs Folder" action-grid button.
-
-   Fields persist across modal opens via localStorage (same pattern as
-   STORAGE_KEY above): "Save" writes the current fields to
-   SONG_DRAFT_KEY, and every time the modal is opened it auto-loads
-   whatever was last saved there. "Clear" wipes both the on-screen
-   fields and the saved draft. Nothing is auto-saved on close/cancel —
-   only explicit Save persists, per how this was asked for. */
+/* ---------- Create Song modal ---------- */
 const SONG_DRAFT_KEY = 'musicStudio.songDraft.v1';
 
 const INSTRUMENT_OPTIONS = [
@@ -742,8 +713,6 @@ function loadSongDraft() {
   }
 }
 
-/* Song language -> reading direction. Arabic, Persian and Urdu read right to
-   left; "auto" lets the browser decide line by line from the letters typed. */
 const SONG_RTL_LANGS = ['ar', 'fa', 'ur', 'he'];
 
 function songLangDir(lang) {
@@ -757,10 +726,9 @@ function applySongDirection(modal) {
   const lyrics = modal.querySelector('#songLyrics');
   if (lyrics) {
     lyrics.setAttribute('dir', dir);
-    lyrics.style.textAlign = 'start';          // right edge when rtl, left when ltr
+    lyrics.style.textAlign = 'start';
     lyrics.style.unicodeBidi = dir === 'auto' ? 'plaintext' : 'normal';
   }
-  // Title and style text boxes always follow the letters typed into them.
   ['#songTitle', '#songStyle'].forEach(sel => {
     const el = modal.querySelector(sel);
     if (el) el.setAttribute('dir', 'auto');
@@ -778,7 +746,6 @@ function readSongFields(modal) {
     singer:      modal.querySelector('#songSinger').value,
     backend:     modal.querySelector('#songBackend').value,
     instruments: Array.from(modal.querySelectorAll('.songInstrument:checked')).map(el => el.value),
-    // The two option checkboxes are saved with everything else (both default ON).
     dialect:     (modal.querySelector('#songDialect') || { value: 'egyptian' }).value,
     include_title_lyrics: !!(modal.querySelector('#songPresetLyrics') || { checked: true }).checked,
     backtrack:            !!(modal.querySelector('#songStems') || { checked: true }).checked,
@@ -795,7 +762,7 @@ function applySongFields(modal, fields) {
   const langEl = modal.querySelector('#songLanguage');
   if (langEl) {
     langEl.value = fields.language || 'auto';
-    if (langEl.value !== (fields.language || 'auto')) langEl.value = 'auto';   // unknown code
+    if (langEl.value !== (fields.language || 'auto')) langEl.value = 'auto';
   }
   applySongDirection(modal);
   const chosen = new Set(fields.instruments || []);
@@ -810,12 +777,7 @@ function applySongFields(modal, fields) {
   if (bkEl) bkEl.checked = fields.backtrack !== false;
 }
 
-/* ---------- AI Lyrics modal ----------
-   Style + a short description of the subject + language -> the server
-   (/api/generate_lyrics_ai) asks an AI to write the lyrics. The result is
-   editable here, and "Use in AI Song" drops it (with the style, language
-   and title) into the Create Song window through the same saved-draft
-   mechanism that window already auto-loads (SONG_DRAFT_KEY). */
+/* ---------- AI Lyrics modal ---------- */
 const AI_LYRICS_LANGUAGES = [
   ['auto', 'Auto - same language as the description'],
   ['ar', 'Arabic - عربي (right to left)'],
@@ -951,25 +913,46 @@ function openAiLyricsModal() {
   };
 
   // ---- Save as a .txt file, and ask before closing unsaved lyrics ----
-  let dirty = false;                       // lyrics changed since last save / use
+  let dirty = false;
   q('#aiLyResult').addEventListener('input', () => { dirty = true; });
 
-  const saveLyricsFile = () => {
+  const saveLyricsFile = async () => {
     const lyrics = q('#aiLyResult').value;
     if (!lyrics.trim()) { showNotice('There are no lyrics to save yet', 'warn'); return false; }
-    const title = q('#aiLyTitle').value.trim();
-    const safe = (title || 'lyrics').replace(/[\\/:*?"<>|]+/g, '').trim().slice(0, 60) || 'lyrics';
-    const text = (title ? title + '\r\n\r\n' : '') + lyrics.replace(/\r?\n/g, '\r\n');
-    // BOM so Notepad shows Arabic / other scripts correctly
-    const blob = new Blob(['\ufeff' + text], { type: 'text/plain;charset=utf-8' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = safe + '.txt';
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
-    dirty = false;
-    showNotice('Lyrics saved as ' + safe + '.txt (check your Downloads folder)', 'success');
+
+    const title = q('#aiLyTitle').value.trim() || 'Untitled_Song';
+    const btn = q('#aiLySave');
+    const originalText = btn.textContent;
+
+    // Set button to processing state (Yellow)
+    btn.disabled = true;
+    btn.textContent = 'Saving...';
+    btn.classList.remove('btn-ready', 'btn-done');
+    btn.classList.add('btn-processing');
+
+    try {
+      const r = await fetch('/api/save_ai_lyrics', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: title, lyrics: lyrics })
+      });
+      const res = await r.json();
+      if (res.error) throw new Error(res.error);
+
+      // Set button to done state (Green)
+      btn.classList.remove('btn-processing');
+      btn.classList.add('btn-done');
+      showNotice('Lyrics saved to: ' + res.path, 'success');
+      dirty = false;
+    } catch (e) {
+      // Reset to ready state (Red)
+      btn.classList.remove('btn-processing');
+      btn.classList.add('btn-ready');
+      showNotice('Save failed: ' + e.message, 'error');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = originalText;
+    }
     return true;
   };
   q('#aiLySave').onclick = saveLyricsFile;
@@ -1029,8 +1012,6 @@ function openAiLyricsModal() {
     q('#aiLyNote').textContent = '';
     setButtonState('btnAiLyrics', 'btn-processing');
 
-    // The server gives no real percentage, so show a moving bar plus the
-    // elapsed time - proof the AI is still working.
     const prog = q('#aiLyProg'), bar = q('#aiLyBar'), ptxt = q('#aiLyProgText');
     const t0 = Date.now();
     let pos = 0, dirn = 1;
@@ -1074,7 +1055,6 @@ function openAiLyricsModal() {
       q('#aiLyNote').style.color = '';
       q('#aiLyNote').textContent = `${lines} sung lines. Edit anything you like, then press "Use in AI Song".`;
     } catch (e) {
-      // Keep the error INSIDE this window (a corner toast vanishes after a few seconds).
       let msg = e.message || String(e);
       if (/failed to fetch|networkerror|load failed/i.test(msg)) {
         msg = 'The connection to the app was lost while waiting (is the app still running?). ' +
@@ -1112,11 +1092,7 @@ function openAiLyricsModal() {
   };
 }
 
-/* ---------- Floating hover tips ----------
-   Any element with data-tip="text" (or data-tip-from="#selector", which
-   reads live text from another element) shows a floating dialog box next
-   to the mouse while hovered / focused. Replaces always-visible helper
-   text so panels stay compact. */
+/* ---------- Floating hover tips ---------- */
 function initFloatingTips() {
   if (window._floatTipInit) return;
   window._floatTipInit = true;
@@ -1381,7 +1357,6 @@ function openCreateSongModal() {
 
   document.body.appendChild(modal);
 
-  // Auto-load whatever was last saved (see SONG_DRAFT_KEY note above).
   applySongFields(modal, loadSongDraft());
   applySongDirection(modal);
   modal.querySelector('#songLanguage').addEventListener('change', () => {
@@ -1396,7 +1371,6 @@ function openCreateSongModal() {
 
   modal.querySelector('#songBrowseOutput').onclick = () => browseRemote('songs');
 
-  /* ----- Arabic dialect dropdown: only shown when the song is Arabic ----- */
   function updateDialectVisibility() {
     const row = modal.querySelector('#songDialectRow');
     if (!row) return;
@@ -1409,14 +1383,13 @@ function openCreateSongModal() {
   modal.querySelector('#songLyrics').addEventListener('input', updateDialectVisibility);
   updateDialectVisibility();
 
-  /* ----- Estimated song length (mirrors the server's estimate) ----- */
   function updateLenNote() {
     const note = modal.querySelector('#songLenNote');
     const text = modal.querySelector('#songLyrics').value;
     const lang = modal.querySelector('#songLanguage').value;
     const isArabic = lang === 'ar' || (lang === 'auto' && /[\u0600-\u06FF\u0750-\u077F]{3}/.test(text));
-    const wps = isArabic ? 1.1 : 0.85;                 // seconds per sung word
-    let words = 0, secs = 12;                           // 12s = intro + outro
+    const wps = isArabic ? 1.1 : 0.85;
+    let words = 0, secs = 12;
     text.split(/\r?\n/).forEach(line => {
       const t = line.trim();
       if (!t) return;
@@ -1438,7 +1411,6 @@ function openCreateSongModal() {
   }
   modal.querySelector('#songLyrics').addEventListener('input', updateLenNote);
 
-  /* ----- Load lyrics from a text file on this computer ----- */
   const lyricsFile = modal.querySelector('#songLyricsFile');
   modal.querySelector('#songLyricsPick').onclick = () => lyricsFile.click();
   lyricsFile.onchange = async () => {
@@ -1465,7 +1437,6 @@ function openCreateSongModal() {
     lyricsFile.value = '';
   };
 
-  /* ----- Named saved setups (stored on the server, per user) ----- */
   const presetSelect = modal.querySelector('#songPresetSelect');
   const presetLyricsBox = modal.querySelector('#songPresetLyrics');
 
@@ -1487,7 +1458,6 @@ function openCreateSongModal() {
         : '<option value="">- none saved yet -</option>';
       if (selectName) presetSelect.value = selectName;
       else if (pickLast && list.length) {
-        // Startup: select the setup used last time (else the newest saved one).
         const wanted = data.last && list.some(p => p.name === data.last) ? data.last : list[0].name;
         presetSelect.value = wanted;
       }
@@ -1522,15 +1492,11 @@ function openCreateSongModal() {
   async function loadSelectedPreset(fromDropdown, quiet, replace) {
     const name = presetSelect.value;
     if (!name) {
-      // Auto-load on the dropdown ignores the placeholder entries silently.
       if (!fromDropdown) showNotice('Pick a saved setup first', 'warn');
       return;
     }
     try {
       const data = await presetApi('/api/song_presets/' + encodeURIComponent(name));
-      // Merge, so a setup saved without lyrics does not wipe the lyrics you have typed.
-      // replace=true (startup): every field comes from the setup, nothing stale is kept.
-      // Otherwise merge, so a setup saved without lyrics keeps what you typed.
       const base = replace ? Object.assign({}, SETUP_DEFAULTS) : readSongFields(modal);
       applySongFields(modal, Object.assign(base, data.settings || {}));
       applySongDirection(modal);
@@ -1544,9 +1510,7 @@ function openCreateSongModal() {
     }
   }
 
-  // Picking a setup in the dropdown loads it straight away and fills the fields.
   presetSelect.addEventListener('change', () => loadSelectedPreset(true));
-  // The Load button still works (handy to reload the same setup after editing).
   modal.querySelector('#songPresetLoad').onclick = () => loadSelectedPreset(false);
 
   modal.querySelector('#songPresetDelete').onclick = async () => {
@@ -1562,10 +1526,6 @@ function openCreateSongModal() {
     }
   };
 
-  // Startup: select the last-used setup and load ALL of its data (title, lyrics, style,
-  // singer, instruments, ...) so the dropdown name always matches what is in the boxes.
-  // The one exception: lyrics just sent over from the AI Lyrics window. Those are shown,
-  // and the dropdown says "current draft" so it never names a setup that is not loaded.
   const freshDraft = !!window.__songDraftFresh;
   window.__songDraftFresh = false;
   refreshPresets(null, true).then(name => {
@@ -1600,8 +1560,6 @@ function openCreateSongModal() {
     showNotice('Song fields cleared', 'success');
   };
 
-  // MusicGen has no lyrics/vocals input at all — make that obvious right
-  // in the modal instead of letting people discover it after a job runs.
   const backendSelect = modal.querySelector('#songBackend');
   const backendNote = modal.querySelector('#songBackendNote');
   const updateBackendNote = () => {
@@ -1616,11 +1574,9 @@ function openCreateSongModal() {
   const backingBox = modal.querySelector('#songBackingBox');
   const backingFile = modal.querySelector('#songBackingFile');
   const voiceFile = modal.querySelector('#songVoiceFile');
-  // Own backing track / voice reference are ACE-Step features (MusicGen has no vocals).
   const usingBacking = () => backendSelect.value === 'ace' && musicSource.value === 'backing';
   const updateStemsVisibility = () => {
     const isAce = backendSelect.value === 'ace';
-    // The separate "backtrack" copy is pointless when the user brought the music.
     const show = isAce && !usingBacking();
     stemsRow.style.display = show ? 'block' : 'none';
     musicRow.style.display = isAce ? '' : 'none';
@@ -1632,7 +1588,6 @@ function openCreateSongModal() {
   updateStemsVisibility();
   updateBackendNote();
 
-  /* ----- audio file pickers (backing track + voice reference) ----- */
   const MAX_SONG_AUDIO_MB = 150;
   let backingUrl = null;
   const backingNameEl = modal.querySelector('#songBackingName');
@@ -1666,7 +1621,7 @@ function openCreateSongModal() {
     }
     backingNameEl.textContent = fileLabel(f);
     backingUrl = URL.createObjectURL(f);
-    backingPlayer.src = backingUrl;               // lets the user check it is the right track
+    backingPlayer.src = backingUrl;
     backingPlayer.style.display = 'block';
   };
   modal.querySelector('#songVoicePick').onclick = () => voiceFile.click();
@@ -1725,12 +1680,11 @@ function openCreateSongModal() {
                         mix_original: modal.querySelector('#songMixOriginal').checked };
       let init;
       if (ownTrack || voiceSample) {
-        // Audio attached -> multipart: the usual fields travel as one JSON "payload".
         const fd = new FormData();
         fd.append('payload', JSON.stringify(payload));
         if (ownTrack) fd.append('backing_track', ownTrack);
         if (voiceSample) fd.append('voice_ref', voiceSample);
-        init = { method: 'POST', body: fd };          // browser sets the multipart header
+        init = { method: 'POST', body: fd };
         setStatus('Uploading audio...');
       } else {
         init = { method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1790,11 +1744,9 @@ setStatus('Ready');
 lockButtons(false);
 resetAllButtonStates();
 
-// Persist setting changes so they survive reloads
 ['language', 'model', 'chordMethod', 'useDemucs'].forEach(id => {
   const el = $(id);
   if (el) el.addEventListener('change', saveSession);
 });
 
-// Restore whatever the user was doing before they closed the browser
 restoreSession();

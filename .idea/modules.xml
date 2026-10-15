@@ -8,6 +8,7 @@
       <module fileurl="file://$PROJECT_DIR$/.idea/ace-step@2.iml" filepath="$PROJECT_DIR$/.idea/ace-step@2.iml" />
       <module fileurl="file://$PROJECT_DIR$/.idea/nano-vllm.iml" filepath="$PROJECT_DIR$/.idea/nano-vllm.iml" />
       <module fileurl="file://$PROJECT_DIR$/.idea/nano-vllm@1.iml" filepath="$PROJECT_DIR$/.idea/nano-vllm@1.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/nano-vllm@2.iml" filepath="$PROJECT_DIR$/.idea/nano-vllm@2.iml" />
     </modules>
   </component>
 </project>
