@@ -20,12 +20,13 @@ from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash
 from subtitle_engine import SubtitleEngine
 from user_store import load_users as _load_users_enc, save_users as _save_users_enc
+from app_paths import data_dir, migrate_legacy_data, get_secret_key
 
 # ============================================================
 # APP CONFIG
 # ============================================================
 app = Flask(__name__)
-app.secret_key = "change-this-secret-key-to-something-random"
+app.secret_key = get_secret_key()   # random per install, stored in the data folder
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 app.config["TEMPLATES_AUTO_RELOAD"] = True
 app.jinja_env.auto_reload = True
@@ -44,15 +45,22 @@ def _app_root() -> Path:
     return Path(__file__).resolve().parent
 
 
-BASE_DIR = _app_root()
-UPLOAD_DIR = BASE_DIR / "uploads"
-OUTPUT_DIR = BASE_DIR / "outputs"
-ASSETS_DIR = BASE_DIR / "assets"
-USERS_FILE = BASE_DIR / "users.json"
-JOBS_DIR = BASE_DIR / "jobs"
+BASE_DIR = _app_root()             # PROGRAM files (read-only when installed)
+DATA_DIR = data_dir()              # everything the app WRITES (see app_paths.py)
+ASSETS_DIR = BASE_DIR / "assets"   # ships with the program
 
-for d in (UPLOAD_DIR, OUTPUT_DIR, ASSETS_DIR, JOBS_DIR):
-    d.mkdir(exist_ok=True)
+# First run after upgrading from the old layout: bring users.json, uploads,
+# outputs etc. over from next to the program into the data folder.
+for _m in migrate_legacy_data(BASE_DIR, DATA_DIR):
+    print(_m, flush=True)
+
+UPLOAD_DIR = DATA_DIR / "uploads"
+OUTPUT_DIR = DATA_DIR / "outputs"
+USERS_FILE = DATA_DIR / "users.json"
+JOBS_DIR = DATA_DIR / "jobs"
+
+for d in (UPLOAD_DIR, OUTPUT_DIR, JOBS_DIR):
+    d.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_ADMIN_PASSWORD = "change-me-now"
 if not USERS_FILE.exists():
@@ -232,10 +240,49 @@ def verify_password(password: str, stored) -> bool:
     return False
 
 
+_USERS_CACHE = {"mtime": None, "users": None}
+
+
+def _users_cached():
+    """users.json parsed, re-read only when the file changes (cheap per request)."""
+    m = USERS_FILE.stat().st_mtime_ns
+    c = _USERS_CACHE
+    if c["mtime"] != m or c["users"] is None:
+        c["users"] = _load_users_enc(USERS_FILE)   # may raise
+        c["mtime"] = m
+    return c["users"]
+
+
+def _session_is_valid() -> bool:
+    """
+    True if someone is logged in AND still exists in users.json.
+    Also refreshes the role, so a demoted admin loses admin rights at once and a
+    deleted user is logged out on their next click, instead of staying in for
+    the 7-day cookie lifetime.
+    If users.json is momentarily unreadable (e.g. the manager is saving it) the
+    session is trusted rather than kicking everybody out.
+    """
+    name = session.get("user")
+    if not name:
+        return False
+    try:
+        users = _users_cached()
+    except Exception:
+        return True
+    if not users:
+        return True
+    stored = users.get(name)
+    if stored is None:
+        session.clear()
+        return False
+    session["role"] = get_role(stored)
+    return True
+
+
 def login_required(f):
     @wraps(f)
     def wrapper(*a, **k):
-        if not session.get("user"):
+        if not _session_is_valid():
             return redirect(url_for("login"))
         return f(*a, **k)
 
@@ -245,7 +292,7 @@ def login_required(f):
 def admin_required(f):
     @wraps(f)
     def wrapper(*a, **k):
-        if not session.get("user"):
+        if not _session_is_valid():
             return redirect(url_for("login"))
         if session.get("role") != "admin":
             return jsonify(error="Admin access required"), 403
@@ -261,14 +308,23 @@ def user_dirs(username: str):
     o.mkdir(parents=True, exist_ok=True)
     return u, o
 
-def get_song_output_dir(username, song_title):
+# Production-folder suffixes, chosen by which process/button is running.
+AI_SONG_PRODUCTION = "_Ai_Song_Production"
+KARAOKE_PRODUCTION = "_Karaoke_Production"
+
+
+def get_song_output_dir(username, song_title, production=""):
     """
     Generates a standardized output directory:
-    outputs/<user>/<Song_Title>/
+    outputs/<user>/<Song_Title>/                      (no production)
+    outputs/<user>/<Song_Title>_Ai_Song_Production/   (AI song process)
+    outputs/<user>/<Song_Title>_Karaoke_Production/   (karaoke process)
     Returns the base run directory.
     """
     _, outdir = user_dirs(username)
     safe_title = secure_filename(song_title) or "Unknown_Song"
+    # Always built from the CURRENT title, then the process-specific suffix.
+    safe_title = safe_title + production
 
     run_dir = outdir / safe_title                   # ← no timestamp
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -1707,7 +1763,7 @@ def _run_video_job(job_id, input_path, srt_path, background_path, keep_vocals):
 
         stem = Path(input_path).stem
         # NEW: Use structured output directory
-        run_dir = get_song_output_dir(user, stem)
+        run_dir = get_song_output_dir(user, stem, KARAOKE_PRODUCTION)
         video_folder = run_dir / "Karaoke"
         video_folder.mkdir(parents=True, exist_ok=True)
 
@@ -1920,7 +1976,7 @@ def _ace_find_launcher():
     if custom:
         return (custom, str(BASE_DIR))
 
-    roots = [BASE_DIR, BASE_DIR.parent, Path.cwd()]
+    roots = [BASE_DIR, BASE_DIR.parent, DATA_DIR, Path.cwd()]
     if os.environ.get("MUSIC_STUDIO_INSTALL_DIR"):
         roots.append(Path(os.environ["MUSIC_STUDIO_INSTALL_DIR"]))
 
@@ -1973,7 +2029,7 @@ def _ace_start_server():
                 kw["creationflags"] = subprocess.CREATE_NEW_CONSOLE
             else:
                 kw["start_new_session"] = True
-                kw["stdout"] = open(BASE_DIR / "ace_step_server.log", "ab")
+                kw["stdout"] = open(DATA_DIR / "ace_step_server.log", "ab")
                 kw["stderr"] = subprocess.STDOUT
             _ACE_PROC = subprocess.Popen(cmd, **kw)
             _ACE_STARTED_AT = time.time()
@@ -3368,7 +3424,9 @@ _LYRIC_LANG_NAMES = {"ar": "Arabic", "en": "English", "zh": "Chinese", "ja": "Ja
 def _lyrics_ai_settings():
     vals = {}
     try:
-        f = BASE_DIR / "lyrics_ai.env"
+        f = DATA_DIR / "lyrics_ai.env"
+        if not f.exists():
+            f = BASE_DIR / "lyrics_ai.env"   # legacy location
         if f.exists():
             for line in f.read_text(encoding="utf-8-sig").splitlines():
                 line = line.strip()
@@ -3434,7 +3492,7 @@ def _llm_complete(system, user, max_tokens=1200, timeout=None):
         key = api_key
         if not key:
             raise RuntimeError("No Anthropic key found. Put ANTHROPIC_API_KEY=sk-ant-... in "
-                               "lyrics_ai.env next to the app, or use a local model with "
+                               "lyrics_ai.env in the Music Studio data folder, or use a local model with "
                                "LYRICS_LLM_PROVIDER=ollama.")
         url = "https://api.anthropic.com/v1/messages"
         body = {"model": model_name or "claude-sonnet-5-5", "max_tokens": max_tokens,
@@ -3443,7 +3501,7 @@ def _llm_complete(system, user, max_tokens=1200, timeout=None):
                    "anthropic-version": "2023-06-01"}
     else:
         raise RuntimeError("No lyrics AI is configured. Create a file named lyrics_ai.env next "
-                           f"to the app ({BASE_DIR}) containing the line "
+                           f"in {DATA_DIR} containing the line "
                            "ANTHROPIC_API_KEY=sk-ant-... (or LYRICS_LLM_PROVIDER=ollama).")
 
     req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"),
@@ -3537,7 +3595,7 @@ def lyrics_ai_key():
     if not key.startswith("sk-ant-") or len(key) < 30 or any(c.isspace() for c in key):
         return jsonify(error="That is not an Anthropic key. It is one long string "
                              "starting with sk-ant- (create it at console.anthropic.com)."), 400
-    f = BASE_DIR / "lyrics_ai.env"
+    f = DATA_DIR / "lyrics_ai.env"
     lines = []
     try:
         if f.exists():
@@ -3712,7 +3770,7 @@ def _run_create_song_job(job_id, title, lyrics, style, instruments, singer, back
         stem = secure_filename(title) or "song"
 
         # NEW: Use structured output directory
-        run_dir = get_song_output_dir(user, stem)
+        run_dir = get_song_output_dir(user, stem, AI_SONG_PRODUCTION)
         songs_folder = run_dir / "Songs"
         songs_folder.mkdir(parents=True, exist_ok=True)
 
@@ -4056,6 +4114,198 @@ def browse_folder(kind):
     return jsonify(ok=True, opened=False, path=" & ".join(folder_names), files=files)
 
 
+# # ============================================================
+# # Audio_Editor LAUNCHER
+# # ============================================================
+# Audio_Editor_ENV_PATH = os.environ.get("Audio_Editor_PATH", "").strip()
+#
+#
+# def _find_Audio_Editor():
+#     """Return a command list that starts Audio_Editor, or None if not installed.
+#     Set the Audio_Editor_PATH environment variable to force a specific location."""
+#     if Audio_Editor_ENV_PATH and Path(Audio_Editor_ENV_PATH).exists():
+#         return [Audio_Editor_ENV_PATH]
+#
+#     if sys.platform.startswith("win"):
+#         roots = [os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)"),
+#                  os.environ.get("LOCALAPPDATA")]
+#         for root in filter(None, roots):
+#             for sub in ("Audio_Editor", "Programs/Audio_Editor"):
+#                 exe = Path(root) / sub / "Audio_Editor.exe"
+#                 if exe.exists():
+#                     return [str(exe)]
+#         found = shutil.which("Audio_Editor")
+#         return [found] if found else None
+#
+#     if sys.platform == "darwin":
+#         for app_dir in ("/Applications/Audio_Editor.app",
+#                         str(Path.home() / "Applications/Audio_Editor.app")):
+#             if Path(app_dir).exists():
+#                 return ["open", "-a", app_dir]
+#         return None
+#
+#     found = shutil.which("Audio_Editor")
+#     if found:
+#         return [found]
+#     if shutil.which("flatpak"):
+#         try:
+#             r = subprocess.run(["flatpak", "info", "org.Audio_Editorteam.Audio_Editor"],
+#                                capture_output=True, timeout=5)
+#             if r.returncode == 0:
+#                 return ["flatpak", "run", "org.Audio_Editorteam.Audio_Editor"]
+#         except Exception:
+#             pass
+#     if shutil.which("snap") and Path("/snap/bin/Audio_Editor").exists():
+#         return ["/snap/bin/Audio_Editor"]
+#     return None
+#
+#
+# @app.route("/api/open_Audio_Editor", methods=["POST"])
+# @login_required
+# def open_Audio_Editor():
+#     """Start Audio_Editor on the machine running this program.
+#     Optional JSON body: {"path": "<file under your outputs or uploads folder>"}
+#     opens that audio file in Audio_Editor."""
+#     if not _is_local_request():
+#         return jsonify(error="Audio_Editor can only be started from the computer "
+#                              "that is running this program."), 403
+#
+#     cmd = _find_Audio_Editor()
+#     if not cmd:
+#         return jsonify(error="Audio_Editor was not found. Install it from "
+#                              "Audio_Editorteam.org, or set the Audio_Editor_PATH "
+#                              "environment variable to its Audio_Editor.exe."), 404
+#
+#     data = request.get_json(silent=True) or {}
+#     rel = (data.get("path") or "").strip()
+#     if rel:
+#         updir, outdir = user_dirs(session["user"])
+#         target = None
+#         for base in (outdir, updir):
+#             cand = (base / rel).resolve()
+#             if (base.resolve() in cand.parents) and cand.is_file():
+#                 target = cand
+#                 break
+#         if target is None:
+#             return jsonify(error="That audio file was not found."), 404
+#         cmd = cmd + [str(target)]
+#
+#     try:
+#         kwargs = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
+#                   "stderr": subprocess.DEVNULL}
+#         if sys.platform.startswith("win"):
+#             kwargs["creationflags"] = (subprocess.DETACHED_PROCESS |
+#                                        subprocess.CREATE_NEW_PROCESS_GROUP)
+#         else:
+#             kwargs["start_new_session"] = True
+#         subprocess.Popen(cmd, **kwargs)
+#     except Exception as e:
+#         return jsonify(error=f"Could not start Audio_Editor: {e}"), 500
+#     return jsonify(ok=True)
+
+# ============================================================
+# STUDIO AUDIO EDITOR LAUNCHER 
+# ============================================================
+AUDIO_EDITOR = BASE_DIR / "studio_audio_editor.py"
+STUDIO_EDITOR_ENV_PATH = os.environ.get("STUDIO_EDITOR_PATH", "").strip()
+
+
+def _editor_script():
+    """Locate studio_audio_editor.py next to the app (or at the env override)."""
+    if STUDIO_EDITOR_ENV_PATH:
+        p = Path(STUDIO_EDITOR_ENV_PATH)
+        if p.is_file():
+            return p
+    for candidate in (AUDIO_EDITOR, BASE_DIR / "tools" / "studio_audio_editor.py"):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _python_for_gui():
+    """On Windows prefer pythonw.exe so no console window pops up."""
+    if sys.platform.startswith("win"):
+        pythonw = Path(sys.executable).with_name("pythonw.exe")
+        if pythonw.is_file():
+            return str(pythonw)
+    return sys.executable
+
+
+def _missing_editor_deps():
+    import importlib.util
+    missing = []
+    for mod in ("numpy", "scipy", "soundfile", "sounddevice", "tkinter"):
+        if importlib.util.find_spec(mod) is None:
+            missing.append(mod)
+    return missing
+
+
+@app.route("/api/open_editor", methods=["POST"])
+@login_required
+def open_editor():
+    """Start studio_audio_editor.py on the machine running this program.
+    Optional JSON body: {"path": "<file under your uploads or outputs>"}
+    opens that audio file in the editor."""
+    if not _is_local_request():
+        return jsonify(error="The audio editor can only be started from the "
+                             "computer that is running this program."), 403
+
+    script = _editor_script()
+    if script is None:
+        return jsonify(error="studio_audio_editor.py was not found next to app.py. "
+                             "Put it in the same folder as the program, or set the "
+                             "STUDIO_EDITOR_PATH environment variable to its full path."), 404
+
+    missing = _missing_editor_deps()
+    if missing:
+        return jsonify(error="The audio editor needs these Python packages: "
+                             + ", ".join(missing)
+                             + ". Install with: pip install "
+                             + " ".join(p for p in missing if p != "tkinter")), 500
+
+    # Headless Linux check: Tkinter needs a display
+    if sys.platform.startswith("linux"):
+        if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+            return jsonify(error="The audio editor needs a desktop session "
+                                 "(no DISPLAY / WAYLAND_DISPLAY set)."), 500
+
+    data = request.get_json(silent=True) or {}
+    rel = (data.get("path") or "").strip()
+
+    cmd = [_python_for_gui(), str(script)]
+    target = None
+    if rel:
+        updir, outdir = user_dirs(session["user"])
+        for base in (outdir, updir):
+            base_r = base.resolve()
+            cand = (base / rel).resolve()
+            if (base_r == cand or base_r in cand.parents) and cand.is_file():
+                target = cand
+                break
+        if target is None:
+            return jsonify(error="That audio file was not found."), 404
+        cmd.append(str(target))
+
+    try:
+        kwargs = {"cwd": str(BASE_DIR),
+                  "stdin": subprocess.DEVNULL,
+                  "stdout": subprocess.DEVNULL,
+                  "stderr": subprocess.DEVNULL}
+        if sys.platform.startswith("win"):
+            kwargs["creationflags"] = (subprocess.DETACHED_PROCESS |
+                                       subprocess.CREATE_NEW_PROCESS_GROUP)
+        else:
+            kwargs["start_new_session"] = True
+        subprocess.Popen(cmd, **kwargs)
+    except Exception as e:
+        return jsonify(error=f"Could not start the audio editor: {e}"), 500
+    return jsonify(ok=True, script=str(script),
+                   opened=str(target) if target else None)
+
+
+# Backwards-compatible alias so existing buttons keep working.
+app.add_url_rule("/api/open_Audio_Editor", "open_Audio_Editor",
+                 open_editor, methods=["POST"])
 def _lan_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:

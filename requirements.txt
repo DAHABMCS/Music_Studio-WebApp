@@ -18,7 +18,8 @@ librosa
 music21
 reportlab
 pillow
-
+soundfile
+sounddevice
 demucs                     # vocal / backtrack separation
 transformers               # also used for MusicGen
 safetensors
