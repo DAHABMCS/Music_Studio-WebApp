@@ -15,7 +15,7 @@ python -c "import sys;sys.exit(0 if sys.version_info>=(3,10) else 1)"
 if errorlevel 1 ( echo [ERROR] Python 3.10 or newer is required to build. & goto :fail )
 
 rem ---- 2. Required project files -------------------------------------------------------
-for %%F in (launcher.py MusicStudio.spec collect_prereqs.py check_requirements.py verify_dist.py app.py requirements.txt) do (
+for %%F in (launcher.py MusicStudio.spec collect_prereqs.py check_requirements.py verify_dist.py app.py app_paths.py user_store.py Securit_Management.py requirements.txt) do (
   if not exist "%%F" ( echo [ERROR] Missing file in the project root: %%F & goto :fail )
 )
 for %%D in (templates static) do (
@@ -23,6 +23,10 @@ for %%D in (templates static) do (
 )
 if exist "MUSIC-STUDIO-WebbApp.spec" echo [note] The old MUSIC-STUDIO-WebbApp.spec is NOT used any more - MusicStudio.spec replaces it.
 if not exist "extras\README.txt" echo [note] extras\ folder not found - README / ACE-Step scripts will not be added to the installer.
+
+rem ---- 2b. Catch syntax errors now, not after a 20-minute build ------------------------
+python -m py_compile app.py app_paths.py user_store.py Securit_Management.py
+if errorlevel 1 ( echo [ERROR] A project .py file has a syntax error - fix it and run again & goto :fail )
 
 rem ---- 3. Collect what the installer ships (ffmpeg + VC++ runtime) ---------------------
 echo.
@@ -92,6 +96,7 @@ rem files users should SEE next to the exe
 if exist "extras\README.txt"           copy /y "extras\README.txt"           "dist\MusicStudio\" >nul
 if exist "extras\start_ace_step.bat"   copy /y "extras\start_ace_step.bat"   "dist\MusicStudio\" >nul
 if exist "extras\install_ace_step.bat" copy /y "extras\install_ace_step.bat" "dist\MusicStudio\" >nul
+if exist "extras\install_optional_tools.bat" copy /y "extras\install_optional_tools.bat" "dist\MusicStudio\" >nul
 
 rem ---- 6. Installer (Inno Setup) or portable zip ---------------------------------------
 echo.
@@ -121,10 +126,10 @@ goto :end
 echo.
 echo *** BUILD FAILED ***
 endlocal
-pause
+if not defined NOPAUSE pause
 exit /b 1
 
 :end
 endlocal
-pause
+if not defined NOPAUSE pause
 exit /b 0

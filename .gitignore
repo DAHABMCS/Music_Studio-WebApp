@@ -56,4 +56,5 @@ Thumbs.db
 
 # Third-party drop-ins
 ACE-Step/
-ACE-Step-1.5/
+ACE-Step-1.5/users.json.key
+users.json

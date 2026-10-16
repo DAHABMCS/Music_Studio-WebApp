@@ -33,6 +33,7 @@ need to install it separately, e.g.:
 import os
 import sys
 import tkinter as tk
+from pathlib import Path
 from datetime import datetime
 from tkinter import ttk, messagebox, simpledialog
 
@@ -57,19 +58,15 @@ except ImportError:
     )
     sys.exit(1)
 
+# Shared with app.py so both programs always use the same data folder.
+from app_paths import data_dir, program_dir, migrate_legacy_data
+
 DEFAULT_FILE = "users.json"
 
 
 def default_users_path() -> str:
-    """users.json living next to this script (or next to the .exe, when frozen)."""
-    if getattr(sys, "frozen", False):
-        # Running as a packaged .exe (PyInstaller etc.) — __file__ can point
-        # into a bundle-internal location that doesn't match where the .exe
-        # itself sits on disk. sys.executable is the reliable one here.
-        script_dir = os.path.dirname(os.path.abspath(sys.executable))
-    else:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(script_dir, DEFAULT_FILE)
+    """users.json in the shared Music Studio data folder (same one app.py uses)."""
+    return str(data_dir() / DEFAULT_FILE)
 
 
 # --------------------------------------------------------------------------
@@ -123,9 +120,10 @@ class EditUserDialog(simpledialog.Dialog):
         row += 1
 
         ttk.Label(master, text="Role:").grid(row=row, column=0, sticky="w", pady=4)
-        self.role_entry = ttk.Entry(master, width=30)
+        # Dropdown so a typo can never create a user with a role the app ignores.
+        self.role_entry = ttk.Combobox(master, width=28, values=("user", "admin"), state="readonly")
         self.role_entry.grid(row=row, column=1, pady=4)
-        self.role_entry.insert(0, self.current_role)
+        self.role_entry.set(self.current_role if self.current_role in ("user", "admin") else "user")
         row += 1
 
         self.change_pw_var = tk.BooleanVar(value=(self.existing_username is None))
@@ -304,6 +302,26 @@ class UserManagerApp(tk.Tk):
             return None
         return sel[0]
 
+    # ---- helpers for safe edits ----
+
+    def _other_admins(self, username: str) -> int:
+        return sum(1 for n, i in self.users.items()
+                   if n != username and i.get("role") == "admin")
+
+    def _rename_user_folders(self, old: str, new: str):
+        """Rename uploads/<old> and outputs/<old> so a renamed user keeps their files."""
+        base = Path(self.path).parent
+        done = []
+        for sub in ("uploads", "outputs"):
+            src, dst = base / sub / old, base / sub / new
+            if src.is_dir() and not dst.exists():
+                try:
+                    src.rename(dst)
+                    done.append(sub)
+                except OSError:
+                    pass
+        return done
+
     # ---- actions ----
 
     def action_add(self):
@@ -340,6 +358,11 @@ class UserManagerApp(tk.Tk):
             messagebox.showerror("Error", f"User '{new_username}' already exists.")
             return
 
+        if (self.users[old_username].get("role") == "admin" and dlg.result_role != "admin"
+                and self._other_admins(old_username) == 0):
+            messagebox.showerror("Error", "You cannot remove admin rights from the last admin.")
+            return
+
         info = self.users.pop(old_username)
         info["role"] = dlg.result_role
         if dlg.result_password is not None:
@@ -349,16 +372,29 @@ class UserManagerApp(tk.Tk):
 
         if self._save():
             self._refresh_table()
+            note = ""
             if new_username != old_username:
                 self.tree.selection_set(new_username)
-            self._set_status(f"Updated user '{new_username}'.")
+                if messagebox.askyesno(
+                    "Rename files too?",
+                    f"Also rename the uploads/outputs folders of '{old_username}' to "
+                    f"'{new_username}' so the user keeps their files?"
+                ):
+                    moved = self._rename_user_folders(old_username, new_username)
+                    note = f" Renamed folders: {', '.join(moved) or 'none found'}."
+            self._set_status(f"Updated user '{new_username}'.{note}")
 
     def action_delete(self):
         username = self._selected_username()
         if not username:
             return
+        if self.users[username].get("role") == "admin" and self._other_admins(username) == 0:
+            messagebox.showerror("Error", "You cannot delete the last admin.")
+            return
         if not messagebox.askyesno(
-            "Confirm delete", f"Delete user '{username}'? This cannot be undone (though a backup file is kept)."
+            "Confirm delete",
+            f"Delete user '{username}'? This cannot be undone (though a backup file is kept). "
+            "Their uploaded and generated files are NOT deleted."
         ):
             return
         del self.users[username]
@@ -398,6 +434,14 @@ class UserManagerApp(tk.Tk):
 
 
 def main():
+    if len(sys.argv) <= 1:
+        # Same one-time move app.py does, so whichever program starts first
+        # brings the old users.json over instead of starting a fresh one.
+        try:
+            for _m in migrate_legacy_data(program_dir(), data_dir()):
+                print(_m)
+        except Exception as _e:
+            print(f"[migrate] skipped: {_e}", file=sys.stderr)
     path = sys.argv[1] if len(sys.argv) > 1 else default_users_path()
 
     # --- DIAGNOSTIC: prove exactly which users.json this GUI is pointed
