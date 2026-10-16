@@ -4330,7 +4330,6 @@ def _open_browser(port):
             except OSError:
                 time.sleep(0.3)
         webbrowser.open(url)
-
     threading.Thread(target=_wait_and_open, daemon=True).start()
 
 
