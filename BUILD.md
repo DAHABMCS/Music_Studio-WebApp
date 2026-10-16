@@ -1,6 +1,6 @@
 # Building the Music Studio installer
 
-Everything below happens in your **project root** (the folder with `app.py`, `templates\`, `static\`).
+Everything below happens in your **project root** (the folder with `app_old.py`, `templates\`, `static\`).
 
 ## 1. Put the files in the root
 Copy the contents of `deploy\` into the project root, so you have:

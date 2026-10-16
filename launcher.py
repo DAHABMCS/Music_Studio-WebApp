@@ -36,7 +36,7 @@ from pathlib import Path
 
 # ----------------------------------------------------------------------------- settings
 APP_NAME = "Music Studio"
-APP_VERSION = "1.0.1"                 # BUMP THIS on every release -> users get re-synced
+APP_VERSION = "1.0.3"                 # BUMP THIS on every release -> users get re-synced
 PORT = 8000                           # app.py serves on 8000 (waitress)
 
 PYTHON_VERSION = "3.11.9"
@@ -153,6 +153,8 @@ def app_env(device="cpu") -> dict:
                      ("mpl", "MPLCONFIGDIR")):
         env.setdefault(var, str(cache / sub))
     env["MUSIC_STUDIO_MANAGED"] = "1"                 # tells app.py its old bootstrap is not needed
+    if getattr(sys, "frozen", False):                 # where Setup put MusicStudio.exe, start_ace_step.bat ...
+        env["MUSIC_STUDIO_INSTALL_DIR"] = str(Path(sys.executable).resolve().parent)
     env["MUSIC_STUDIO_DEVICE"] = "cuda" if device == "cuda" else "cpu"
     if device != "cuda":
         env["CUDA_VISIBLE_DEVICES"] = ""
