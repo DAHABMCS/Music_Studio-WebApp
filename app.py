@@ -4332,7 +4332,6 @@ def _open_browser(port):
         webbrowser.open(url)
     threading.Thread(target=_wait_and_open, daemon=True).start()
 
-
 if __name__ == "__main__":
     ip = _lan_ip()
 
