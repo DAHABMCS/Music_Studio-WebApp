@@ -15,7 +15,7 @@ python -c "import sys;sys.exit(0 if sys.version_info>=(3,10) else 1)"
 if errorlevel 1 ( echo [ERROR] Python 3.10 or newer is required to build. & goto :fail )
 
 rem ---- 2. Required project files -------------------------------------------------------
-for %%F in (launcher.py MusicStudio.spec Securit_Management.spec collect_prereqs.py check_requirements.py verify_dist.py app.py app_paths.py user_store.py Securit_Management.py requirements.txt) do (
+for %%F in (launcher.py MusicStudio.spec Securit_Management.spec StudioEditor.spec studio_audio_editor.py collect_prereqs.py check_requirements.py verify_dist.py app.py app_paths.py user_store.py Securit_Management.py requirements.txt) do (
   if not exist "%%F" ( echo [ERROR] Missing file in the project root: %%F & goto :fail )
 )
 for %%D in (templates static) do (
@@ -25,7 +25,7 @@ if exist "MUSIC-STUDIO-WebbApp.spec" echo [note] The old MUSIC-STUDIO-WebbApp.sp
 if not exist "extras\README.txt" echo [note] extras\ folder not found - README / ACE-Step scripts will not be added to the installer.
 
 rem ---- 2b. Catch syntax errors now, not after a 20-minute build ------------------------
-python -m py_compile app.py app_paths.py user_store.py Securit_Management.py
+python -m py_compile app.py app_paths.py user_store.py Securit_Management.py studio_audio_editor.py
 if errorlevel 1 ( echo [ERROR] A project .py file has a syntax error - fix it and run again & goto :fail )
 
 rem ---- 3. Collect what the installer ships (ffmpeg + VC++ runtime) ---------------------
@@ -100,6 +100,19 @@ if errorlevel 1 ( echo [ERROR] User Manager build failed & goto :fail )
 if not exist "build\um_dist\UserManager\Securit_Management.exe" ( echo [ERROR] Securit_Management.exe was not created & goto :fail )
 xcopy /e /i /y /q "build\um_dist\UserManager" "dist\MusicStudio\UserManager" >nul
 if errorlevel 1 ( echo [ERROR] Could not copy User Manager into dist & goto :fail )
+
+rem ---- 4c. Build the Studio audio editor from the CURRENT studio_audio_editor.py
+echo.
+echo [4c/5] Building Studio Editor ...
+if exist "build\ed_dist" rmdir /s /q "build\ed_dist"
+if exist "dist\MusicStudio\StudioEditor" rmdir /s /q "dist\MusicStudio\StudioEditor"
+"%BUILD_PY%" -m pip install numpy scipy soundfile sounddevice
+"%BUILD_PY%" -m PyInstaller --noconfirm --clean --distpath "build\ed_dist" --workpath "build\ed_work" StudioEditor.spec
+if errorlevel 1 ( echo [ERROR] Studio Editor build failed & goto :fail )
+if not exist "build\ed_dist\StudioEditor\StudioEditor.exe" ( echo [ERROR] StudioEditor.exe was not created & goto :fail )
+xcopy /e /i /y /q "build\ed_dist\StudioEditor" "dist\MusicStudio\StudioEditor" >nul
+if errorlevel 1 ( echo [ERROR] Could not copy Studio Editor into dist & goto :fail )
+for %%I in (studio_audio_editor.py) do echo [note] Editor source used: %%~fI  ^(%%~tI^)
 
 rem files users should SEE next to the exe
 if exist "extras\README.txt"           copy /y "extras\README.txt"           "dist\MusicStudio\" >nul
