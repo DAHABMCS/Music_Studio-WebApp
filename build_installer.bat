@@ -15,7 +15,7 @@ python -c "import sys;sys.exit(0 if sys.version_info>=(3,10) else 1)"
 if errorlevel 1 ( echo [ERROR] Python 3.10 or newer is required to build. & goto :fail )
 
 rem ---- 2. Required project files -------------------------------------------------------
-for %%F in (launcher.py MusicStudio.spec collect_prereqs.py check_requirements.py verify_dist.py app.py app_paths.py user_store.py Securit_Management.py requirements.txt) do (
+for %%F in (launcher.py MusicStudio.spec Securit_Management.spec collect_prereqs.py check_requirements.py verify_dist.py app.py app_paths.py user_store.py Securit_Management.py requirements.txt) do (
   if not exist "%%F" ( echo [ERROR] Missing file in the project root: %%F & goto :fail )
 )
 for %%D in (templates static) do (
@@ -91,6 +91,15 @@ if not exist "dist\MusicStudio\MusicStudio.exe" ( echo [ERROR] dist\MusicStudio\
 rem -- the payload inside dist must match the project files (catches a stale requirements.txt)
 python verify_dist.py
 if errorlevel 1 ( echo [ERROR] dist payload does not match the project files & goto :fail )
+
+rem ---- 4b. Build the User Manager (Securit_Management) and ship it inside the app folder
+echo.
+echo [4b/5] Building User Manager ...
+"%BUILD_PY%" -m PyInstaller --noconfirm --clean --distpath "build\um_dist" --workpath "build\um_work" Securit_Management.spec
+if errorlevel 1 ( echo [ERROR] User Manager build failed & goto :fail )
+if not exist "build\um_dist\UserManager\Securit_Management.exe" ( echo [ERROR] Securit_Management.exe was not created & goto :fail )
+xcopy /e /i /y /q "build\um_dist\UserManager" "dist\MusicStudio\UserManager" >nul
+if errorlevel 1 ( echo [ERROR] Could not copy User Manager into dist & goto :fail )
 
 rem files users should SEE next to the exe
 if exist "extras\README.txt"           copy /y "extras\README.txt"           "dist\MusicStudio\" >nul

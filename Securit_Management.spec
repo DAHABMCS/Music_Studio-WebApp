@@ -1,16 +1,22 @@
 # -*- mode: python ; coding: utf-8 -*-
-
+# User-manager GUI (Tkinter). Built as a one-folder app and shipped inside
+# dist\MusicStudio\UserManager\ by build_installer.bat.
 
 a = Analysis(
     ['Securit_Management.py'],
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=[],
+    hiddenimports=[
+        'user_store', 'app_paths',
+        'werkzeug.security',
+        'cryptography', 'cryptography.fernet',
+        'tkinter', 'tkinter.ttk', 'tkinter.messagebox', 'tkinter.simpledialog',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['flask', 'numpy', 'scipy', 'torch', 'matplotlib', 'pandas'],  # keep it small
     noarchive=False,
     optimize=0,
 )
@@ -25,8 +31,8 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
-    console=True,
+    upx=False,
+    console=False,          # GUI app: no black console window
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
@@ -38,7 +44,7 @@ coll = COLLECT(
     a.binaries,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
-    name='Securit_Management',
+    name='UserManager',
 )
