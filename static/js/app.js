@@ -329,7 +329,7 @@ async function uploadFile(file, kind = 'input') {
     if (kind === 'input') {
       state.uploaded = j;
       $('outputFilePath').value = j.srt_full_path || j.srt_path || (file.name.replace(/\.[^.]+$/, '') + '.srt');
-      state.srt = null;
+      if (!state.srtPinned) state.srt = null;   // keep an SRT loaded from Browse
     }
     saveSession();
     return j;
@@ -459,6 +459,7 @@ function handleResult(result) {
   }
   if (result.srt) {
     state.srt = result.srt;
+    state.srtPinned = false;
   }
   if (result.srt_abs && $('outputFilePath')) {
     $('outputFilePath').value = result.srt_abs;
@@ -572,6 +573,7 @@ $('btnStop').onclick = async () => {
 };
 
 $('btnClear').onclick = () => {
+  state.srtPinned = false;
   $('srtPreview').textContent = '—';
   setProgress(0);
   setStatus('Ready');
@@ -659,36 +661,322 @@ async function browseRemote(kind) {
   openBrowseModal(kind, data);
 }
 
+function _escAttr(v) {
+  return String(v).replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+                  .replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/* Folder (relative to the user's outputs) that contains a file group. */
+function _dirOfFile(f) {
+  return f.rel.slice(0, f.rel.length - f.name.length).replace(/\/$/, '');
+}
+
+/* Ask the server to open a folder in the file explorer (own computer only). */
+async function openOutputFolder(rel) {
+  try {
+    const r = await fetch('/api/open_output_folder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: rel || '' }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) showNotice(j.error || 'Could not open the folder', 'error');
+    else setStatus('Opened ' + (j.path && j.path !== '.' ? j.path : 'outputs') + ' folder');
+  } catch (e) {
+    showNotice('Could not open the folder: ' + e.message, 'error');
+  }
+}
+
+/* Load a saved SRT (from any song / run) into the preview and the app state. */
+async function loadSrtFromOutputs(rel) {
+  try {
+    const r = await fetch(`/api/output_preview?path=${encodeURIComponent(rel)}`);
+    if (!r.ok) throw new Error('file not found');
+    const text = await r.text();
+    $('srtPreview').textContent = text.slice(0, 8000);
+    state.srt = rel;
+    state.srtPinned = true;          // keep it when the matching input file is picked next
+    let shown = rel;
+    try {
+      const a = await (await fetch(`/api/output_abs?path=${encodeURIComponent(rel)}`)).json();
+      if (a && a.path) shown = a.path;
+    } catch (e) { /* keep the relative path */ }
+    if ($('outputFilePath')) $('outputFilePath').value = shown;
+    saveSession();
+    setStatus('Loaded SRT: ' + rel);
+    showNotice('SRT loaded.' + (state.uploaded ? '' :
+      '\nNow choose the matching Input File, then use Karaoke / Lyrics.'), 'success');
+  } catch (e) {
+    showNotice('Could not load SRT: ' + e.message, 'error');
+  }
+}
+
+const BROWSE_KIND_LABELS = {
+  srt: 'SRT', karaoke: 'Karaoke', songs: 'Music',
+  lyrics_tab: 'Lyrics, Tab & MP3', transcription: 'Transcription',
+};
+
+function _encPath(rel) { return encodeURIComponent(rel).replace(/%2F/g, '/'); }
+
+/* 2026-10-19_14-32-07 -> "2026-10-19  14:32:07" */
+function _prettyRun(run) {
+  const m = /^(\d{4}-\d{2}-\d{2})_(\d{2})-(\d{2})-(\d{2})(?:_\d+)?$/.exec(run || '');
+  return m ? `${m[1]}   ${m[2]}:${m[3]}:${m[4]}` : (run || '(earlier files)');
+}
+
+const AUDIO_EXT = /\.(wav|mp3|flac|ogg|oga|opus|m4a|aac|aif|aiff|wma)$/i;
+
+/* Start the Studio Audio Editor on this computer with an output file loaded. */
+async function openInAudioEditor(rel) {
+  try {
+    const r = await fetch('/api/open_editor', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: rel }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      showNotice(j.error || 'Could not open the audio editor', 'error');
+      return false;
+    }
+    setStatus('Opened in Studio Audio Editor: ' + rel.split('/').pop());
+    return true;
+  } catch (e) {
+    showNotice('Could not open the audio editor: ' + e.message, 'error');
+    return false;
+  }
+}
+
+/* Open one output file. Returns a promise: true = opened, false = failed.
+     - .srt            -> loaded straight into the app
+     - audio (local)   -> Studio Audio Editor, to play and review
+     - anything else   -> opens in a new browser tab
+   keepOpen: leave the Browse window open afterwards (used from the file list so
+   several tracks can be opened one after the other). */
+async function _openOutputFile(f, closeFn, local, keepOpen) {
+  if (/\.srt$/i.test(f.name)) {
+    await loadSrtFromOutputs(f.rel);
+    closeFn();
+    return true;
+  }
+  if (local && AUDIO_EXT.test(f.name)) {
+    const ok = await openInAudioEditor(f.rel);
+    if (ok && !keepOpen) closeFn();
+    return ok;
+  }
+  window.open('/api/download_output/' + _encPath(f.rel) + '?inline=1', '_blank', 'noopener');
+  if (!keepOpen) closeFn();
+  return true;
+}
+
+/* Browse window: 1) song folders  ->  2) date-time runs of the folder that
+   belongs to the pressed button (SRT, Karaoke, ...)  ->  3) files of a run.
+   A run with a single file opens immediately; several files are listed. */
 function openBrowseModal(kind, data) {
   document.querySelectorAll('.browse-modal').forEach(m => m.remove());
 
+  if (!document.getElementById('browseNavStyle')) {
+    const st = document.createElement('style');
+    st.id = 'browseNavStyle';
+    st.textContent = `
+      .bn-row{display:flex;gap:10px;align-items:center;padding:9px 12px;margin:4px 0;
+              border:1px solid rgba(255,255,255,.14);border-radius:8px;cursor:pointer;}
+      .bn-row:hover{background:rgba(255,255,255,.09);}
+      .bn-main{flex:1;min-width:0;word-break:break-word;}
+      .bn-sub{opacity:.65;font-size:12px;white-space:nowrap;}
+      .bn-head{display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap;}
+      .bn-crumb{flex:1;min-width:0;font-weight:600;word-break:break-word;}
+      .bn-body{max-height:60vh;overflow:auto;}`;
+    document.head.appendChild(st);
+  }
+
+  const songs = Array.isArray(data.songs) ? data.songs : null;
+  const canOpen = !!data.local;
+  const label = BROWSE_KIND_LABELS[kind] || kind;
+
   const modal = document.createElement('div');
   modal.className = 'editor-modal browse-modal';
-
-  const itemsHtml = (data.files && data.files.length)
-    ? data.files.map(f => `
-        <li class="browse-item">
-          <span class="browse-name">${escapeHtml(f.name)}</span>
-          <span class="browse-size">${f.size_mb} MB</span>
-          <a class="btn" href="/api/download_output/${encodeURIComponent(f.rel)}"
-             target="_blank" rel="noopener">Download</a>
-        </li>`).join('')
-    : `<li class="browse-empty">This folder is empty.</li>`;
-
-  modal.innerHTML = `
-    <div class="editor-box">
-      <h3>${escapeHtml(kind)} folder</h3>
-      <ul class="browse-list">${itemsHtml}</ul>
-      <div class="editor-actions">
-        <button class="btn" id="browseClose">Close</button>
-      </div>
-    </div>`;
-
   document.body.appendChild(modal);
-  modal.querySelector('#browseClose').onclick = () => modal.remove();
+
+  const onKey = (e) => { if (e.key === 'Escape') close(); };
+  function close() { modal.remove(); document.removeEventListener('keydown', onKey); }
+  document.addEventListener('keydown', onKey);
+
+  /* ----- older server without the tree: plain list ----- */
+  if (!songs) {
+    const rows = (data.files || []).map(f => `
+      <div class="bn-row" data-url="${_escAttr('/api/download_output/' + _encPath(f.rel))}">
+        <span class="bn-main">${escapeHtml(f.name)}</span><span class="bn-sub">${f.size_mb} MB</span>
+      </div>`).join('') || '<div class="bn-sub">This folder is empty.</div>';
+    modal.innerHTML = `<div class="editor-box" style="max-width:760px;width:92vw;">
+      <h3>${escapeHtml(label)}</h3><div class="bn-body">${rows}</div>
+      <div class="editor-actions"><button class="btn" data-act="close">Close</button></div></div>`;
+    modal.addEventListener('click', (e) => {
+      if (e.target === modal || e.target.closest('[data-act="close"]')) { close(); return; }
+      const r = e.target.closest('[data-url]');
+      if (r) window.open(r.getAttribute('data-url'), '_blank', 'noopener');
+    });
+    return;
+  }
+
+  /* ----- helpers over the tree ----- */
+  // All date-time runs of a song, merged across its kind folders (Lyrics + Tabs
+  // of one job share the same date-time), newest first.
+  function runsOfSong(song) {
+    const map = new Map();
+    song.kinds.forEach(k => k.runs.forEach(r => {
+      const key = r.run || '';
+      if (!map.has(key)) map.set(key, { run: key, files: [], kinds: [] });
+      const g = map.get(key);
+      if (!g.kinds.includes(k.kind)) g.kinds.push(k.kind);
+      r.files.forEach(f => g.files.push(Object.assign({ kind: k.kind }, f)));
+    }));
+    const list = [...map.values()];
+    list.forEach(g => g.files.sort((x, y) => x.name.localeCompare(y.name)));
+    list.sort((a, b) => a.run === b.run ? 0 : a.run === '' ? 1 : b.run === '' ? -1 : (a.run < b.run ? 1 : -1));
+    return list;
+  }
+
+  // Folder (relative to outputs) of a song's button folder, e.g. My_Song/SRT
+  function songDirRel(song) {
+    if (song.folder === '(older files)') return '';
+    if (song.kinds.length === 1) {
+      const k = song.kinds[0];
+      const r = k.runs.find(x => x.files.length);
+      if (r) {
+        let d = _dirOfFile(r.files[0]);
+        if (r.run && d.endsWith('/' + r.run)) d = d.slice(0, -(r.run.length + 1));
+        return d;
+      }
+    }
+    return song.folder;
+  }
+
+  let view = { level: 1, song: null, run: null };
+  let filterText = '';
+
+  const openBtn = (rel, text) => canOpen
+    ? `<button class="btn" data-act="open-folder" data-rel="${_escAttr(rel)}">${escapeHtml(text || 'Open folder')}</button>` : '';
+
+  function render() {
+    let crumb = '', headBtns = '', body = '', back = '';
+
+    if (view.level === 1) {
+      crumb = `${escapeHtml(label)} — choose a song`;
+      headBtns = openBtn('', 'Open outputs folder');
+      const q = filterText.trim().toLowerCase();
+      const rows = songs.map((song, i) => ({ song, i }))
+        .filter(({ song }) => !q || (song.title || song.folder).toLowerCase().includes(q))
+        .map(({ song, i }) => {
+          const n = runsOfSong(song).length;
+          const badge = song.production ? ` <span class="bn-sub">· ${escapeHtml(song.production)}</span>` : '';
+          const when = song.latest ? new Date(song.latest * 1000).toLocaleString() : '';
+          return `<div class="bn-row" data-act="song" data-i="${i}">
+              <span class="bn-main">${escapeHtml(song.title || song.folder)}${badge}</span>
+              <span class="bn-sub">${n} run${n === 1 ? '' : 's'}${when ? ' · ' + escapeHtml(when) : ''}</span>
+              <span class="bn-sub">›</span></div>`;
+        }).join('');
+      body = (songs.length > 5
+          ? `<input type="text" id="browseFilter" class="row-input" placeholder="Filter songs…"
+               value="${_escAttr(filterText)}" style="width:100%;margin-bottom:8px;">` : '')
+        + (rows || `<div class="bn-sub" style="padding:10px;">${songs.length
+            ? 'No song matches the filter.' : 'Nothing here yet — no ' + escapeHtml(label) + ' has been created.'}</div>`);
+    }
+
+    else if (view.level === 2) {
+      const song = songs[view.song];
+      crumb = `${escapeHtml(song.title || song.folder)} › ${escapeHtml(song.kinds.map(k => k.kind).join(' / '))}`;
+      back = `<button class="btn" data-act="back">‹ Songs</button>`;
+      headBtns = openBtn(songDirRel(song));
+      body = runsOfSong(song).map((g, gi) => {
+        const multi = song.kinds.length > 1
+          ? ` <span class="bn-sub">· ${escapeHtml(g.kinds.join(', '))}</span>` : '';
+        return `<div class="bn-row" data-act="run" data-i="${gi}">
+            <span class="bn-main">${escapeHtml(_prettyRun(g.run))}${multi}</span>
+            <span class="bn-sub">${g.files.length} file${g.files.length === 1 ? '' : 's'}</span>
+            <span class="bn-sub">›</span></div>`;
+      }).join('') || '<div class="bn-sub" style="padding:10px;">No files.</div>';
+    }
+
+    else {
+      const song = songs[view.song];
+      const g = runsOfSong(song)[view.run];
+      crumb = `${escapeHtml(song.title || song.folder)} › ${escapeHtml(_prettyRun(g.run))}`;
+      back = `<button class="btn" data-act="back">‹ Runs</button>`;
+      const dirs = [];
+      g.files.forEach(f => {
+        const d = _dirOfFile(f);
+        if (!dirs.some(x => x.d === d)) dirs.push({ d, kind: f.kind });
+      });
+      headBtns = dirs.map(x => openBtn(x.d, dirs.length > 1 ? 'Open ' + x.kind + ' folder' : 'Open folder')).join('');
+      body = g.files.map((f, fi) => {
+        const isSrt = /\.srt$/i.test(f.name);
+        const tag = song.kinds.length > 1 ? ` <span class="bn-sub">· ${escapeHtml(f.kind)}</span>` : '';
+        return `<div class="bn-row" data-act="file" data-i="${fi}">
+            <span class="bn-main">${escapeHtml(f.name)}${tag}</span>
+            <span class="bn-sub">${f.size_mb} MB</span>
+            <button class="btn" data-act="file" data-i="${fi}">${isSrt ? 'Load'
+              : (canOpen && AUDIO_EXT.test(f.name)) ? 'Open in Editor' : 'Open'}</button>
+            <a class="btn" href="/api/download_output/${_escAttr(_encPath(f.rel))}" target="_blank" rel="noopener">Download</a>
+          </div>`;
+      }).join('');
+    }
+
+    modal.innerHTML = `
+      <div class="editor-box" style="max-width:760px;width:92vw;">
+        <div class="bn-head">${back}<div class="bn-crumb">${crumb}</div>${headBtns}</div>
+        <div class="bn-body">${body}</div>
+        <div class="editor-actions"><button class="btn" data-act="close">Close</button></div>
+      </div>`;
+
+    const f = modal.querySelector('#browseFilter');
+    if (f) {
+      f.addEventListener('input', () => {
+        filterText = f.value;
+        const pos = f.selectionStart;
+        render();
+        const nf = modal.querySelector('#browseFilter');
+        if (nf) { nf.focus(); nf.setSelectionRange(pos, pos); }
+      });
+      if (!filterText) f.focus();
+    }
+  }
+
+  function selectRun(gi) {
+    const song = songs[view.song];
+    const g = runsOfSong(song)[gi];
+    if (g.files.length === 1) {            // one file: open it straight away
+      _openOutputFile(g.files[0], close, canOpen, false).then(ok => {
+        if (ok === false) { view = { level: 3, song: view.song, run: gi }; render(); }
+      });
+      return;
+    }
+    view = { level: 3, song: view.song, run: gi };   // several files: let the user pick
+    render();
+  }
+
   modal.addEventListener('click', (e) => {
-    if (e.target === modal) modal.remove();
+    if (e.target === modal) { close(); return; }
+    if (e.target.closest('a')) return;               // real download link
+    const el = e.target.closest('[data-act]');
+    if (!el) return;
+    const act = el.getAttribute('data-act');
+    const i = parseInt(el.getAttribute('data-i'), 10);
+    if (act === 'close') close();
+    else if (act === 'open-folder') openOutputFolder(el.getAttribute('data-rel'));
+    else if (act === 'song') { view = { level: 2, song: i, run: null }; render(); }
+    else if (act === 'run') selectRun(i);
+    else if (act === 'file') {
+      const g = runsOfSong(songs[view.song])[view.run];
+      _openOutputFile(g.files[i], close, canOpen, true);
+    }
+    else if (act === 'back') {
+      view = view.level === 3 ? { level: 2, song: view.song, run: null } : { level: 1, song: null, run: null };
+      render();
+    }
   });
+
+  render();
 }
 
 function escapeHtml(str) {
@@ -737,6 +1025,130 @@ function applySongDirection(modal) {
 
 const ARABIC_DIALECT_CODES = ['egyptian', 'gulf', 'levantine', 'iraqi', 'maghrebi', 'msa'];
 
+/* ---------- Voice / Genre / Mood pickers for the description box ----------
+   Each pick is written into the normal "Genre / mood / description" text box as part of
+   one comma-separated sentence. The box is still what gets sent, so nothing else changes.
+   Typing by hand works exactly as before. */
+const STYLE_VOICES = [
+  { label: 'Raspy, gravelly', phrase: 'raspy gravelly vocals, cracked texture',
+    male: 'Louis Armstrong, Tom Waits, Joe Cocker', female: 'Janis Joplin, Tina Turner, Bonnie Tyler' },
+  { label: 'Warm, smooth jazz', phrase: 'warm smooth jazz vocals, relaxed swing phrasing',
+    male: 'Frank Sinatra, Nat King Cole, Michael Bublé', female: 'Ella Fitzgerald, Norah Jones, Diana Krall' },
+  { label: 'Deep, smoky, sultry', phrase: 'deep smoky sultry vocals, low register',
+    male: 'Barry White, Leonard Cohen, Johnny Cash', female: 'Billie Holiday, Amy Winehouse, Nina Simone, Sade' },
+  { label: 'Soulful, powerful', phrase: 'powerful soulful vocals, gospel-style runs',
+    male: 'Ray Charles, Otis Redding, Marvin Gaye', female: 'Aretha Franklin, Whitney Houston, Adele' },
+  { label: 'Rock belt', phrase: 'powerful rock vocals, high belt, gritty',
+    male: 'Freddie Mercury, Robert Plant, Chris Cornell', female: 'Ann Wilson, Pat Benatar, Stevie Nicks' },
+  { label: 'Bright pop', phrase: 'bright clean pop vocals, catchy hook',
+    male: 'Bruno Mars, Justin Timberlake, Harry Styles', female: 'Ariana Grande, Dua Lipa, Taylor Swift' },
+  { label: 'Soft, breathy, intimate', phrase: 'soft breathy intimate vocals, close and quiet',
+    male: 'Jeff Buckley, Sam Smith, Chet Baker', female: 'Billie Eilish, Lana Del Rey, Lorde' },
+  { label: 'Folk, storyteller', phrase: 'gentle acoustic folk vocals, storytelling',
+    male: 'Bob Dylan, Neil Young, Cat Stevens, James Taylor', female: 'Joni Mitchell, Joan Baez, Tracy Chapman' },
+  { label: 'High, falsetto', phrase: 'airy high falsetto vocals',
+    male: 'Barry Gibb, Frankie Valli, Prince', female: 'Mariah Carey, Minnie Riperton' },
+  { label: 'Country', phrase: 'warm country vocals, light twang',
+    male: 'Willie Nelson, Chris Stapleton, Johnny Cash', female: 'Dolly Parton, Patsy Cline, Shania Twain' },
+  { label: 'Arabic tarab', phrase: 'Arabic tarab vocals, expressive ornamentation, maqam melodies',
+    male: 'Abdel Halim Hafez, Kadim Al Sahir, Wael Kfoury, Mohamed Mounir', female: 'Umm Kulthum, Fairuz, Angham, Nancy Ajram' },
+  { label: 'Operatic', phrase: 'operatic classical vocals, wide vibrato',
+    male: 'Luciano Pavarotti, Andrea Bocelli', female: 'Maria Callas, Sarah Brightman' },
+];
+
+const STYLE_GENRES = [
+  ['Pop', 'pop'], ['Upbeat pop rock', 'upbeat pop rock'], ['Slow rock', 'slow rock'],
+  ['Hard rock', 'hard rock'], ['Rock ballad', 'rock ballad'], ['Indie / alternative', 'indie alternative'],
+  ['Metal', 'heavy metal'], ['Vintage jazz / swing', 'vintage jazz, swing'], ['Smooth jazz', 'smooth jazz'],
+  ['Blues', 'blues'], ['Soul', 'soul'], ['R&B', 'R&B'], ['Funk', 'funk'], ['Gospel', 'gospel'],
+  ['Folk / acoustic', 'folk, acoustic'], ['Acoustic ballad', 'acoustic ballad'], ['Country', 'country'],
+  ['Hip hop', 'hip hop'], ['Electronic / dance', 'electronic dance'], ['Synthwave', 'synthwave'],
+  ['Lo-fi chill', 'lo-fi chill'], ['Reggae', 'reggae'], ['Latin / bossa nova', 'latin, bossa nova'],
+  ['Disco', 'disco'], ['Classical / orchestral', 'classical orchestral'], ['Cinematic', 'cinematic'],
+  ['Arabic pop', 'Arabic pop'], ['Arabic tarab (classical)', 'Arabic tarab, oriental strings'],
+  ['Khaleeji', 'Khaleeji'], ['Egyptian shaabi', 'Egyptian shaabi'],
+];
+
+const STYLE_MOODS = [
+  ['Happy, upbeat', 'happy, upbeat'], ['Playful', 'playful'], ['Romantic', 'romantic'],
+  ['Melancholic', 'melancholic'], ['Nostalgic', 'nostalgic'], ['Dreamy', 'dreamy'],
+  ['Dark, moody', 'dark, moody'], ['Epic, anthemic', 'epic, anthemic'], ['Calm, relaxing', 'calm, relaxing'],
+  ['Energetic', 'energetic'], ['Emotional, heartfelt', 'emotional, heartfelt'], ['Sensual', 'sensual'],
+  ['Hopeful', 'hopeful'], ['Aggressive', 'aggressive'], ['Mysterious', 'mysterious'], ['Intimate', 'intimate'],
+];
+
+/* The three pickers look like buttons labelled Vocal / Genre / Mood. Choosing an item adds it
+   to the description box (in the order picked); the button then goes back to its label so the
+   next pick can be made. Everything stays editable in the box. */
+const STYLE_PICKER_LABELS = { '#stylePickVoice': 'Vocal', '#stylePickGenre': 'Genre', '#stylePickMood': 'Mood' };
+const _pickerPlaceholder = (label) => `<option value="" hidden disabled selected>${label}</option>`;
+
+/* Vocal list follows the Singer: male -> male voices, female -> female voices,
+   auto / duet -> both, instrumental -> not available. */
+function refreshVoicePicker(modal) {
+  const sel = modal.querySelector('#stylePickVoice');
+  if (!sel) return;
+  const singerEl = modal.querySelector('#songSinger');
+  const singer = singerEl ? singerEl.value : 'auto';
+  const opts = (key) => STYLE_VOICES.map(v =>
+    `<option value="${_escAttr(v.phrase)}">${escapeHtml(v.label)} — ${escapeHtml(v[key])}</option>`).join('');
+  if (singer === 'instrumental') {
+    sel.innerHTML = _pickerPlaceholder('Vocal (n/a)');
+    sel.disabled = true;
+    return;
+  }
+  sel.disabled = false;
+  let html = _pickerPlaceholder('Vocal');
+  if (singer === 'male') html += opts('male');
+  else if (singer === 'female') html += opts('female');
+  else html += `<optgroup label="Male voices">${opts('male')}</optgroup>` +
+               `<optgroup label="Female voices">${opts('female')}</optgroup>`;
+  sel.innerHTML = html;
+}
+
+/* Add one phrase to the end of the description box (skipped if it is already listed). */
+function insertStylePhrase(modal, phrase) {
+  const el = modal.querySelector('#songStyle');
+  if (!el || !phrase) return;
+  const e = phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (new RegExp('(^|,)\\s*' + e + '\\s*(,|$)', 'i').test(el.value)) return;
+  el.value = el.value.trim() === '' ? phrase : el.value.replace(/[\s,]+$/, '') + ', ' + phrase;
+  el.dispatchEvent(new Event('input', { bubbles: true }));    // keeps drafts / listeners in step
+}
+
+/* Buttons back to their labels (used when a whole setup is loaded into the form). */
+function resetStylePickers(modal) {
+  ['#stylePickGenre', '#stylePickMood'].forEach(id => {
+    const s = modal.querySelector(id);
+    if (s) s.value = '';
+  });
+  refreshVoicePicker(modal);
+}
+
+function wireStylePickers(modal) {
+  const fill = (id, items) => {
+    const s = modal.querySelector(id);
+    if (!s) return;
+    s.innerHTML = _pickerPlaceholder(STYLE_PICKER_LABELS[id]) +
+      items.map(([t, ph]) => `<option value="${_escAttr(ph)}">${escapeHtml(t)}</option>`).join('');
+  };
+  fill('#stylePickGenre', STYLE_GENRES);
+  fill('#stylePickMood', STYLE_MOODS);
+  refreshVoicePicker(modal);
+  Object.keys(STYLE_PICKER_LABELS).forEach(id => {
+    const s = modal.querySelector(id);
+    if (!s) return;
+    s.addEventListener('change', () => {
+      insertStylePhrase(modal, s.value);
+      s.value = '';                                          // back to "Vocal" / "Genre" / "Mood"
+      const box = modal.querySelector('#songStyle');
+      if (box) box.focus({ preventScroll: true });           // ready to add or edit words
+    });
+  });
+  const singer = modal.querySelector('#songSinger');
+  if (singer) singer.addEventListener('change', () => refreshVoicePicker(modal));
+}
+
 function readSongFields(modal) {
   return {
     title:       modal.querySelector('#songTitle').value.trim(),
@@ -744,6 +1156,7 @@ function readSongFields(modal) {
     language:    modal.querySelector('#songLanguage').value,
     style:       modal.querySelector('#songStyle').value.trim(),
     singer:      modal.querySelector('#songSinger').value,
+    vocal_level: (modal.querySelector('#songVocal') || { value: '6' }).value,
     backend:     modal.querySelector('#songBackend').value,
     instruments: Array.from(modal.querySelectorAll('.songInstrument:checked')).map(el => el.value),
     dialect:     (modal.querySelector('#songDialect') || { value: 'egyptian' }).value,
@@ -758,6 +1171,11 @@ function applySongFields(modal, fields) {
   modal.querySelector('#songLyrics').value  = fields.lyrics || '';
   modal.querySelector('#songStyle').value   = fields.style || '';
   modal.querySelector('#songSinger').value  = fields.singer || 'auto';
+  const vocEl = modal.querySelector('#songVocal');
+  if (vocEl) {
+    vocEl.value = fields.vocal_level || '6';
+    if (vocEl.value !== (fields.vocal_level || '6')) vocEl.value = '6';   // unknown value -> default
+  }
   modal.querySelector('#songBackend').value = fields.backend || 'ace';
   const langEl = modal.querySelector('#songLanguage');
   if (langEl) {
@@ -775,6 +1193,7 @@ function applySongFields(modal, fields) {
   if (incEl) incEl.checked = fields.include_title_lyrics !== false;
   const bkEl = modal.querySelector('#songStems');
   if (bkEl) bkEl.checked = fields.backtrack !== false;
+  resetStylePickers(modal);
 }
 
 /* ---------- AI Lyrics modal ---------- */
@@ -1304,9 +1723,22 @@ function openCreateSongModal() {
               <option value="instrumental">Instrumental (no vocals)</option>
             </select>
           </div>
+          <div class="song-field" data-tip="How loud the singing is compared with the music. Louder singing makes the words easier to understand. The finished song is split into voice and music and mixed again, which adds 1-3 minutes. The untouched version is kept as ..._original_mix.wav. Not used for instrumentals.">
+            <label for="songVocal">Vocal level <i class="sc-i">i</i></label>
+            <select id="songVocal">
+              <option value="6">Clear words (voice +6 dB)</option>
+              <option value="9">Extra clear (voice +9 dB)</option>
+              <option value="3">Balanced (voice +3 dB)</option>
+              <option value="off">As generated (no change)</option>
+            </select>
+          </div>
           <div class="song-field sc-full">
-            <label for="songStyle">Genre / mood / description</label>
-            <input type="text" id="songStyle" placeholder="e.g. upbeat pop rock, 120bpm, anthemic">
+            <div class="style-row" style="display:flex;gap:8px;flex-wrap:wrap;align-items:stretch;">
+              <select id="stylePickVoice" style="flex:0 0 auto;width:auto;max-width:100%;" title="Vocal type - the list follows the Singer chosen above"></select>
+              <select id="stylePickGenre" style="flex:0 0 auto;width:auto;max-width:100%;" title="Pick a genre - it is added to the description"></select>
+              <select id="stylePickMood" style="flex:0 0 auto;width:auto;max-width:100%;" title="Pick a mood - it is added to the description"></select>
+              <input type="text" id="songStyle" aria-label="Genre / mood / description" style="flex:1 1 260px;width:auto;min-width:0;" placeholder="Description - pick Vocal / Genre / Mood, then add or edit your own words">
+            </div>
           </div>
           <div class="song-field sc-full">
             <label>Instruments</label>
@@ -1357,6 +1789,7 @@ function openCreateSongModal() {
 
   document.body.appendChild(modal);
 
+  wireStylePickers(modal);
   applySongFields(modal, loadSongDraft());
   applySongDirection(modal);
   modal.querySelector('#songLanguage').addEventListener('change', () => {
@@ -1449,16 +1882,35 @@ function openCreateSongModal() {
     return data;
   }
 
+  const LAST_RUN = '__last_run__';     // pseudo-entry: settings of the last generated song
+  let lastRunInfo = null;
+
   async function refreshPresets(selectName, pickLast) {
     try {
       const data = await presetApi('/api/song_presets');
       const list = data.presets || [];
-      presetSelect.innerHTML = list.length
-        ? list.map(p => `<option value="${escapeHtml(p.name)}">${escapeHtml(p.name)}</option>`).join('')
+
+      lastRunInfo = null;
+      try {
+        const lr = await presetApi('/api/song_last_run');
+        if (lr && lr.found) lastRunInfo = lr;
+      } catch (e) { /* no previous song run - fine */ }
+
+      const opts = list.map(p => `<option value="${escapeHtml(p.name)}">${escapeHtml(p.name)}</option>`);
+      if (lastRunInfo) {
+        const t = (lastRunInfo.title || 'untitled').slice(0, 40);
+        opts.unshift(`<option value="${LAST_RUN}">Last generated song - ${escapeHtml(t)}</option>`);
+      }
+      presetSelect.innerHTML = opts.length ? opts.join('')
         : '<option value="">- none saved yet -</option>';
+
       if (selectName) presetSelect.value = selectName;
-      else if (pickLast && list.length) {
-        const wanted = data.last && list.some(p => p.name === data.last) ? data.last : list[0].name;
+      else if (pickLast && opts.length) {
+        // Default = whichever happened last: the last saved/loaded setup, or the last generated song.
+        const lastPreset = data.last && list.some(p => p.name === data.last) ? data.last : null;
+        let wanted;
+        if (lastRunInfo && (!lastPreset || (lastRunInfo.saved || 0) >= (data.last_at || 0))) wanted = LAST_RUN;
+        else wanted = lastPreset || (list[0] && list[0].name) || '';
         presetSelect.value = wanted;
       }
     } catch (e) {
@@ -1468,7 +1920,8 @@ function openCreateSongModal() {
   }
 
   modal.querySelector('#songPresetSave').onclick = async () => {
-    const suggested = presetSelect.value || modal.querySelector('#songTitle').value.trim();
+    const suggested = (presetSelect.value && presetSelect.value !== LAST_RUN)
+      ? presetSelect.value : modal.querySelector('#songTitle').value.trim();
     const name = (window.prompt('Name for this setup:', suggested) || '').trim();
     if (!name) return;
     const settings = readSongFields(modal);
@@ -1486,17 +1939,20 @@ function openCreateSongModal() {
     }
   };
 
-  const SETUP_DEFAULTS = { title: '', lyrics: '', language: 'auto', style: '', singer: 'auto',
+  const SETUP_DEFAULTS = { title: '', lyrics: '', language: 'auto', style: '', singer: 'auto', vocal_level: '6',
     backend: 'ace', instruments: [], dialect: 'egyptian', include_title_lyrics: true, backtrack: true };
 
   async function loadSelectedPreset(fromDropdown, quiet, replace) {
     const name = presetSelect.value;
     if (!name) {
-      if (!fromDropdown) showNotice('Pick a saved setup first', 'warn');
+      if (!fromDropdown) showNotice('Nothing saved yet. Generate a song, or fill the form and use "Save setup..."', 'warn');
       return;
     }
     try {
-      const data = await presetApi('/api/song_presets/' + encodeURIComponent(name));
+      const data = name === LAST_RUN
+        ? await presetApi('/api/song_last_run')
+        : await presetApi('/api/song_presets/' + encodeURIComponent(name));
+      if (name === LAST_RUN && !data.found) throw new Error('no previous song found');
       const base = replace ? Object.assign({}, SETUP_DEFAULTS) : readSongFields(modal);
       applySongFields(modal, Object.assign(base, data.settings || {}));
       applySongDirection(modal);
@@ -1504,7 +1960,7 @@ function openCreateSongModal() {
       updateStemsVisibility();
       updateLenNote();
       updateDialectVisibility();
-      if (!quiet) showNotice('Setup "' + name + '" loaded', 'success');
+      if (!quiet) showNotice(name === LAST_RUN ? 'Last generated song loaded' : 'Setup "' + name + '" loaded', 'success');
     } catch (e) {
       showNotice('Could not load setup: ' + e.message, 'error');
     }
@@ -1516,6 +1972,7 @@ function openCreateSongModal() {
   modal.querySelector('#songPresetDelete').onclick = async () => {
     const name = presetSelect.value;
     if (!name) { showNotice('Pick a saved setup first', 'warn'); return; }
+    if (name === LAST_RUN) { showNotice('That is your last generated song, not a saved setup. Use "Save setup..." to keep it under a name.', 'warn'); return; }
     if (!window.confirm('Delete saved setup "' + name + '"?')) return;
     try {
       await presetApi('/api/song_presets/' + encodeURIComponent(name), { method: 'DELETE' });
@@ -1551,7 +2008,7 @@ function openCreateSongModal() {
   };
 
   modal.querySelector('#songClear').onclick = () => {
-    applySongFields(modal, { title: '', lyrics: '', language: 'auto', style: '', singer: 'auto', backend: 'ace', instruments: [] });
+    applySongFields(modal, { title: '', lyrics: '', language: 'auto', style: '', singer: 'auto', vocal_level: '6', backend: 'ace', instruments: [] });
     try { localStorage.removeItem(SONG_DRAFT_KEY); } catch (e) {}
     resetAudioInputs();
     updateBackendNote();
@@ -1673,6 +2130,7 @@ function openCreateSongModal() {
     let res;
     try {
       const payload = { title, lyrics, language, style, singer, instruments, backend,
+                        vocal_level: modal.querySelector('#songVocal').value,
                         stems: backend === 'ace' && modal.querySelector('#songStems').checked,
                         backtrack: modal.querySelector('#songStems').checked,
                         dialect: modal.querySelector('#songDialect').value,

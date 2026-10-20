@@ -11,6 +11,7 @@ import threading
 import subprocess
 import tempfile
 import datetime
+import re
 from pathlib import Path
 from functools import wraps
 
@@ -330,11 +331,64 @@ def get_song_output_dir(username, song_title, production=""):
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
 
-def _srt_rel_path(filename: str) -> str:
-    """SRT location relative to outputs/<user>/ : <Song>/SRT/<stem>.srt"""
+
+# ---- One dated sub-folder per run -------------------------------------
+# outputs/<user>/<Song>[_Production]/<Kind>/<YYYY-MM-DD_HH-MM-SS>/<run files>
+RUN_STAMP_FMT = "%Y-%m-%d_%H-%M-%S"
+_RUN_STAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(_\d+)?$")
+
+
+def new_run_stamp() -> str:
+    """Local date-time label for one run, e.g. 2026-10-19_14-32-07."""
+    return datetime.datetime.now().strftime(RUN_STAMP_FMT)
+
+
+def _is_run_stamp(name: str) -> bool:
+    return bool(_RUN_STAMP_RE.match(name or ""))
+
+
+def get_run_folder(run_dir, kind, stamp=None):
+    """Create and return <run_dir>/<kind>/<date_time>/ for ONE run.
+
+    kind  : "SRT", "Lyrics", "Tabs", "Transcription", "Karaoke", "Songs", ...
+    stamp : pass the same value to several kinds that belong to one job
+            (e.g. Lyrics + Tabs) so they share the same date-time name.
+            When omitted a fresh stamp is used; if two runs start in the same
+            second the second one gets a _2, _3 ... suffix.
+    """
+    base = Path(run_dir) / kind
+    if stamp:
+        folder = base / stamp
+    else:
+        stamp = new_run_stamp()
+        folder = base / stamp
+        n = 2
+        while folder.exists():
+            folder = base / f"{stamp}_{n}"
+            n += 1
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+def _srt_rel_path(filename: str, username: str = None) -> str:
+    """SRT location relative to outputs/<user>/.
+
+    New layout : <Song>/SRT/<date_time>/<stem>.srt  (newest run is returned)
+    Old layout : <Song>/SRT/<stem>.srt              (fallback / not generated yet)
+    """
     stem = Path(filename).stem
     song = secure_filename(stem) or "Unknown_Song"
-    return f"{song}/SRT/{stem}.srt"
+    legacy = f"{song}/SRT/{stem}.srt"
+    if username:
+        try:
+            _, outdir = user_dirs(username)
+            runs = [p for p in (outdir / song / "SRT").glob(f"*/{stem}.srt")
+                    if p.is_file() and _is_run_stamp(p.parent.name)]
+            if runs:
+                best = max(runs, key=lambda p: p.parent.name)
+                return best.relative_to(outdir).as_posix()
+        except OSError:
+            pass
+    return legacy
 
 
 def _owns_job(job: dict) -> bool:
@@ -542,20 +596,168 @@ def list_files():
     return jsonify(files=files)
 
 
+# Kind folders that live inside <Song>/ (used by Load / Browse)
+_KIND_FOLDERS = {
+    "srt": ["SRT"],
+    "karaoke": ["Karaoke"],
+    "lyrics_tab": ["Lyrics", "Tabs"],
+    "transcription": ["Transcription"],
+    "songs": ["Songs"],
+    "ai_lyrics": ["AI_Lyrics"],
+}
+_ALL_KIND_NAMES = {n for names in _KIND_FOLDERS.values() for n in names}
+_PRODUCTION_SUFFIXES = ((AI_SONG_PRODUCTION, "AI Song"),
+                        (KARAOKE_PRODUCTION, "Karaoke"))
+
+
+def _classify_output(parts):
+    """Split a path (relative to outputs/<user>/) into song / kind / run / name.
+
+    New : <Song>/<Kind>/<date_time>/<file...>
+    Old : <Song>/<Kind>/<file>   |   <Kind>/<file>   |   <file>
+    """
+    n = len(parts)
+    if n == 1:
+        return "", "", "", parts[0]
+    if n == 2:
+        if parts[0] in _ALL_KIND_NAMES:                    # outputs/<Kind>/<file>
+            return "", parts[0], "", parts[1]
+        return parts[0], "", "", parts[1]                  # <Song>/<file>
+    song, kind = parts[0], parts[1]
+    if n >= 4 and _is_run_stamp(parts[2]):
+        return song, kind, parts[2], "/".join(parts[3:])
+    return song, kind, "", "/".join(parts[2:])
+
+
+def _song_title_parts(folder):
+    """'My_Song_Ai_Song_Production' -> ('My_Song', 'AI Song')"""
+    for suffix, label in _PRODUCTION_SUFFIXES:
+        if folder.endswith(suffix):
+            return folder[: -len(suffix)], label
+    return folder, ""
+
+
+def _output_tree(outdir, kind_names=None):
+    """Song -> Kind -> Run -> files, newest first. Works for the dated-run
+    layout and still lists older files that have no date-time folder."""
+    songs = {}
+    for p in outdir.rglob("*"):
+        try:
+            if not p.is_file():
+                continue
+            rel = p.relative_to(outdir)
+            if rel.parts[0] == "Presets":
+                continue
+            song, kind, run, name = _classify_output(rel.parts)
+            if kind_names and kind not in kind_names:
+                continue
+            st = p.stat()
+        except OSError:
+            continue
+        folder = song or "(older files)"
+        title, production = _song_title_parts(folder)
+        node = songs.setdefault(folder, {
+            "folder": folder, "title": title, "production": production,
+            "latest": 0.0, "_kinds": {}})
+        node["latest"] = max(node["latest"], st.st_mtime)
+        runs = node["_kinds"].setdefault(kind or "(files)", {})
+        runs.setdefault(run, []).append({
+            "name": name, "rel": rel.as_posix(),
+            "size_mb": round(st.st_size / (1024 * 1024), 2),
+            "mtime": int(st.st_mtime)})
+
+    tree = []
+    for node in sorted(songs.values(), key=lambda n: n["latest"], reverse=True):
+        kinds = []
+        for kind in sorted(node.pop("_kinds").items()):
+            kname, runs = kind
+            run_list = []
+            for run in sorted(runs, reverse=True):        # newest date-time first
+                files = sorted(runs[run], key=lambda f: f["name"].lower())
+                run_list.append({"run": run,
+                                 "label": run.replace("_", " ", 1) if run else "(earlier run)",
+                                 "files": files})
+            kinds.append({"kind": kname, "runs": run_list})
+        node["kinds"] = kinds
+        node["latest"] = int(node["latest"])
+        tree.append(node)
+    return tree
+
+
+APP_BUILD = "2026-10-20 vocal-level + browse + vocal/genre/mood row"
+
+
+@app.route("/api/build_info")
+@login_required
+def build_info():
+    """Which files this running copy of the program is really using.
+    Open  http://<your address>/api/build_info  when a change does not show up."""
+    info = {
+        "build": APP_BUILD,
+        "app_py": str(Path(__file__).resolve()),
+        "static_folder": str(app.static_folder),
+        "templates_folder": str(app.template_folder),
+        "python": sys.version.split()[0],
+        "packaged_exe": bool(getattr(sys, "frozen", False)),
+    }
+    js = Path(app.static_folder or ".") / "js" / "app.js"
+    try:
+        text = js.read_text(encoding="utf-8", errors="replace")
+        st = js.stat()
+        info["app_js"] = {
+            "path": str(js.resolve()),
+            "bytes": st.st_size,
+            "modified": datetime.datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds"),
+            "has_vocal_genre_mood_row": "stylePickVoice" in text,
+            "has_new_browse_window": "BROWSE_KIND_LABELS" in text,
+            "has_vocal_level": "songVocal" in text,
+        }
+        info["verdict"] = ("app.js is the latest version" if all(
+            info["app_js"][k] for k in ("has_vocal_genre_mood_row", "has_new_browse_window", "has_vocal_level"))
+            else "app.js at the path above is an OLD copy - replace that file")
+    except OSError as e:
+        info["app_js"] = {"error": str(e)}
+        info["verdict"] = "app.js was not found in the static folder above"
+    return jsonify(info)
+
+
 @app.route("/api/list_outputs")
 @login_required
 def list_outputs():
+    """Flat list (as before, plus song/kind/run fields) AND a Song->Kind->Run tree."""
     _, outdir = user_dirs(session["user"])
     files = []
     for p in sorted(outdir.rglob("*"),
                     key=lambda x: x.stat().st_mtime, reverse=True):
         if p.is_file():
+            rel = p.relative_to(outdir)
+            if rel.parts[0] == "Presets":
+                continue
+            song, kind, run, _ = _classify_output(rel.parts)
             files.append({
                 "name": p.name,
-                "rel": str(p.relative_to(outdir)),
+                "rel": str(rel),
+                "song": song,
+                "kind": kind,
+                "run": run,
                 "size_mb": round(p.stat().st_size / (1024 * 1024), 2),
             })
-    return jsonify(files=files)
+    return jsonify(files=files, songs=_output_tree(outdir))
+
+
+@app.route("/api/output_tree")
+@login_required
+def output_tree():
+    """Load dialog data: song names -> kind -> date-time run -> files.
+    Optional ?kind=srt|karaoke|lyrics_tab|transcription|songs|ai_lyrics"""
+    _, outdir = user_dirs(session["user"])
+    kind = (request.args.get("kind") or "").strip().lower()
+    names = None
+    if kind:
+        names = set(_KIND_FOLDERS.get(kind, []))
+        if not names:
+            return jsonify(error=f"Unknown kind: {kind}"), 400
+    return jsonify(songs=_output_tree(outdir, names))
 
 
 @app.route("/api/files")
@@ -603,9 +805,9 @@ def upload():
         path=safe,
         size=dest.stat().st_size,
         size_mb=round(dest.stat().st_size / (1024 * 1024), 2),
-        srt_path=_srt_rel_path(safe),
+        srt_path=_srt_rel_path(safe, session["user"]),
         srt_full_path=str((OUTPUT_DIR / session["user"]
-                           / _srt_rel_path(safe)).resolve()),
+                           / _srt_rel_path(safe, session["user"])).resolve()),
     )
 
 
@@ -698,8 +900,7 @@ def _run_pipeline(job_id, opts):
 
         # NEW: Use structured output directory
         run_dir = get_song_output_dir(user, stem)
-        song_folder = run_dir / "SRT"
-        song_folder.mkdir(parents=True, exist_ok=True)
+        song_folder = get_run_folder(run_dir, "SRT")
 
         out_path = song_folder / f"{stem}.srt"
 
@@ -1173,8 +1374,7 @@ def _run_lyrics_job(job_id, input_path, srt_path, chord_method, sheet_meta=None)
         stem = Path(input_path).stem
         # NEW: Use structured output directory
         run_dir = get_song_output_dir(user, stem)
-        lyrics_folder = run_dir / "Lyrics"
-        lyrics_folder.mkdir(parents=True, exist_ok=True)
+        lyrics_folder = get_run_folder(run_dir, "Lyrics")
 
         pdf_path = lyrics_folder / f"{stem}_lyrics.pdf"
         mp3_path = lyrics_folder / f"{stem}.mp3"
@@ -1271,7 +1471,7 @@ def _run_tab_job(job_id, input_path, start_sec, end_sec, use_demucs):
         stem = Path(input_path).stem
         # NEW: Use structured output directory
         run_dir = get_song_output_dir(user, stem)
-        tabs_folder = run_dir / "Tabs"
+        tabs_folder = get_run_folder(run_dir, "Tabs")
         tabs_folder.mkdir(parents=True, exist_ok=True)
 
         pdf_path = tabs_folder / f"{stem}_solo_tab.pdf"
@@ -1374,8 +1574,8 @@ def _run_lyrics_and_tab_job(job_id, input_path, srt_path, chord_method,
         if not cues:
             raise RuntimeError("No cues found in SRT — nothing to export.")
 
-        lyrics_folder = run_dir / "Lyrics"
-        lyrics_folder.mkdir(parents=True, exist_ok=True)
+        _run_stamp = new_run_stamp()          # Lyrics + Tabs of this job share it
+        lyrics_folder = get_run_folder(run_dir, "Lyrics", _run_stamp)
         lyrics_pdf = lyrics_folder / f"{stem}_lyrics.pdf"
         lyrics_mp3 = lyrics_folder / f"{stem}.mp3"
 
@@ -1395,7 +1595,7 @@ def _run_lyrics_and_tab_job(job_id, input_path, srt_path, chord_method,
             _p(52, "Checking track length...")
             resolved_end = engine.get_audio_duration(input_path)
 
-        tabs_folder = run_dir / "Tabs"
+        tabs_folder = get_run_folder(run_dir, "Tabs", _run_stamp)
         tabs_folder.mkdir(parents=True, exist_ok=True)
         tab_pdf = tabs_folder / f"{stem}_solo_tab.pdf"
 
@@ -1512,8 +1712,7 @@ def _run_full_transcription_job(job_id, input_path):
         stem = Path(input_path).stem
         # NEW: Use structured output directory
         run_dir = get_song_output_dir(user, stem)
-        out_dir = run_dir / "Transcription"
-        out_dir.mkdir(parents=True, exist_ok=True)
+        out_dir = get_run_folder(run_dir, "Transcription")
 
         input_path_obj = Path(input_path)
 
@@ -1764,8 +1963,7 @@ def _run_video_job(job_id, input_path, srt_path, background_path, keep_vocals):
         stem = Path(input_path).stem
         # NEW: Use structured output directory
         run_dir = get_song_output_dir(user, stem, KARAOKE_PRODUCTION)
-        video_folder = run_dir / "Karaoke"
-        video_folder.mkdir(parents=True, exist_ok=True)
+        video_folder = get_run_folder(run_dir, "Karaoke")
 
         suffix = "_lyric_video.mp4" if keep_vocals else "_karaoke.mp4"
         out_path = video_folder / f"{stem}{suffix}"
@@ -1896,7 +2094,10 @@ def download_output(rel):
     target = (outdir / rel).resolve()
     if outdir.resolve() not in target.parents and target != outdir.resolve():
         return jsonify(error="Invalid path"), 400
-    return send_from_directory(outdir, rel, as_attachment=True)
+    # ?inline=1 lets the browser show PDFs / audio / video / text in a tab
+    # instead of forcing a download (used by the Browse window's "Open").
+    return send_from_directory(outdir, rel,
+                               as_attachment=request.args.get("inline") != "1")
 
 
 # ============================================================
@@ -2550,6 +2751,28 @@ ACE_SINGLE_PASS = os.environ.get("ACE_STEP_SINGLE_PASS", "1").strip() != "0"
 ACE_SEAM_SECONDS = float(os.environ.get("ACE_STEP_SEAM_SECONDS", "0") or 0)
 ACE_BED_LUFS = -18.0
 ACE_VOCAL_OVER_MUSIC_DB = float(os.environ.get("ACE_STEP_VOCAL_OVER_MUSIC_DB", "3") or 3)
+# "Vocal level" of a new song: how far the singing sits above the music (dB). The song is
+# split into voice + music and re-mixed so the lyrics are easy to understand.
+ACE_VOCAL_LIFT_DEFAULT_DB = float(os.environ.get("ACE_STEP_VOCAL_LIFT_DB", "6") or 6)
+
+
+def _parse_vocal_level(value):
+    """Form value -> dB the voice should sit above the music, or None = leave as generated.
+    "off" / "none" / "as_generated" -> None, a number -> that many dB (0..12), nothing -> default."""
+    if value is None or str(value).strip() == "":
+        return ACE_VOCAL_LIFT_DEFAULT_DB
+    v = str(value).strip().lower()
+    if v in ("off", "none", "as_generated", "as-generated", "no"):
+        return None
+    try:
+        return max(0.0, min(12.0, float(v)))
+    except ValueError:
+        return ACE_VOCAL_LIFT_DEFAULT_DB
+
+
+def _vocal_level_key(db):
+    """Inverse of _parse_vocal_level for the form: None -> "off", 6.0 -> "6"."""
+    return "off" if db is None else str(int(round(db)))
 ACE_VOCAL_CHUNK_LUFS = float(os.environ.get("ACE_STEP_VOCAL_CHUNK_LUFS", "-16") or -16)
 ACE_BED_MODE = os.environ.get("ACE_STEP_BED_MODE", "single").strip().lower()
 ACE_SINGLE_BED_MAX_SECONDS = float(os.environ.get("ACE_STEP_SINGLE_BED_MAX_SECONDS", "420") or 420)
@@ -3003,7 +3226,8 @@ def _normalize_loudness(path, target_lufs=-14.0):
     return False
 
 
-def _make_backtrack_from_song(song_path, back_path, status=None, stem_name="no_vocals"):
+def _make_backtrack_from_song(song_path, back_path, status=None, stem_name="no_vocals",
+                              extra_stems=None):
     import glob
 
     def _s(msg):
@@ -3056,18 +3280,26 @@ def _make_backtrack_from_song(song_path, back_path, status=None, stem_name="no_v
         found = glob.glob(os.path.join(out_dir, "**", f"{stem_name}.*"), recursive=True)
         if not found:
             raise RuntimeError(f"Demucs finished but produced no '{stem_name}' file.")
-        src = found[0]
-        if src.lower().endswith(".wav"):
-            shutil.copyfile(src, str(back_path))
-        else:
-            conv = subprocess.run(
-                [shutil.which("ffmpeg"), "-y", "-i", src, "-c:a", "pcm_s16le", str(back_path)],
-                capture_output=True, text=True, encoding="utf-8", errors="replace",
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            if conv.returncode != 0:
-                raise RuntimeError("Could not convert the backtrack to WAV: " + (conv.stderr or "")[-300:])
-        if not Path(back_path).exists() or Path(back_path).stat().st_size < 1000:
-            raise RuntimeError("The backtrack file was not written.")
+        def _save_stem(src, dst):
+            if src.lower().endswith(".wav"):
+                shutil.copyfile(src, str(dst))
+            else:
+                conv = subprocess.run(
+                    [shutil.which("ffmpeg"), "-y", "-i", src, "-c:a", "pcm_s16le", str(dst)],
+                    capture_output=True, text=True, encoding="utf-8", errors="replace",
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                if conv.returncode != 0:
+                    raise RuntimeError("Could not convert the backtrack to WAV: " + (conv.stderr or "")[-300:])
+            if not Path(dst).exists() or Path(dst).stat().st_size < 1000:
+                raise RuntimeError("The backtrack file was not written.")
+
+        _save_stem(found[0], back_path)
+        # extra_stems = {"vocals": path} also keeps the other stem of the same separation
+        for extra_name, extra_dst in (extra_stems or {}).items():
+            extra_found = glob.glob(os.path.join(out_dir, "**", f"{extra_name}.*"), recursive=True)
+            if not extra_found:
+                raise RuntimeError(f"Demucs finished but produced no '{extra_name}' file.")
+            _save_stem(extra_found[0], extra_dst)
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)
 
@@ -3117,7 +3349,7 @@ def _generate_backtrack_rerun(song_path, back_path, style, instruments, language
 
 
 def _generate_song_and_backtrack(folder, stem, lyrics, style, instruments, singer,
-                                 language, _p, ref_audio=None):
+                                 language, _p, ref_audio=None, vocal_db=None):
     folder = Path(folder)
     song_path = folder / f"{stem}_full_song.wav"
     back_path = folder / f"{stem}_backtrack.wav"
@@ -3129,6 +3361,9 @@ def _generate_song_and_backtrack(folder, stem, lyrics, style, instruments, singe
         lyrics, style, instruments, singer, str(song_path),
         progress_cb=lambda v, s: _p(6 + min(float(v), 100) * 0.46, "Full song: " + s),
         language=language, ref_audio=ref_audio)
+    if vocal_db is not None and singer != "instrumental":
+        _p(52, "Raising the voice above the music (1-3 min)...")
+        _lift_vocals_in_song(song_path, vocal_db, lambda m: _p(52, "Voice level: " + str(m)))
     if ACE_NORMALIZE:
         _p(53, "Mastering the full song...")
         _normalize_loudness(song_path, ACE_TARGET_LUFS)
@@ -3295,8 +3530,45 @@ def _mix_vocals_over_track(track_path, vocals_path, out_path, music_gain=1.0, vo
                 pass
 
 
+def _lift_vocals_in_song(song_path, lift_db, status=None):
+    """Make the sung words easy to understand: split the generated song into voice and
+    music (Demucs), then mix the voice back `lift_db` dB above the music with a speech-clarity
+    polish. The untouched version is kept as <name>_original_mix.wav.
+    Never raises: on any problem the song stays exactly as generated."""
+    song_path = Path(song_path)
+    if lift_db is None or not song_path.exists():
+        return False
+    note = song_path.with_name("vocal_level_error.txt")
+    note.unlink(missing_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix="vocal_lift_"))
+    try:
+        music, voice, mixed = tmp / "music.wav", tmp / "vocals.wav", tmp / "mixed.wav"
+        _make_backtrack_from_song(song_path, music, status, stem_name="no_vocals",
+                                  extra_stems={"vocals": voice})
+        if status:
+            status(f"Mixing the voice {lift_db:+.0f} dB above the music...")
+        _mix_vocals_over_track(music, voice, mixed, vocal_over_music_db=float(lift_db))
+        original = song_path.with_name(song_path.stem + "_original_mix" + song_path.suffix)
+        shutil.copyfile(song_path, original)          # keep the version as generated
+        shutil.copyfile(mixed, song_path)             # the song now has a clearer voice
+        print(f"[ACE-Step] vocal level: voice raised to {lift_db:+.0f} dB over the music "
+              f"({song_path.name}; original kept as {original.name})", flush=True)
+        return True
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"[ACE-Step] vocal level step skipped ({e}); song left as generated", flush=True)
+        try:
+            note.write_text(str(e), encoding="utf-8")
+        except Exception:
+            pass
+        return False
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _generate_song_on_backing_track(folder, stem, lyrics, style, singer, language,
-                                    backing_path, voice_ref, mix_original, _p):
+                                    backing_path, voice_ref, mix_original, _p, vocal_db=None):
     folder = Path(folder)
     back_path = folder / f"{stem}_backtrack.wav"
     vocals_path = folder / f"{stem}_vocals.wav"
@@ -3336,7 +3608,8 @@ def _generate_song_on_backing_track(folder, stem, lyrics, style, singer, languag
                                   lambda msg: _p(72, "Vocals: " + str(msg)),
                                   stem_name="vocals")
         _p(90, "Putting the singing on top of your original track...")
-        _mix_vocals_over_track(back_path, vocals_path, full_path)
+        _mix_vocals_over_track(back_path, vocals_path, full_path,
+                               vocal_over_music_db=vocal_db)   # None = default level
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -3645,10 +3918,9 @@ def save_ai_lyrics():
     # Sanitize title for folder name
     safe_title = secure_filename(title) or "Untitled_Song"
 
-    # Create the directory structure: outputs/<user>/<Song_Title>/<Timestamp>/AI_Lyrics/
+    # Create the directory structure: outputs/<user>/<Song_Title>/AI_Lyrics/<date_time>/
     run_dir = get_song_output_dir(session["user"], safe_title)
-    lyrics_dir = run_dir / "AI_Lyrics"
-    lyrics_dir.mkdir(parents=True, exist_ok=True)
+    lyrics_dir = get_run_folder(run_dir, "AI_Lyrics")
 
     file_path = lyrics_dir / f"{safe_title}_lyrics.txt"
     file_path.write_text(lyrics, encoding="utf-8")
@@ -3728,6 +4000,7 @@ def create_song():
         _save_job(job_id)
 
     language = _normalize_language(data.get("language"))
+    vocal_db = _parse_vocal_level(data.get("vocal_level"))
 
     threading.Thread(
         target=_run_create_song_job,
@@ -3735,7 +4008,7 @@ def create_song():
               include_title_lyrics,
               str(backing_path) if backing_path else None,
               str(voice_path) if voice_path else None,
-              mix_original),
+              mix_original, vocal_db),
         daemon=True,
     ).start()
 
@@ -3752,7 +4025,8 @@ def _as_bool(value, default=True):
 
 def _run_create_song_job(job_id, title, lyrics, style, instruments, singer, backend="ace",
                          language="", stems=True, include_title_lyrics=True,
-                         backing_path=None, voice_path=None, mix_original=True):
+                         backing_path=None, voice_path=None, mix_original=True,
+                         vocal_db=None):
     try:
         with LOCK:
             user = JOBS[job_id].get("user", "shared")
@@ -3771,8 +4045,7 @@ def _run_create_song_job(job_id, title, lyrics, style, instruments, singer, back
 
         # NEW: Use structured output directory
         run_dir = get_song_output_dir(user, stem, AI_SONG_PRODUCTION)
-        songs_folder = run_dir / "Songs"
-        songs_folder.mkdir(parents=True, exist_ok=True)
+        songs_folder = get_run_folder(run_dir, "Songs")
 
         if include_title_lyrics:
             (songs_folder / "lyrics.txt").write_text(f"{title}\n\n{lyrics}\n", encoding="utf-8")
@@ -3788,6 +4061,7 @@ def _run_create_song_job(job_id, title, lyrics, style, instruments, singer, back
             "own_backing_track": bool(backing_path),
             "voice_reference": bool(voice_path),
             "mix_original": bool(mix_original),
+            "vocal_over_music_db": vocal_db,          # null = left as generated
         }, indent=2), encoding="utf-8")
 
         backing_in = voice_in = None
@@ -3810,11 +4084,12 @@ def _run_create_song_job(job_id, title, lyrics, style, instruments, singer, back
         if backing_in:
             out_path, tracks, final_status = _generate_song_on_backing_track(
                 songs_folder, stem, lyrics, style, singer, language,
-                str(backing_in), str(voice_in) if voice_in else None, mix_original, _p)
+                str(backing_in), str(voice_in) if voice_in else None, mix_original, _p,
+                vocal_db=vocal_db)
         elif stems and backend == "ace" and singer != "instrumental":
             out_path, tracks, final_status = _generate_song_and_backtrack(
                 songs_folder, stem, lyrics, style, instruments, singer, language, _p,
-                ref_audio=str(voice_in) if voice_in else None)
+                ref_audio=str(voice_in) if voice_in else None, vocal_db=vocal_db)
         else:
             _p(15, f"Generating song with {backend}...")
             out_path = songs_folder / f"{stem}.wav"
@@ -3822,6 +4097,9 @@ def _run_create_song_job(job_id, title, lyrics, style, instruments, singer, back
                                 str(out_path), backend=backend, progress_cb=_p,
                                 language=language,
                                 ref_audio=str(voice_in) if voice_in else None)
+            if backend == "ace" and singer != "instrumental" and vocal_db is not None:
+                _p(80, "Raising the voice above the music (1-3 min)...")
+                _lift_vocals_in_song(out_path, vocal_db, lambda m: _p(80, "Voice level: " + str(m)))
 
         with LOCK:
             JOBS[job_id]["progress"] = 100
@@ -3845,7 +4123,7 @@ def _run_create_song_job(job_id, title, lyrics, style, instruments, singer, back
 
 
 PRESET_KEYS = ("title", "style", "singer", "instruments", "backend", "lyrics", "language",
-               "include_title_lyrics", "backtrack")
+               "include_title_lyrics", "backtrack", "vocal_level")
 PRESET_BOOL_KEYS = ("include_title_lyrics", "backtrack")
 PRESET_MAX_BYTES = 200_000
 
@@ -3893,7 +4171,69 @@ def list_song_presets():
     items = []
     for f in sorted(_preset_dir().glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
         items.append({"name": f.stem, "saved": int(f.stat().st_mtime)})
-    return jsonify(presets=items, last=_get_last_preset())
+    last_at = 0
+    try:
+        if _get_last_preset():
+            last_at = int(_last_preset_file().stat().st_mtime)
+    except OSError:
+        pass
+    return jsonify(presets=items, last=_get_last_preset(), last_at=last_at)
+
+
+@app.route("/api/song_last_run", methods=["GET"])
+@login_required
+def song_last_run():
+    """Settings of the most recent AI-song run, read from its own folder:
+    <Song>_Ai_Song_Production/Songs/<date_time>/song_request.json (+ lyrics.txt).
+    Lets the Create Song window default to the last generated song even when
+    no setup was ever saved by hand."""
+    _, outdir = user_dirs(session["user"])
+    cands = list(outdir.glob("*/Songs/*/song_request.json"))
+    cands += list(outdir.glob("*/Songs/song_request.json"))      # older layout
+    best = None
+    for f in cands:
+        try:
+            mt = f.stat().st_mtime
+        except OSError:
+            continue
+        if best is None or mt > best[0]:
+            best = (mt, f)
+    if best is None:
+        return jsonify(found=False)
+    mt, f = best
+    try:
+        req = json.loads(f.read_text(encoding="utf-8"))
+    except Exception:
+        return jsonify(found=False)
+
+    title = str(req.get("title") or "")
+    lyrics = ""
+    lf = f.parent / "lyrics.txt"
+    if lf.exists():
+        try:
+            lyrics = lf.read_text(encoding="utf-8")
+            head = f"{title}\n\n"
+            if title and lyrics.startswith(head):          # file is "<title>\n\n<lyrics>\n"
+                lyrics = lyrics[len(head):]
+            lyrics = lyrics.rstrip("\n")
+        except Exception:
+            lyrics = ""
+    instruments = req.get("instruments") or []
+    settings = {
+        "title": title,
+        "lyrics": lyrics,
+        "style": str(req.get("style") or ""),
+        "singer": str(req.get("singer") or "auto"),
+        "backend": str(req.get("backend") or "ace"),
+        "language": str(req.get("language") or "auto"),
+        "instruments": [str(i) for i in instruments] if isinstance(instruments, list) else [],
+        "include_title_lyrics": bool(req.get("include_title_lyrics", True)),
+        "backtrack": bool(req.get("with_backtrack", True)),
+        "vocal_level": (_vocal_level_key(req["vocal_over_music_db"])
+                        if "vocal_over_music_db" in req else _vocal_level_key(ACE_VOCAL_LIFT_DEFAULT_DB)),
+    }
+    return jsonify(found=True, title=title, saved=int(mt),
+                   run=f.parent.relative_to(outdir).as_posix(), settings=settings)
 
 
 @app.route("/api/song_presets", methods=["POST"])
@@ -4061,7 +4401,12 @@ def _latest_kind_dirs(outdir, folder_names):
         if legacy.is_dir():
             cands.append(legacy)
         if cands:
-            result.append(max(cands, key=_newest))
+            best = max(cands, key=_newest)
+            # new layout: open the newest <date_time> run inside the kind folder
+            runs = sorted((d for d in best.iterdir()
+                           if d.is_dir() and _is_run_stamp(d.name)),
+                          key=lambda d: d.name)
+            result.append(runs[-1] if runs else best)
     return result
 
 
@@ -4070,14 +4415,7 @@ def _latest_kind_dirs(outdir, folder_names):
 def browse_folder(kind):
     _, outdir = user_dirs(session["user"])
 
-    folder_names_for_kind = {
-        "srt": ["SRT"],
-        "karaoke": ["Karaoke"],
-        "lyrics_tab": ["Lyrics", "Tabs"],
-        "transcription": ["Transcription"],
-        "songs": ["Songs"],
-    }
-    folder_names = folder_names_for_kind.get(kind)
+    folder_names = _KIND_FOLDERS.get(kind)
     if folder_names is None:
         return jsonify(error=f"Unknown browse kind: {kind}"), 400
 
@@ -4085,7 +4423,9 @@ def browse_folder(kind):
     found = []
     for root, dirs, files in os.walk(outdir):
         # Check if the current folder is one of our target types
-        if Path(root).name in folder_names:
+        _rp = Path(root)
+        if _rp.name in folder_names or (
+                _rp.parent.name in folder_names and _is_run_stamp(_rp.name)):
             for f in files:
                 p = Path(root) / f
                 found.append(p)
@@ -4097,21 +4437,37 @@ def browse_folder(kind):
         "size_mb": round(p.stat().st_size / (1024 * 1024), 2),
     } for p in found]
 
-    if _is_local_request():
-        # Folders now live at outputs/<user>/<Song>/<Kind>/ so open the newest
-        # real one; if none exist yet, open the user's outputs root instead.
-        targets = _latest_kind_dirs(outdir, folder_names) or [outdir]
-        opened_any = False
-        shown = []
-        for t in targets:
-            if _open_native_folder(t):
-                opened_any = True
-                rel = str(t.relative_to(outdir))
-                shown.append(rel if rel != "." else "outputs")
-        if opened_any:
-            return jsonify(ok=True, opened=True, path=" & ".join(shown))
+    # Always return the Song -> Kind -> Run tree so the page can show the song
+    # names first and let the user drill down. On the computer running the
+    # program the page also offers "Open folder" buttons (see open_output_folder).
+    return jsonify(ok=True, opened=False, path=" & ".join(folder_names), files=files,
+                   songs=_output_tree(outdir, set(folder_names)),
+                   local=_is_local_request())
 
-    return jsonify(ok=True, opened=False, path=" & ".join(folder_names), files=files)
+
+@app.route("/api/open_output_folder", methods=["POST"])
+@login_required
+def open_output_folder():
+    """Open a song / kind / run folder in the file explorer (local machine only).
+    Body: {"path": "<relative path under outputs/<user>/>"}; a file path opens
+    its parent folder."""
+    if not _is_local_request():
+        return jsonify(error="Folders can only be opened on the computer "
+                             "that is running this program."), 403
+    data = request.get_json(silent=True) or {}
+    rel = (data.get("path") or "").strip().replace("\\", "/")
+    _, outdir = user_dirs(session["user"])
+    root = outdir.resolve()
+    target = (outdir / rel).resolve() if rel else root
+    if root != target and root not in target.parents:
+        return jsonify(error="Invalid path"), 400
+    if target.is_file():
+        target = target.parent
+    if not target.is_dir():
+        return jsonify(error="Folder not found"), 404
+    if not _open_native_folder(target):
+        return jsonify(error="Could not open the folder"), 500
+    return jsonify(ok=True, path=str(target.relative_to(root)) or ".")
 
 
 # # ============================================================
@@ -4204,7 +4560,7 @@ def browse_folder(kind):
 #     return jsonify(ok=True)
 
 # ============================================================
-# STUDIO AUDIO EDITOR LAUNCHER 
+# STUDIO AUDIO EDITOR LAUNCHER
 # ============================================================
 AUDIO_EDITOR = BASE_DIR / "studio_audio_editor.py"
 STUDIO_EDITOR_ENV_PATH = os.environ.get("STUDIO_EDITOR_PATH", "").strip()

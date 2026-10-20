@@ -1,0 +1,7 @@
+@echo off
+cd /d "%~dp0"
+set ANTHROPIC_DEFAULT_OPUS_MODEL=qwen3-32k
+set ANTHROPIC_DEFAULT_SONNET_MODEL=qwen3-32k
+set ANTHROPIC_DEFAULT_HAIKU_MODEL=qwen3-32k
+set CLAUDE_CODE_MAX_CONTEXT_TOKENS=32768
+ollama launch claude --model qwen3-32k
