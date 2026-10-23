@@ -30,7 +30,7 @@ import time
 import webview
 from waitress import serve
 
-from app_old import app  # your existing Flask app, completely unchanged
+from app import app  # your existing Flask app, completely unchanged
 
 
 def _free_port() -> int:

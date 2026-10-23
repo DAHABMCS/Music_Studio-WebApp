@@ -15,7 +15,7 @@ python -c "import sys;sys.exit(0 if sys.version_info>=(3,10) else 1)"
 if errorlevel 1 ( echo [ERROR] Python 3.10 or newer is required to build. & goto :fail )
 
 rem ---- 2. Required project files -------------------------------------------------------
-for %%F in (launcher.py MusicStudio.spec Securit_Management.spec StudioEditor.spec studio_audio_editor.py collect_prereqs.py check_requirements.py verify_dist.py app.py app_paths.py user_store.py Securit_Management.py requirements.txt) do (
+for %%F in (launcher.py MusicStudio.spec Securit_Management.spec StudioEditor.spec studio_audio_editor.py collect_prereqs.py check_requirements.py verify_dist.py app.py app_paths.py user_store.py Securit_Management.py transcription_extras.py requirements.txt) do (
   if not exist "%%F" ( echo [ERROR] Missing file in the project root: %%F & goto :fail )
 )
 for %%D in (templates static) do (
@@ -25,7 +25,7 @@ if exist "MUSIC-STUDIO-WebbApp.spec" echo [note] The old MUSIC-STUDIO-WebbApp.sp
 if not exist "extras\README.txt" echo [note] extras\ folder not found - README / ACE-Step scripts will not be added to the installer.
 
 rem ---- 2b. Catch syntax errors now, not after a 20-minute build ------------------------
-python -m py_compile app.py app_paths.py user_store.py Securit_Management.py studio_audio_editor.py
+python -m py_compile app.py app_paths.py user_store.py Securit_Management.py studio_audio_editor.py transcription_extras.py
 if errorlevel 1 ( echo [ERROR] A project .py file has a syntax error - fix it and run again & goto :fail )
 
 rem ---- 3. Collect what the installer ships (ffmpeg + VC++ runtime) ---------------------
@@ -51,7 +51,6 @@ rem ---- 5. Build environment + PyInstaller ------------------------------------
 echo.
 echo [3/5] Preparing the build environment ...
 
-rem -- Clean any broken leftover venv ---------------------------------------
 if exist ".buildenv" (
   if not exist ".buildenv\Scripts\python.exe" (
     echo [note] Removing incomplete .buildenv ...
@@ -59,7 +58,6 @@ if exist ".buildenv" (
   )
 )
 
-rem -- Try to create the venv, show real error if it fails ------------------
 if not exist ".buildenv\Scripts\python.exe" (
   echo Creating virtual environment in .buildenv ...
   python -m venv .buildenv
@@ -88,11 +86,9 @@ if exist dist rmdir /s /q dist
 if errorlevel 1 ( echo [ERROR] PyInstaller failed & goto :fail )
 if not exist "dist\MusicStudio\MusicStudio.exe" ( echo [ERROR] dist\MusicStudio\MusicStudio.exe was not created & goto :fail )
 
-rem -- the payload inside dist must match the project files (catches a stale requirements.txt)
 python verify_dist.py
 if errorlevel 1 ( echo [ERROR] dist payload does not match the project files & goto :fail )
 
-rem ---- 4b. Build the User Manager (Securit_Management) and ship it inside the app folder
 echo.
 echo [4b/5] Building User Manager ...
 "%BUILD_PY%" -m PyInstaller --noconfirm --clean --distpath "build\um_dist" --workpath "build\um_work" Securit_Management.spec
@@ -101,7 +97,6 @@ if not exist "build\um_dist\UserManager\Securit_Management.exe" ( echo [ERROR] S
 xcopy /e /i /y /q "build\um_dist\UserManager" "dist\MusicStudio\UserManager" >nul
 if errorlevel 1 ( echo [ERROR] Could not copy User Manager into dist & goto :fail )
 
-rem ---- 4c. Build the Studio audio editor from the CURRENT studio_audio_editor.py
 echo.
 echo [4c/5] Building Studio Editor ...
 if exist "build\ed_dist" rmdir /s /q "build\ed_dist"
@@ -114,13 +109,11 @@ xcopy /e /i /y /q "build\ed_dist\StudioEditor" "dist\MusicStudio\StudioEditor" >
 if errorlevel 1 ( echo [ERROR] Could not copy Studio Editor into dist & goto :fail )
 for %%I in (studio_audio_editor.py) do echo [note] Editor source used: %%~fI  ^(%%~tI^)
 
-rem files users should SEE next to the exe
 if exist "extras\README.txt"           copy /y "extras\README.txt"           "dist\MusicStudio\" >nul
 if exist "extras\start_ace_step.bat"   copy /y "extras\start_ace_step.bat"   "dist\MusicStudio\" >nul
 if exist "extras\install_ace_step.bat" copy /y "extras\install_ace_step.bat" "dist\MusicStudio\" >nul
 if exist "extras\install_optional_tools.bat" copy /y "extras\install_optional_tools.bat" "dist\MusicStudio\" >nul
 
-rem ---- 6. Installer (Inno Setup) or portable zip ---------------------------------------
 echo.
 echo [5/5] Creating the installer ...
 if not exist installer_output mkdir installer_output

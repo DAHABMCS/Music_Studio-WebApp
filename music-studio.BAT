@@ -1,7 +1,7 @@
 @echo off
 setlocal
 rem ============================================================
-rem  Build MUSIC_STUDIO_WEB with PyInstaller (same settings as the JSON)
+rem  Build MUSIC_STUDIO_WEB with PyInstaller (manual build, parallel to build_installer.bat)
 rem  Put this file in C:\Users\dahab\Music_Studio-webapp and double-click it
 rem ============================================================
 
@@ -26,6 +26,15 @@ if errorlevel 1 (
     echo.
     echo ERROR: flask/werkzeug are missing or broken in this venv.
     echo Run:  "%PY%" -m pip install --upgrade --force-reinstall flask werkzeug flask-login
+    pause
+    exit /b 1
+)
+
+"%PY%" -c "import pretty_midi, mido, music21; print('pretty_midi/mido/music21 OK')"
+if errorlevel 1 (
+    echo.
+    echo ERROR: pretty_midi / mido / music21 is missing in this venv.
+    echo Run:  "%PY%" -m pip install pretty_midi mido music21
     pause
     exit /b 1
 )
@@ -81,6 +90,8 @@ echo === Building (this can take a long time) ===
   --collect-all reportlab ^
   --collect-all demucs ^
   --collect-all madmom ^
+  --collect-all pretty_midi ^
+  --collect-all mido ^
   --collect-all music21 ^
   --hidden-import werkzeug.http ^
   --hidden-import werkzeug.serving ^
@@ -103,9 +114,25 @@ echo === Building (this can take a long time) ===
   --hidden-import chardet ^
   --hidden-import PIL ^
   --hidden-import numpy ^
+  --hidden-import transcription_extras ^
+  --hidden-import pretty_midi ^
+  --hidden-import pretty_midi.containers ^
+  --hidden-import pretty_midi.instrument ^
+  --hidden-import pretty_midi.pretty_midi ^
+  --hidden-import pretty_midi.utilities ^
+  --hidden-import mido ^
+  --hidden-import mido.backends ^
+  --hidden-import mido.backends.backend ^
+  --hidden-import mido.backends.rtmidi ^
+  --hidden-import mido.midifiles ^
+  --hidden-import mido.midifiles.meta ^
+  --hidden-import mido.midifiles.midifiles ^
+  --hidden-import mido.midifiles.tracks ^
+  --hidden-import mido.midifiles.units ^
   --add-data "%PROJ%\assets;assets" ^
   --add-data "%PROJ%\static;static" ^
   --add-data "%PROJ%\templates;templates" ^
+  --add-data "%PROJ%\transcription_extras.py;." ^
   %FFMPEG_ARG% ^
   --exclude-module IPython ^
   --exclude-module notebook ^

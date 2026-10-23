@@ -1,9 +1,9 @@
 # ---------------------------------------------------------------------------
-# Libraries installed on the user's PC at first run, AFTER PyTorch/torchaudio (the launcher installs
-# those itself as GPU or CPU build - do NOT list torch / torchaudio here).
-# Based on the package lists in your old MUSIC-STUDIO-WebbApp.spec and the bootstrap in app.py.
-# build_installer.bat runs check_requirements.py, which scans ALL your .py files (subtitle_engine.py,
-# MUSIC.py, midi_refine.py, user_store.py ...) and warns about anything imported but not listed here.
+# Libraries installed on the user's PC at first run, AFTER PyTorch/torchaudio (the launcher
+# installs those itself as GPU or CPU build - do NOT list torch / torchaudio here).
+# build_installer.bat runs check_requirements.py, which scans ALL .py files in the payload
+# (subtitle_engine.py, MUSIC.py, midi_refine.py, transcription_extras.py, ...) and warns
+# about anything imported but not listed here.
 # ---------------------------------------------------------------------------
 flask>=3.0
 werkzeug>=3.0
@@ -15,12 +15,12 @@ scipy
 soundfile
 audioread
 librosa
-music21
+pretty_midi                # per-instrument MIDI export + vocal data sheet
+music21                    # MusicXML for vocal scores with lyrics
 reportlab
 pillow
-soundfile
 sounddevice
-demucs                     # vocal / backtrack separation
+demucs                     # vocal / backtrack separation + 6-stem per-instrument split
 transformers               # also used for MusicGen
 safetensors
 tokenizers
@@ -30,6 +30,6 @@ sentencepiece
 cryptography
 pywebview
 openai-whisper
-tiktoken                    # whisper tokenizer (also pulled in by openai-whisper)
+tiktoken
 stable-ts
 mido
