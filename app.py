@@ -1805,6 +1805,11 @@ def _run_full_transcription_job(job_id, input_path):
                 if (out_dir / "04_RHYTHM_CHORDS.mid").exists() else None)
             grid_mode = "ticks" if rf else "seconds"
 
+            try:
+                import librosa as _lb
+                _song_seconds = float(_lb.get_duration(path=str(input_path)))
+            except Exception:
+                _song_seconds = None
             se_parts = []
             for _k, _kind in (("vocals", "vocals"), ("drums", "drums"),
                               ("bass", "bass"), ("piano", "piano"),
@@ -1826,7 +1831,7 @@ def _run_full_transcription_job(job_id, input_path):
             se_res = se.generate_sheets(
                 out_dir, se_parts, _display_title(stem), tempo_bpm,
                 srt_text=srt_text, beat_source=(rf.get("solo") if rf else None),
-                log=print)
+                song_seconds=_song_seconds, log=print)
             sheet_files = dict(se_res["sheets"])
             if se_res.get("vocal_data"):
                 sheet_files["vocal_data_sheet"] = se_res["vocal_data"]

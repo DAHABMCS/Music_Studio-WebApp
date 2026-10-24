@@ -6,7 +6,10 @@ Install once:      pip install numpy scipy soundfile sounddevice
 Run:               python studio_audio_editor.py [song.wav ...]
 """
 import os
+import queue
+import re
 import sys
+import threading
 import json
 import math
 import shutil
@@ -402,44 +405,187 @@ def fx_noise_reduce(x, rate, threshold_db=-40.0, smooth=0.3):
     return clean.astype(np.float32)
 
 
+# ===== Key Changer DSP (numpy/scipy only) =====================================
+PV_PROGRESS = None          # optional callback(fraction 0..1) used by the Key Changer panel
+
+KEY_NAMES_MAJOR = ["C", "Db", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
+KEY_NAMES_MINOR = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "G#", "A", "Bb", "B"]
+_KS_MAJOR = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
+_KS_MINOR = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+_PC_LOOKUP = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
+
+
+def key_label(tonic, mode):
+    names = KEY_NAMES_MAJOR if mode == "major" else KEY_NAMES_MINOR
+    return f"{names[tonic % 12]} {mode}"
+
+
+def parse_key(text):
+    """'F#m', 'Bb major', 'a min', 'D' -> (tonic 0-11, mode or None).  None if not understood."""
+    s = (text or "").strip().replace("\u266f", "#").replace("\u266d", "b")
+    m = re.fullmatch(r"([A-Ga-g])\s*([#b]?)\s*(.*)", s)
+    if not m:
+        return None
+    pc = _PC_LOOKUP[m.group(1).upper()] + {"#": 1, "b": -1, "": 0}[m.group(2)]
+    rest = m.group(3).strip()
+    if rest == "":
+        mode = None
+    elif rest == "m" or rest.lower() in ("min", "minor"):
+        mode = "minor"
+    elif rest == "M" or rest.lower() in ("maj", "major"):
+        mode = "major"
+    else:
+        return None
+    return pc % 12, mode
+
+
+def detect_song_key(x, rate, max_seconds=150):
+    """Krumhansl-Schmuckler key finder on a tuning-corrected chromagram.
+    x: (N,) or (N,2) float array.  Returns dict(tonic, mode, label, margin, cents, relative)."""
+    x = np.asarray(x, dtype=np.float32)
+    mono = x.mean(axis=1) if x.ndim == 2 else x
+    if len(mono) > max_seconds * rate:                       # analyse the middle of long songs
+        a = (len(mono) - int(max_seconds * rate)) // 2
+        mono = mono[a:a + int(max_seconds * rate)]
+    sr = 22050
+    if int(rate) != sr:
+        fr = Fraction(sr, int(rate)).limit_denominator(1000)
+        mono = signal.resample_poly(mono, fr.numerator, fr.denominator).astype(np.float32)
+    n_fft, hop = 8192, 4096
+    if len(mono) < n_fft * 2:
+        raise ValueError("Audio too short to detect a key.")
+    frames = np.lib.stride_tricks.sliding_window_view(mono, n_fft)[::hop]
+    win = np.hanning(n_fft).astype(np.float32)
+    mags = np.abs(np.fft.rfft(frames * win, axis=1)).astype(np.float32)
+    rms = np.sqrt(np.mean(frames ** 2, axis=1))
+    keep = rms > 0.15 * np.median(rms[rms > 0]) if np.any(rms > 0) else np.ones(len(rms), bool)
+    mags = mags[keep]
+    f = np.fft.rfftfreq(n_fft, 1.0 / sr)
+    band = (f >= 65) & (f <= 2100)
+    fb = f[band]
+    m = 69 + 12 * np.log2(fb / 440.0)                         # fractional MIDI note
+    # tuning offset from the sustained peaks of the long-term spectrum
+    lt = mags.mean(axis=0)[band]
+    pk, _ = signal.find_peaks(lt, prominence=0.2 * lt.max() if lt.max() > 0 else 0)
+    if len(pk) >= 4:
+        dev = m[pk] - np.round(m[pk])
+        w = lt[pk]
+        ang = np.arctan2(np.sum(w * np.sin(2 * np.pi * dev)), np.sum(w * np.cos(2 * np.pi * dev)))
+        tuning = ang / (2 * np.pi)
+    else:
+        tuning = 0.0
+    madj = m - tuning
+    near = np.round(madj)
+    closeness = np.cos(np.pi * (madj - near)) ** 2            # weight bins that sit on a pitch centre
+    fold = np.zeros((len(fb), 12), np.float32)
+    fold[np.arange(len(fb)), (near.astype(int) % 12)] = closeness
+    comp = np.log1p(30.0 * mags[:, band] / (mags[:, band].max() + 1e-9))
+    chroma = comp @ fold
+    chroma /= (chroma.max(axis=1, keepdims=True) + 1e-9)
+    prof = chroma.mean(axis=0)
+    scores = []
+    for t in range(12):
+        scores.append((np.corrcoef(prof, np.roll(_KS_MAJOR, t))[0, 1], t, "major"))
+        scores.append((np.corrcoef(prof, np.roll(_KS_MINOR, t))[0, 1], t, "minor"))
+    scores.sort(reverse=True)
+    best, second = scores[0], scores[1]
+    tonic, mode = best[1], best[2]
+    rel = ((tonic + 9) % 12, "minor") if mode == "major" else ((tonic + 3) % 12, "major")
+    margin = float(best[0] - second[0])
+    return dict(tonic=tonic, mode=mode, label=key_label(tonic, mode), margin=margin,
+                confidence=("None" if best[0] < 0.5 else "High" if margin > 0.08 else ("Medium" if margin > 0.03 else "Low")),
+                score=float(best[0]), cents=float(tuning * 100), relative=key_label(*rel),
+                alt=key_label(second[1], second[2]))
+
+
+def _mix_for_key(datas):
+    """datas = [(stereo array, offset)] -> one array to analyse (several tracks are summed)."""
+    if len(datas) == 1:
+        return datas[0][0]
+    a = min(o for _d, o in datas)
+    b = max(o + len(d) for d, o in datas)
+    out = np.zeros((b - a, 2), np.float32)
+    for d, o in datas:
+        out[o - a:o - a + len(d)] += d
+    return out
+
+
 def _time_stretch(x, rate, target_len):
-    if len(x) == 0 or target_len <= 0:
+    """Phase-vocoder time stretch (pitch preserved) with identity phase locking.
+    Output has exactly `target_len` samples.  Works for mono or stereo."""
+    x = np.asarray(x, dtype=np.float32)
+    n = len(x)
+    if n == 0 or target_len <= 0:
         return x
-    if len(x) == target_len:
-        return x.astype(np.float32)
-    nper, nover = 1024, 768
-    _, _, Z = signal.stft(x.T, rate, nperseg=nper, noverlap=nover, axis=-1)
-    ratio = target_len / len(x)
-    new_n = int(round(Z.shape[1] * ratio))
-    out_frames = np.zeros((Z.shape[0], new_n), dtype=complex)
-    for k in range(new_n):
-        pos = k / ratio
-        i0 = int(pos)
-        i1 = min(Z.shape[1] - 1, i0 + 1)
-        frac = pos - i0
-        if i1 == i0:
-            out_frames[:, k] = Z[:, i0]
+    if n == target_len:
+        return x
+    mono_in = x.ndim == 1
+    if mono_in:
+        x = x[:, None]
+    C = x.shape[1]
+    n_fft, hop = 4096, 1024
+    nb = n_fft // 2 + 1
+    ratio = target_len / n
+    win = np.hanning(n_fft + 1)[:-1].astype(np.float32)
+    pad = n_fft
+    xp = np.pad(x.T, ((0, 0), (pad, pad + n_fft)))
+    n_frames = int(math.ceil((pad + target_len) / hop)) + 1
+    omega = (2 * np.pi * np.arange(nb) / n_fft).astype(np.float32)
+    idx = np.arange(nb)
+    out = np.zeros((C, (n_frames - 1) * hop + n_fft), np.float32)
+    prev_ph = prev_psi = None
+    prev_pos = 0
+    max_pos = xp.shape[1] - n_fft
+    for k in range(n_frames):
+        pos = int(round((k * hop + n_fft / 2 - pad) / ratio - n_fft / 2 + pad))
+        pos = min(max(pos, 0), max_pos)
+        X = np.fft.rfft(xp[:, pos:pos + n_fft] * win, axis=-1)
+        mag = np.abs(X)
+        ph = np.angle(X)
+        if prev_ph is None:
+            psi = ph
         else:
-            mag = (1 - frac) * np.abs(Z[:, i0]) + frac * np.abs(Z[:, i1])
-            phase = (1 - frac) * np.angle(Z[:, i0]) + frac * np.angle(Z[:, i1])
-            out_frames[:, k] = mag * np.exp(1j * phase)
-    _, y = signal.istft(out_frames, rate, nperseg=nper, noverlap=nover, axis=-1)
-    y = y[:, :target_len]
-    if y.shape[0] < target_len:
-        y = np.pad(y, ((0, target_len - y.shape[0]), (0, 0)))
-    y = y.T
-    if y.shape[1] < 2:
-        y = np.repeat(y, 2, axis=1)
-    return np.ascontiguousarray(y[:, :2], dtype=np.float32)
+            d = max(1, pos - prev_pos)
+            dphi = ph - prev_ph - omega * d
+            dphi -= 2 * np.pi * np.round(dphi / (2 * np.pi))
+            psi_std = prev_psi + (omega * d + dphi) * (hop / d)
+            pk = np.zeros(mag.shape, bool)
+            c = mag[:, 2:-2]
+            pk[:, 2:-2] = (c > mag[:, 1:-3]) & (c > mag[:, 3:-1]) & (c >= mag[:, :-4]) & (c >= mag[:, 4:])
+            left = np.maximum.accumulate(np.where(pk, idx, -1), axis=1)
+            right = np.minimum.accumulate(np.where(pk, idx, 2 * nb)[:, ::-1], axis=1)[:, ::-1]
+            use_left = (left >= 0) & ((idx - left <= right - idx) | (right >= 2 * nb))
+            near = np.where(use_left, left, np.where(right < 2 * nb, right, idx))
+            psi = (np.take_along_axis(psi_std, near, axis=1) + ph - np.take_along_axis(ph, near, axis=1))
+        out[:, k * hop:k * hop + n_fft] += np.fft.irfft(mag * np.exp(1j * psi), n_fft, axis=-1) * win
+        prev_ph, prev_psi, prev_pos = ph, psi, pos
+        if PV_PROGRESS is not None and (k & 63) == 0:
+            PV_PROGRESS(k / n_frames)
+    res = (out[:, pad:pad + target_len] / 1.5).T
+    res = np.ascontiguousarray(res, dtype=np.float32)
+    if len(res) < target_len:
+        res = np.pad(res, ((0, target_len - len(res)), (0, 0)))
+    if mono_in:
+        return res[:, 0]
+    if res.shape[1] < 2:
+        res = np.repeat(res, 2, axis=1)
+    return np.ascontiguousarray(res[:, :2])
 
 
 def fx_pitch_shift(x, rate, semitones):
+    """Shift pitch by `semitones` (length unchanged): stretch by the pitch ratio, then resample back."""
     if abs(semitones) < 0.01 or len(x) == 0:
         return x
+    n = len(x)
     factor = 2 ** (semitones / 12.0)
-    fr = Fraction(factor).limit_denominator(1000)
-    shifted = signal.resample_poly(x, fr.numerator, fr.denominator, axis=0)
-    return _time_stretch(shifted, rate, len(x))
+    stretched = _time_stretch(x, rate, int(round(n * factor)))
+    fr = Fraction(factor).limit_denominator(256)
+    y = signal.resample_poly(stretched, fr.denominator, fr.numerator, axis=0).astype(np.float32)
+    if len(y) >= n:
+        y = y[:n]
+    else:
+        y = np.pad(y, ((0, n - len(y)),) + ((0, 0),) * (y.ndim - 1))
+    return np.clip(y, -1.0, 1.0)
 
 
 def fx_tempo(x, rate, factor):
@@ -892,16 +1038,11 @@ class Auto5StarDialog(tk.Toplevel):
     """Auto 5_Star Enhancement panel.
 
     Layout (top to bottom):
-      header          - title + audio stats + live progress line
+      header          - title + audio stats
       recommendations - scrollable list of checkboxes (fills available space)
       footer          - Select All / None / Invert + Cancel + Run Enhancement
-
-    Run behaviour:
-      The original track is NEVER modified. On Run, a new track named
-      "<original> — Enhanced 5_Star" is inserted directly BELOW the original
-      (same offset), and the enabled recommendations are applied to it one at
-      a time. After each step the editor redraws, so the enhanced waveform
-      visibly grows into shape below the original for easy A/B comparison.
+    The footer is packed with `side="bottom"` before the list grows, so it
+    is always visible regardless of how many recommendations there are.
     """
     WIDTH = 2240
     HEIGHT = 1640
@@ -984,14 +1125,10 @@ class Auto5StarDialog(tk.Toplevel):
                  text="Analyze \u2192 review recommendations \u2192 run enhancement chain",
                  bg="#1f2530", fg="#c7ccd8",
                  font=fnt(28), anchor="w").pack(fill="x", padx=u(24))
-        self.stats_lbl = tk.Label(header, text=self.stats.summary(),
-                                  bg="#1f2530", fg="#9fd2ff",
-                                  font=fnt(26), anchor="w")
-        self.stats_lbl.pack(fill="x", padx=u(24), pady=(0, u(4)))
-        self.progress_lbl = tk.Label(header, text="",
-                                     bg="#1f2530", fg="#ffd966",
-                                     font=fnt(24, True), anchor="w")
-        self.progress_lbl.pack(fill="x", padx=u(24), pady=(0, u(16)))
+        tk.Label(header, text=self.stats.summary(),
+                 bg="#1f2530", fg="#9fd2ff",
+                 font=fnt(26), anchor="w").pack(fill="x", padx=u(24),
+                                                pady=(0, u(16)))
 
         # ---- footer (bottom, packed BEFORE the list so it is always visible) ----
         foot = tk.Frame(self, bg=P["bottom"])
@@ -1079,9 +1216,8 @@ class Auto5StarDialog(tk.Toplevel):
                        "spectral balance, noise floor and stereo width. "
                        "Recommendations are ordered by importance. "
                        "Uncheck anything you don't want \u2014 checked items turn green. "
-                       "Press  \u25b6  Run Enhancement  to apply the enabled steps to a NEW "
-                       "track placed below the original (so you can A/B them side by side). "
-                       "The original is never modified."),
+                       "Press  \u25b6  Run Enhancement  to apply the enabled steps and save "
+                       "the enhanced file."),
                  bg=P["bottom"], fg="#16161a", font=fnt(24),
                  justify="left", anchor="w", wraplength=u(1400)).grid(
                      row=0, column=0, sticky="ew")
@@ -1178,43 +1314,28 @@ class Auto5StarDialog(tk.Toplevel):
             self.preview_lbl.config(text=f"{n} of {total} step(s) enabled.\n"
                                          f"Estimated time: {n * 0.6:.1f}s")
 
-    # ---------------- progress helpers ----------------
-    def _set_progress(self, text, color="#2f6fe0"):
-        try:
-            self.progress_lbl.config(text=text, fg=color)
-        except Exception:
-            pass
-        try:
-            self.update_idletasks()
-        except Exception:
-            pass
+    # ---------------- base name for output ----------------
+    def _song_base_name(self):
+        """Return the song's base name (no folder, no extension).
 
-    def _apply_step_to_enhanced(self, rec, enhanced_track):
-        """Apply one recommendation to the enhanced lane and refresh the
-        editor so the user sees the new waveform grow step by step."""
-        rate = self.rate
-        try:
-            new_data = rec.effect(enhanced_track.data, rate)
-            if new_data.ndim != 2 or new_data.shape[1] != 2:
-                new_data = to_stereo(new_data)
-            enhanced_track.data = to_stereo(new_data)
-            ok, err = True, None
-        except Exception as ex:
-            ok, err = False, str(ex)
-
-        try:
-            self.app.redraw()
-            self.app.update_idletasks()
-        except Exception:
-            pass
-
-        try:
-            s = AudioAnalyzer().analyze(enhanced_track.data, rate)
-            self.stats_lbl.config(text=s.summary(), fg="#9fd2ff")
-        except Exception:
-            pass
-
-        return ok, err
+        Priority:
+          1. project file path (if saved)
+          2. source audio file path remembered on the track
+          3. the track's name (fallback)
+        """
+        base = None
+        if self.app.proj.path:
+            base = os.path.splitext(os.path.basename(self.app.proj.path))[0]
+        if not base:
+            src = getattr(self.target_track, "source_path", None)
+            if src:
+                base = os.path.splitext(os.path.basename(src))[0]
+        if not base:
+            base = self.target_track.name or "audio"
+        # sanitize
+        for ch in '<>:"/\\|?*':
+            base = base.replace(ch, "_")
+        return base
 
     # ---------------- run ----------------
     def run(self):
@@ -1224,84 +1345,84 @@ class Auto5StarDialog(tk.Toplevel):
                                 "Tick at least one recommendation first.",
                                 parent=self)
             return
-
         self.run_btn.state(["disabled"])
         self.config(cursor="watch")
-        self._set_progress("Preparing\u2026")
         self.update_idletasks()
 
-        app = self.app
-        proj = app.proj
-
-        # one undo entry for the whole operation
-        proj.push_undo()
-
-        src = self.target_track
-        try:
-            src_index = proj.tracks.index(src)
-        except ValueError:
-            src_index = max(0, len(proj.tracks) - 1)
-
-        # --- create the enhanced lane directly BELOW the source ---
-        enhanced = Track(
-            name=f"{src.name} \u2014 Enhanced 5_Star",
-            data=src.data.copy(),
-            offset=src.offset,
-        )
-        enhanced.gain, enhanced.pan = src.gain, src.pan
-        enhanced.source_path = src.source_path
-        self._enhanced_track = enhanced
-
-        insert_at = src_index + 1
-        proj.tracks.insert(insert_at, enhanced)
-
-        # keep the enhanced lane selected so the user's edits target it
-        app.selected = {insert_at}
-        app.redraw()
-        app.update_idletasks()
-
-        # --- apply the chain step by step to the enhanced lane ---
-        ordered = sorted(selected, key=lambda r: r.priority)
+        data = self.original.copy()
+        rate = self.rate
         report = []
-        total = len(ordered)
-
-        for i, rec in enumerate(ordered, 1):
-            self._set_progress(f"Applying {i}/{total}:  {rec.title}\u2026")
-            ok, err = self._apply_step_to_enhanced(rec, enhanced)
-            report.append(f"\u2713 {rec.title}" if ok else f"\u2717 {rec.title}: {err}")
-            self.after(120, lambda: None)
-            try:
-                self.update()
-            except Exception:
-                pass
-
-        self._set_progress(
-            "Done \u2014 original kept, enhanced lane added below.",
-            "#2e9d52")
-
-        final_stats = AudioAnalyzer().analyze(enhanced.data, self.rate)
-        report.append("")
-        report.append("Original: " + self.stats.summary())
-        report.append("Enhanced: " + final_stats.summary())
-        report.append("")
-        report.append("The enhanced lane is below the original in the editor.")
-        report.append("Mute the original lane to audition the enhanced version alone.")
-        report.append("Ctrl+Z removes the enhanced lane in one step.")
-        report.append("Use  File \u2192 Export Selected Audio  to save either lane.")
-
+        saved_to = None
         try:
-            app.after_edit()
-        except Exception:
-            pass
+            for rec in sorted(selected, key=lambda r: r.priority):
+                try:
+                    data = rec.effect(data, rate)
+                    if data.ndim != 2 or data.shape[1] != 2:
+                        data = to_stereo(data)
+                    report.append(f"\u2713 {rec.title}")
+                except Exception as ex:
+                    report.append(f"\u2717 {rec.title}: {ex}")
 
-        self.config(cursor="")
-        self._show_summary(report)
+            self.app.proj.push_undo()
+            track = self.target_track
+            track.data = to_stereo(data)
 
-    def _show_summary(self, report):
+            final_stats = AudioAnalyzer().analyze(track.data, rate)
+            report.append("")
+            report.append("Final: " + final_stats.summary())
+
+            out_path = self._choose_output_path()
+            if out_path:
+                try:
+                    save_audio(out_path, track.data, rate)
+                    saved_to = out_path
+                    report.append(f"Saved: {os.path.basename(out_path)}")
+                    sidecar = out_path + ".enhanced.txt"
+                    with open(sidecar, "w", encoding="utf-8") as f:
+                        f.write("Studio Audio Editor - Auto 5_Star Enhance report\n")
+                        f.write(f"Source: {self.app.proj.path or '(unsaved project)'}\n")
+                        f.write(f"Track: {track.name}\n")
+                        f.write(f"Rate: {rate} Hz\n")
+                        f.write(f"Before: {self.stats.summary()}\n")
+                        f.write(f"After:  {final_stats.summary()}\n\n")
+                        f.write("Recommendations applied:\n")
+                        for rec in sorted(selected, key=lambda r: r.priority):
+                            f.write(f"  - {rec.title}\n")
+                            f.write(f"    {rec.describe_params()}\n")
+                            f.write(f"    {rec.reason}\n")
+                    report.append(f"Report: {os.path.basename(sidecar)}")
+                    push_recent(out_path)
+                    self.app._rebuild_recent_menu()
+                except Exception as ex:
+                    report.append(f"Save failed: {ex}")
+        finally:
+            self.config(cursor="")
+            self.app.after_edit()
+
+        self._show_summary(report, saved_to)
+        self.destroy()
+
+    def _choose_output_path(self):
+        base = self._song_base_name()
+        default_name = f"{base}_Enhanced_5_Star.wav"
+        if self.app.proj.path:
+            folder = os.path.dirname(self.app.proj.path)
+        else:
+            src = getattr(self.target_track, "source_path", None)
+            folder = os.path.dirname(src) if src else os.path.expanduser("~")
+        return filedialog.asksaveasfilename(
+            parent=self, title="Save enhanced audio",
+            initialfile=default_name,
+            initialdir=folder,
+            defaultextension=".wav",
+            filetypes=[("WAV", "*.wav"), ("MP3", "*.mp3"),
+                       ("FLAC", "*.flac"), ("OGG", "*.ogg")])
+
+    def _show_summary(self, report, saved_to):
         win = tk.Toplevel(self)
         win.title("Auto 5_Star Enhance \u2014 Complete")
         win.transient(self)
-        win.geometry(f"{u(1000)}x{u(720)}")
+        win.geometry(f"{u(900)}x{u(680)}")
         tk.Label(win, text="\u2605 Enhancement complete",
                  bg="#1f2530", fg="#ffd966",
                  font=fnt(38, True)).pack(fill="x", padx=u(14), pady=u(14))
@@ -1311,24 +1432,17 @@ class Auto5StarDialog(tk.Toplevel):
         txt.configure(state="disabled")
         bar = tk.Frame(win)
         bar.pack(fill="x", padx=u(14), pady=(0, u(12)))
-
-        def play_enhanced():
-            try:
-                t = getattr(self, "_enhanced_track", None)
-                if t is None:
-                    tg = self.app.targets()
-                    t = tg[0] if tg else None
-                if t is None:
-                    return
-                self.app.stop()
-                self.app.player.start(t.data, self.app.proj.rate, loop=False)
-                self.app.play_origin = t.offset
-                self.app.play_speed = 1.0
-            except Exception as ex:
-                messagebox.showerror("Play", str(ex), parent=win)
-
-        ttk.Button(bar, text="\u25b6 Play Enhanced Lane",
-                   command=play_enhanced).pack(side="left", padx=u(5))
+        if saved_to and os.path.exists(saved_to):
+            def play_now():
+                try:
+                    data, rate = load_audio(saved_to)
+                    self.app.player.start(data, rate, loop=False)
+                    self.app.play_origin = 0
+                    self.app.play_speed = 1.0
+                except Exception as ex:
+                    messagebox.showerror("Play", str(ex), parent=win)
+            ttk.Button(bar, text="\u25b6 Play Test",
+                       command=play_now).pack(side="left", padx=u(5))
         ttk.Button(bar, text="Close",
                    command=win.destroy).pack(side="right", padx=u(5))
 
@@ -2111,6 +2225,253 @@ class ParamDialog(tk.Toplevel):
         self.destroy()
 
 
+DRUM_TRACK_RE = re.compile(r"drum|perc|kick|snare|hi-?hat|cymbal", re.I)
+
+
+class KeyChangerDialog(tk.Toplevel):
+    """Key Changer: shows the song's key, lets you step the new key up/down, then re-pitches the song.
+
+        Song key  [ A minor ]  [Detect]        <- detected automatically (you can type to correct it)
+        New key   [ B minor ]  [^][v]          <- Up/Down buttons or arrow keys, or type a key name
+        [ Apply Key Change ]                   <- Ctrl+Enter;  Ctrl+Z undoes it
+    """
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title("Key Changer")
+        self.transient(app)
+        self.resizable(False, False)
+        self.configure(bg=PAL["bottom"])
+        self.cur = None                    # (tonic, mode) of the loaded song
+        self.shift = 0                     # semitones to apply (-12..+12)
+        self.busy = False
+        self.song_var = tk.StringVar()
+        self.new_var = tk.StringVar()
+        self.shift_var = tk.StringVar()
+        self.info_var = tk.StringVar(value="Detecting key...")
+        self.status_var = tk.StringVar(value="")
+        self.sel_var = tk.BooleanVar(value=False)
+        self.drum_var = tk.BooleanVar(value=True)
+        self._build()
+        self.bind("<Escape>", lambda _e: self.close())
+        self.bind("<Up>", lambda _e: self._step(+1))
+        self.bind("<Down>", lambda _e: self._step(-1))
+        self.bind("<Control-Return>", lambda _e: self.apply())
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self._place()
+        self.after(150, self.detect)
+
+    # ---------------- UI ----------------
+    def _build(self):
+        pad = u(12)
+        f = ttk.Frame(self, padding=pad)
+        f.grid(sticky="nsew")
+        big = fnt(22, True)
+        self.head_var = tk.StringVar(value="Key of the loaded song")
+        ttk.Label(f, textvariable=self.head_var, font=fnt(13, True)).grid(row=0, column=0, columnspan=3, sticky="w")
+        self.song_entry = ttk.Entry(f, textvariable=self.song_var, width=13, font=big, justify="center")
+        self.song_entry.grid(row=1, column=0, columnspan=2, sticky="we", pady=(u(4), 0))
+        ttk.Button(f, text="Detect", command=self.detect, width=8).grid(row=1, column=2, padx=(u(8), 0))
+        ttk.Label(f, textvariable=self.info_var, foreground="#666").grid(row=2, column=0, columnspan=3, sticky="w", pady=(u(2), u(10)))
+        ttk.Label(f, text="Change the key to", font=fnt(13, True)).grid(row=3, column=0, columnspan=3, sticky="w")
+        self.new_entry = ttk.Entry(f, textvariable=self.new_var, width=13, font=big, justify="center")
+        self.new_entry.grid(row=4, column=0, columnspan=2, sticky="we", pady=(u(4), 0))
+        arrows = ttk.Frame(f)
+        arrows.grid(row=4, column=2, padx=(u(8), 0))
+        ttk.Button(arrows, text="\u25b2", width=4, command=lambda: self._step(+1)).pack()
+        ttk.Button(arrows, text="\u25bc", width=4, command=lambda: self._step(-1)).pack()
+        ttk.Label(f, textvariable=self.shift_var, font=fnt(13, True)).grid(row=5, column=0, columnspan=3, sticky="w", pady=(u(2), u(10)))
+        self.sel_chk = ttk.Checkbutton(f, text="Only the selected region / tracks", variable=self.sel_var)
+        self.sel_chk.grid(row=6, column=0, columnspan=3, sticky="w")
+        ttk.Checkbutton(f, text="Leave drum / percussion tracks unchanged", variable=self.drum_var).grid(
+            row=7, column=0, columnspan=3, sticky="w")
+        self.prog = ttk.Progressbar(f, maximum=1.0, length=u(300))
+        self.prog.grid(row=8, column=0, columnspan=3, sticky="we", pady=(u(10), 0))
+        ttk.Label(f, textvariable=self.status_var, foreground="#444", wraplength=u(330), justify="left").grid(
+            row=9, column=0, columnspan=3, sticky="w")
+        bar = ttk.Frame(f)
+        bar.grid(row=10, column=0, columnspan=3, pady=(u(10), 0))
+        self.apply_btn = ttk.Button(bar, text="Apply Key Change", command=self.apply)
+        self.apply_btn.pack(side="left", padx=4)
+        ttk.Button(bar, text="Reset", command=self.reset).pack(side="left", padx=4)
+        ttk.Button(bar, text="Close", command=self.close).pack(side="left", padx=4)
+        self.song_entry.bind("<Return>", lambda _e: self._typed_song())
+        self.new_entry.bind("<Return>", lambda _e: self._typed_new())
+        self.new_entry.bind("<FocusOut>", lambda _e: self._typed_new())
+        self.song_entry.bind("<FocusOut>", lambda _e: self._typed_song())
+
+    def _place(self):
+        self.update_idletasks()
+        a = self.app
+        x = a.winfo_rootx() + max(0, (a.winfo_width() - self.winfo_reqwidth()) // 2)
+        y = a.winfo_rooty() + u(80)
+        self.geometry(f"+{x}+{y}")
+
+    def close(self):
+        self.destroy()
+
+    # ---------------- state ----------------
+    def _refresh(self):
+        if self.cur is None:
+            self.new_var.set("")
+            self.shift_var.set("")
+            self.apply_btn.state(["disabled"])
+            return
+        tonic, mode = self.cur
+        self.new_var.set(key_label((tonic + self.shift) % 12, mode))
+        if self.shift == 0:
+            self.shift_var.set("No change")
+        else:
+            self.shift_var.set(f"{self.shift:+d} semitone{'s' if abs(self.shift) != 1 else ''} "
+                               f"({'up' if self.shift > 0 else 'down'})")
+        self.apply_btn.state(["disabled" if (self.shift == 0 or self.busy) else "!disabled"])
+
+    def _step(self, d):
+        if self.cur is None or self.busy:
+            return
+        self.shift = max(-12, min(12, self.shift + d))
+        self._refresh()
+
+    def reset(self):
+        self.shift = 0
+        self._refresh()
+
+    def _typed_song(self):
+        k = parse_key(self.song_var.get())
+        if k is None:
+            if self.cur:
+                self.song_var.set(key_label(*self.cur))
+            return
+        mode = k[1] or (self.cur[1] if self.cur else "major")
+        self.cur = (k[0], mode)
+        self.song_var.set(key_label(*self.cur))
+        self._refresh()
+
+    def _typed_new(self):
+        if self.cur is None or self.busy:
+            return
+        k = parse_key(self.new_var.get())
+        if k is None:
+            self._refresh()
+            return
+        d = (k[0] - self.cur[0] + 6) % 12 - 6          # nearest direction, -6..+5
+        self.shift = d
+        self._refresh()
+        if k[1] and k[1] != self.cur[1]:
+            self.status_var.set("Major \u2194 minor can't be changed by transposing - used the note only.")
+
+    # ---------------- detect ----------------
+    def detect(self):
+        app = self.app
+        if self.busy or not app.proj.tracks:
+            return
+        self.config(cursor="watch")
+        self.info_var.set("Detecting key...")
+        self.update_idletasks()
+        try:
+            idx = sorted(i for i in app.selected if i < len(app.proj.tracks))
+            if idx:                      # same source as the toolbar's key box: the selected track(s)
+                mix = _mix_for_key([(app.proj.tracks[i].data, app.proj.tracks[i].offset) for i in idx])
+                self.head_var.set("Key of the selected track" + ("s" if len(idx) > 1 else ""))
+                self.sel_var.set(True)
+            else:
+                mix = app.proj.mixdown()
+                self.head_var.set("Key of the loaded song")
+                self.sel_var.set(False)
+            if len(mix) < app.proj.rate * 3:
+                raise ValueError("Audio is too short to detect a key.")
+            k = detect_song_key(mix, app.proj.rate)
+        except Exception as ex:
+            self.info_var.set(f"Could not detect the key ({ex}). Type it in the box above.")
+            self.cur = self.cur or (0, "major")
+            self.song_var.set(key_label(*self.cur))
+        else:
+            if k["confidence"] == "None":
+                self.cur = self.cur or (0, "major")
+                self.song_var.set(key_label(*self.cur))
+                self.info_var.set("No clear key found (noise or drums only). Type the key in the box above.")
+                self.shift = 0
+                self.config(cursor="")
+                self._refresh()
+                return
+            self.cur = (k["tonic"], k["mode"])
+            self.song_var.set(k["label"])
+            extra = f"  \u00b7  also possible: {k['alt']}" if k["confidence"] != "High" else ""
+            self.info_var.set(f"Confidence: {k['confidence']}  \u00b7  relative key: {k['relative']}{extra}")
+            self.shift = 0
+        finally:
+            self.config(cursor="")
+        self._refresh()
+
+    # ---------------- apply ----------------
+    def apply(self):
+        global PV_PROGRESS
+        app = self.app
+        if self.busy or self.cur is None or self.shift == 0 or not app.proj.tracks:
+            return
+        semis = self.shift
+        has_sel = app._has_sel()
+        only_sel = bool(self.sel_var.get()) and (has_sel or bool(app.selected))
+        tracks = app.targets() if only_sel else list(app.proj.tracks)
+        skipped = [t for t in tracks if self.drum_var.get() and DRUM_TRACK_RE.search(t.name or "")]
+        tracks = [t for t in tracks if t not in skipped]
+        if not tracks:
+            return messagebox.showinfo("Key Changer", "Nothing to change: every track is a drum track.", parent=self)
+        app.stop()
+        rate = app.proj.rate
+        spans = []
+        for t in tracks:
+            s, e = app.sel if (only_sel and has_sel) else (t.offset, t.end)
+            a, b = t.local(s, e)
+            spans.append((t, s, e, max(0, b - a)))
+        total = max(1, sum(sp[3] for sp in spans))
+        old_label = key_label(*self.cur)
+        new_label = key_label((self.cur[0] + semis) % 12, self.cur[1])
+        app.proj.push_undo()
+        self.busy = True
+        self.apply_btn.state(["disabled"])
+        self.config(cursor="watch")
+        app.config(cursor="watch")
+        done = 0
+        ok = True
+        try:
+            for t, s, e, n in spans:
+                base = done
+
+                def hook(fr, base=base, n=n):
+                    self.prog["value"] = (base + fr * n) / total
+                    self.status_var.set(f"Changing key: {t.name}  ({int(100 * (base + fr * n) / total)}%)")
+                    self.update_idletasks()
+                PV_PROGRESS = hook
+                t.apply(s, e, lambda x: fx_pitch_shift(x, rate, semis))
+                done += n
+        except Exception as ex:
+            ok = False
+            app.proj.undo()
+            messagebox.showerror("Key change failed", str(ex), parent=self)
+        finally:
+            PV_PROGRESS = None
+            self.busy = False
+            self.config(cursor="")
+            app.config(cursor="")
+        app.after_edit()
+        self.prog["value"] = 0
+        if ok:
+            note = f"  ({len(skipped)} drum track{'s' if len(skipped) != 1 else ''} left unchanged)" if skipped else ""
+            self.status_var.set(f"Done: {old_label} \u2192 {new_label} ({semis:+d}).{note}  Ctrl+Z to undo.")
+            app.status_var.set(f"Key changed {old_label} \u2192 {new_label}")
+            if only_sel:
+                self.shift = 0
+                self.detect()
+            else:
+                self.cur = ((self.cur[0] + semis) % 12, self.cur[1])
+                self.song_var.set(key_label(*self.cur))
+                self.shift = 0
+                self.info_var.set("Key changed. Detect again to double-check.")
+        self._refresh()
+
+
 GRID_CHOICES = ("Bar", "1/2", "1/4", "1/8", "1/16", "1/32", "1/64",
                 "Seconds", "Deciseconds", "Centiseconds", "Milliseconds")
 MINOR_DIV = {2: 4, 15: 3, 30: 3, 60: 6, 120: 4, 0.2: 4, 0.02: 4, 0.002: 4}
@@ -2336,6 +2697,7 @@ class App(tk.Tk):
         add_effect("Fade Out", lambda: self.run_effect(lambda x: fx_fade(x, False)))
         add_effect("Studio Fade Out", self.fx_studio_fade)
         sep()
+        add_effect("Key Changer...    Ctrl+K", self.open_key_changer)
         add_effect("Change Pitch...", self.fx_pitch)
         add_effect("Change Speed...", self.fx_speed)
         add_effect("Change Tempo...", self.fx_tempo)
@@ -2395,6 +2757,26 @@ class App(tk.Tk):
         P = PAL
         bar = tk.Frame(self, bg=P["toolbar"])
         bar.pack(side="top", fill="x")
+
+        # ---- key readout, top right: key of the selected track(s) ----
+        self.key_var = tk.StringVar(value="No selection")
+        self.key_sub_var = tk.StringVar(value="select a track on the left")
+        self._key_sig, self._key_cache, self._key_q = None, {}, queue.Queue()
+        kb = tk.Frame(bar, bg=P["toolbar"])
+        kb.pack(side="right", padx=(u(8), u(14)), pady=u(8))
+        box = tk.Frame(kb, bg="#ffffff", highlightbackground=P["grip"],
+                       highlightthickness=max(1, u(2)), cursor="hand2")
+        box.pack()
+        cap = tk.Label(box, text="KEY OF SELECTED TRACK", bg="#ffffff", fg="#70707a", font=fnt(12, True))
+        cap.pack(padx=u(18), pady=(u(6), 0))
+        self._key_lbl = tk.Label(box, textvariable=self.key_var, bg="#ffffff", fg="#9a9aa4",
+                                 font=fnt(38, True), width=12)
+        self._key_lbl.pack(padx=u(10))
+        sub = tk.Label(box, textvariable=self.key_sub_var, bg="#ffffff", fg="#70707a", font=fnt(12))
+        sub.pack(pady=(0, u(6)))
+        for w_ in (box, cap, self._key_lbl, sub):
+            w_.bind("<Button-1>", lambda _e: self.open_key_changer())
+
         row = tk.Frame(bar, bg=P["toolbar"])
         row.pack(side="left", padx=(u(10), 0), pady=(u(13), u(11)))
         self.btn = {}
@@ -2628,6 +3010,7 @@ class App(tk.Tk):
         key("<Control-Shift-E>", self.export_dialog, True)
         key("<Control-Shift-I>", self.import_dialog, True)
         key("<Control-Shift-Key-5>", self.open_auto_5star, True)
+        key("<Control-k>", self.open_key_changer, True)
         key("<Control-Key-1>", lambda: self.zoom(2.0), True)
         key("<Control-Key-3>", lambda: self.zoom(0.5), True)
         key("<Control-Shift-F>", self.zoom_fit, True)
@@ -2635,6 +3018,20 @@ class App(tk.Tk):
         key("<End>", lambda: self.set_cursor(self.proj.length()))
 
     # -------------------- Auto 5_Star --------------------
+    def open_key_changer(self):
+        if not self.proj.tracks:
+            return messagebox.showinfo("Key Changer", "Load some audio first.")
+        w = getattr(self, "_key_win", None)
+        if w is not None:
+            try:
+                if w.winfo_exists():
+                    w.deiconify()
+                    w.lift()
+                    return
+            except tk.TclError:
+                pass
+        self._key_win = KeyChangerDialog(self)
+
     def open_auto_5star(self):
         if not self.proj.tracks:
             return messagebox.showinfo("Audio Plus", "Load some audio first.")
@@ -2787,6 +3184,77 @@ class App(tk.Tk):
         b["redo"].set(enabled=bool(self.proj._redo))
         b["trim"].set(enabled=self._has_sel())
         b["silence"].set(enabled=self._has_sel())
+        self._update_key_label()
+
+    # ---- key readout (top-right of the toolbar) ----
+    def _set_key_text(self, big, sub="", dim=False):
+        self.key_var.set(big)
+        self.key_sub_var.set(sub)
+        self._key_lbl.configure(fg="#9a9aa4" if dim else PAL["icon"])
+
+    def _key_signature(self, tracks):
+        sig = [self.proj.rate]
+        for t in tracks:
+            d = t.data
+            step = max(1, len(d) // 64)
+            sig.append((id(d), len(d), t.offset, round(float(np.abs(d[::step]).sum()), 3)))
+        return tuple(sig)
+
+    def _update_key_label(self):
+        if not hasattr(self, "_key_lbl"):
+            return
+        idx = sorted(i for i in self.selected if i < len(self.proj.tracks))
+        if not idx:
+            self._key_sig = None
+            self._set_key_text("No selection", "select a track on the left", True)
+            return
+        tracks = [self.proj.tracks[i] for i in idx]
+        sig = self._key_signature(tracks)
+        if sig == self._key_sig:
+            return
+        self._key_sig = sig
+        hit = self._key_cache.get(sig)
+        if hit:
+            self._set_key_text(*hit)
+            return
+        self._set_key_text("Detecting...", f"{len(tracks)} track{'s' if len(tracks) != 1 else ''} selected", True)
+        rate = self.proj.rate
+        datas = [(t.data, t.offset) for t in tracks]
+        n_sel = len(tracks)
+
+        def work():
+            try:
+                k = detect_song_key(_mix_for_key(datas), rate)
+                if k["confidence"] == "None":
+                    self._key_q.put((sig, ("No clear key", "noise or percussion only", True)))
+                    return
+                sub = f"{k['confidence']} confidence"
+                if k["confidence"] != "High":
+                    sub += f"  \u00b7  or {k['alt']}"
+                if n_sel > 1:
+                    sub = f"{n_sel} tracks  \u00b7  " + sub
+                res = (k["label"], sub, False)
+            except ValueError:
+                res = ("Too short", "needs 3+ seconds of audio", True)
+            except Exception:
+                res = ("Unknown", "could not detect a key", True)
+            self._key_q.put((sig, res))
+        threading.Thread(target=work, daemon=True).start()
+        self.after(150, self._poll_key)
+
+    def _poll_key(self):
+        try:
+            while True:
+                sig, res = self._key_q.get_nowait()
+                if len(self._key_cache) > 32:
+                    self._key_cache.clear()
+                self._key_cache[sig] = res
+                if sig == self._key_sig:
+                    self._set_key_text(*res)
+        except queue.Empty:
+            pass
+        if self._key_sig is not None and self._key_sig not in self._key_cache:
+            self.after(150, self._poll_key)
 
     # -------------------- drawing --------------------
     def redraw(self):
@@ -4048,6 +4516,7 @@ class App(tk.Tk):
             "Ctrl+I  split                Ctrl+J  join\n"
             "Ctrl+B  add label            Ctrl+M  label at playback\n"
             "Ctrl+R  repeat last effect   Ctrl+Shift+5  Auto 5_Star Enhance\n"
+            "Ctrl+K  Key Changer (change the song's key)\n"
             "Ctrl+Shift+I  import   Ctrl+Shift+E  export   Ctrl+S  save   Ctrl+O  open\n"
             "Ctrl+1 / Ctrl+3  zoom in / out        Ctrl+Shift+F  fit to width\n"
             "Home / End  go to start / end\n\n"

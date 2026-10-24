@@ -810,6 +810,7 @@ class Ctx:
     fifths: int
     key_name: str
     n_bars: int
+    song_len: float = 0.0
     footer: str = "Auto-transcribed by Music Studio - check against the recording."
 
 
@@ -839,6 +840,8 @@ class SheetDrawer:
         c.setFillGray(0.45)
         c.drawRightString(d.W - d.margin, y, "Music Studio")
         c.drawRightString(d.W - d.margin, y - 11, f"Key: {ctx.key_name}   Time: 4/4")
+        c.drawRightString(d.W - d.margin, y - 22, f"Full song: bars 1-{ctx.n_bars}"
+                          + (f"  ({fmt_clock(ctx.song_len)})" if ctx.song_len else ""))
         c.setFillGray(0)
         ty = y - 46
         x = d.margin + 4
@@ -1661,13 +1664,14 @@ def _slug(s):
 
 
 def generate_sheets(out_dir, parts, title, tempo_bpm, srt_text=None, beat_source=None,
-                    log=print, progress=None):
+                    song_seconds=None, log=print, progress=None):
     """
     out_dir     : folder that receives SHEET_*.pdf, VOCAL_DATA_SHEET.pdf, VOCAL_NOTES.csv
     parts       : [{key, kind, midi, time_mode}]   (see module docstring)
     title       : song title printed on every sheet
     tempo_bpm   : tempo to print (e.g. refined["tempo_bpm"])
     srt_text    : optional SRT text -> lyrics under the vocal melody + vocal data sheet
+    song_seconds: length of the song in seconds -> every sheet runs to the very end
     beat_source : optional path of a Midi_refine.py MIDI; its tempo map gives the beat grid
                   that real-time (seconds) MIDIs are aligned to
     Returns dict(sheets={key: pdf}, vocal_data=pdf|None, vocal_csv=csv|None, key, grid, warnings)
@@ -1721,10 +1725,17 @@ def generate_sheets(out_dir, parts, title, tempo_bpm, srt_text=None, beat_source
     for n in all_notes:
         n.b0 -= shift
         n.b1 -= shift
-    n_bars = int(min(500, max(1, math.ceil(max(n.b1 for n in all_notes) / 4.0))))
+    end_b = max(n.b1 for n in all_notes)
+    if song_seconds:
+        eb = (float(_sec_to_beat([song_seconds], bt)[0]) if bt is not None
+              else song_seconds * tempo_bpm / 60.0) - shift
+        end_b = max(end_b, eb)
+    n_bars = int(min(900, max(1, math.ceil(end_b / 4.0 - 1e-6))))
+    song_len = float(song_seconds or max(n.sec1 for n in all_notes))
     pitched = [n for lp in loaded if lp["kind"] != "drums" for n in lp["notes"]]
     tonic, mode, fifths, key_name = detect_key(pitched)
-    ctx = Ctx(title=title, tempo=tempo_bpm, upb=upb, fifths=fifths, key_name=key_name, n_bars=n_bars)
+    ctx = Ctx(title=title, tempo=tempo_bpm, upb=upb, fifths=fifths, key_name=key_name, n_bars=n_bars,
+               song_len=song_len)
     grid_name = "triplets (swing feel)" if upb == 3 else "16th notes"
     log(f"[score_engine] {len(loaded)} parts, {n_bars} bars, key {key_name}, grid {grid_name}, "
         f"{tempo_bpm:.0f} BPM")
@@ -1752,7 +1763,7 @@ def generate_sheets(out_dir, parts, title, tempo_bpm, srt_text=None, beat_source
             continue
         if kind == "vocals":
             vn = sorted(lp["notes"], key=lambda n: n.sec0)
-            dur = max(n.sec1 for n in vn)
+            dur = song_len
             phr = []
             for n in vn:
                 if phr and n.sec0 - phr[-1][1] < 0.9:
@@ -1776,4 +1787,4 @@ def generate_sheets(out_dir, parts, title, tempo_bpm, srt_text=None, beat_source
         warnings.append("No lyrics (SRT) available - vocal sheet shows the melody only.")
     prog(1.0, "Sheets done")
     return dict(sheets=sheets, vocal_data=vocal_data, vocal_csv=vocal_csv, key=key_name,
-                grid=grid_name, bars=n_bars, warnings=warnings)
+                grid=grid_name, bars=n_bars, song_len=song_len, warnings=warnings)
