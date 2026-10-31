@@ -26,8 +26,12 @@ safetensors
 tokenizers
 huggingface_hub
 sentencepiece
-
+arabic-reshaper
+python-bidi
+python-docx
 cryptography
+docx
+yt-dlp
 pywebview
 openai-whisper
 tiktoken

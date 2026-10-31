@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Studio Audio Editor - Audacity-complete edition + Auto 5_Star Enhance + Recent Files.
 
@@ -10,6 +10,9 @@ import queue
 import re
 import sys
 import threading
+import base64
+import struct
+import zlib
 import json
 import math
 import shutil
@@ -33,17 +36,20 @@ DEFAULT_RATE = 44100
 MAX_UNDO = 30
 
 PAL = dict(
-    toolbar="#f8f8f9", bottom="#f8f8f9", status="#f0f0f0", sep="#d3d3d8", grip="#a0a0a8",
-    btn="#dddee4", btn_hover="#d0d1d9", btn_down="#c0c2cc", btn_active="#c2c4cf", btn_off="#e9e9ec",
-    icon="#16161a", icon_off="#a9aab1",
-    ruler="#e9e9eb", ruler_fg="#17171a", ruler_tick="#2b2b30",
-    panel_sel="#dbe7ff", panel="#e4e6ee", frame_sel="#97a8fd", frame="#9da0b8",
-    ctl="#c3d2e0", mute="#e8b04a", solo="#7fcf7f",
-    clip_hdr="#cfd6f4", clip_bg="#f0f3ff", clip_sel="#c7cdea",
-    wave="#6464d3", wave_sel="#3b3ba8", wave_mute="#b4b4c8",
-    empty="#3e4051", empty_sel="#505470", desk="#323545", black="#000000",
-    time_bg="#323545", cursor="#000000", play="#2e9d52", thumb="#858585",
-    check="#2f6fe0", meter_edge="#c9c9cf",
+    toolbar="#d9dde6", bottom="#bcc2c9", status="#bcc2c9", sep="#98a2b6", grip="#8793ad",
+    pill="#e8ebf2", pill_edge="#bcc4d6",
+    btn="#e4e9f3", btn_hover="#f3f6fb", btn_down="#c9d3e8", btn_active="#cfdcf7", btn_off="#e3e6ec",
+    icon="#11295f", icon_off="#9aa4ba",
+    ruler="#dbe1ea", ruler_fg="#11295f", ruler_tick="#3a4a70",
+    panel_sel="#cfdcf7", panel="#d3d8e1", scale="#e6ebf4", scale_sel="#d6e2fb",
+    frame_sel="#6f95e8", frame="#8d97b3",
+    ctl="#dfe4ee", mute="#f0b04a", solo="#6fcf8a",
+    clip_hdr="#a5b7d1", clip_bg="#dde4f2", clip_sel="#c3d1f0",
+    wave="#1a4fc4", wave_sel="#0b2f8a", wave_mute="#a9b3c9",
+    empty="#b4bdcd", empty_sel="#9fb0d2", desk="#9ea4ab", black="#13224a",
+    time_bg="#1e2634", cursor="#13224a", play="#2e9d52", thumb="#12307a",
+    check="#1f55d6", meter_edge="#9aa3b5", digits="#5b92f2",
+    navy="#0b3a8c", navy_dark="#072a68", ink="#0f1d3f",
     label="#c83c3c", label_bg="#ffe0e0", marker="#ff8c00")
 
 U_SCALE = 1.0
@@ -702,6 +708,422 @@ def spectrogram_ppm(x, rate, W=900, H=320):
 
 
 # =====================================================================
+#  AUDIO HEALTH DSP  -  loudness (LUFS) / true peak, declipper, presence + exciter, mono compatibility
+#  (numpy / scipy only)
+# =====================================================================
+from scipy import ndimage
+
+LOUDNESS_TARGETS = (
+    ("Streaming - Spotify / YouTube / Tidal", -14.0, -1.0),
+    ("Apple Music / Podcasts", -16.0, -1.0),
+    ("Broadcast - EBU R128 (Europe)", -23.0, -1.0),
+    ("Broadcast - ATSC A/85 (USA)", -24.0, -2.0),
+    ("Loud master / Club", -9.0, -1.0),
+)
+
+
+def _k_sos(rate):
+    """ITU-R BS.1770 K-weighting (shelf + RLB high-pass) for any rate; exact at 48 kHz."""
+    f0, Q, G = 1681.974450955533, 0.7071752369554196, 3.999843853973347
+    K = math.tan(math.pi * f0 / rate)
+    Vh = 10 ** (G / 20.0)
+    Vb = Vh ** 0.4996667741545416
+    a0 = 1.0 + K / Q + K * K
+    s1 = [(Vh + Vb * K / Q + K * K) / a0, 2.0 * (K * K - Vh) / a0, (Vh - Vb * K / Q + K * K) / a0,
+          1.0, 2.0 * (K * K - 1.0) / a0, (1.0 - K / Q + K * K) / a0]
+    f0, Q = 38.13547087602444, 0.5003270373238773
+    K = math.tan(math.pi * f0 / rate)
+    a0 = 1.0 + K / Q + K * K
+    s2 = [1.0, -2.0, 1.0, 1.0, 2.0 * (K * K - 1.0) / a0, (1.0 - K / Q + K * K) / a0]
+    return np.array([s1, s2], dtype=np.float64)
+
+
+class Loudness:
+    def __init__(self):
+        self.lufs_i = -70.0        # integrated
+        self.lufs_s_max = -70.0    # max short-term (3 s)
+        self.lufs_m_max = -70.0    # max momentary (400 ms)
+        self.lra = 0.0
+        self.sample_peak_db = -120.0
+        self.true_peak_db = -120.0
+        self.measurable = False
+
+
+def _block_power(ms_cum, rate, win_s, hop_s):
+    w, h = int(round(win_s * rate)), int(round(hop_s * rate))
+    n = len(ms_cum) - 1
+    if n < w:
+        return np.zeros(0)
+    st = np.arange(0, n - w + 1, h)
+    return (ms_cum[st + w] - ms_cum[st]) / w
+
+
+def _lufs(power):
+    return -0.691 + 10 * np.log10(np.maximum(power, 1e-12))
+
+
+def _kweighted_power_cumsum(x, rate):
+    sos = _k_sos(rate)
+    n = len(x)
+    cum = np.zeros(n + 1, np.float64)
+    zi = [signal.sosfilt_zi(sos) * 0.0 for _ in range(x.shape[1])]
+    chunk = 1 << 20
+    acc = 0.0
+    for a in range(0, n, chunk):
+        seg = x[a:a + chunk].astype(np.float64)
+        ms = np.zeros(len(seg))
+        for ch in range(x.shape[1]):
+            y, zi[ch] = signal.sosfilt(sos, seg[:, ch], zi=zi[ch])
+            ms += y * y
+        cum[a + 1:a + 1 + len(seg)] = acc + np.cumsum(ms)
+        acc = cum[a + len(seg)]
+    return cum
+
+
+def integrated_lufs(x, rate):
+    """Fast path: gated integrated loudness only."""
+    if len(x) < int(0.4 * rate):
+        return -70.0
+    cum = _kweighted_power_cumsum(x, rate)
+    p = _block_power(cum, rate, 0.4, 0.1)
+    if not len(p):
+        return -70.0
+    l = _lufs(p)
+    m = l > -70.0
+    if not np.any(m):
+        return -70.0
+    rel = _lufs(np.mean(p[m])) - 10.0
+    m2 = l > max(rel, -70.0)
+    return float(_lufs(np.mean(p[m2]))) if np.any(m2) else -70.0
+
+
+def _true_peak_env(x, rate):
+    """Per-sample true-peak envelope (4x oversampled, linear)."""
+    over = 4 if rate < 96000 else (2 if rate < 192000 else 1)
+    n = len(x)
+    if over == 1 or n == 0:
+        return np.max(np.abs(x), axis=1) if n else np.zeros(0)
+    env = np.empty(n, np.float32)
+    chunk, pad = 1 << 19, 96
+    for a in range(0, n, chunk):
+        lo_i, hi_i = max(0, a - pad), min(n, a + chunk + pad)
+        y = signal.resample_poly(x[lo_i:hi_i].astype(np.float32), over, 1, axis=0)
+        s = (a - lo_i) * over
+        cnt = min(chunk, n - a)
+        blk = np.abs(y[s:s + cnt * over]).reshape(cnt, over, -1)
+        env[a:a + cnt] = blk.max(axis=(1, 2))
+    return env
+
+
+def true_peak_db(x, rate):
+    if len(x) == 0:
+        return -120.0
+    return 20 * math.log10(max(float(np.max(_true_peak_env(x, rate))), 1e-9))
+
+
+def measure_loudness(x, rate):
+    m = Loudness()
+    if len(x) == 0:
+        return m
+    m.sample_peak_db = 20 * math.log10(max(float(np.max(np.abs(x))), 1e-9))
+    m.true_peak_db = true_peak_db(x, rate)
+    if len(x) < int(0.4 * rate):
+        return m
+    cum = _kweighted_power_cumsum(x, rate)
+    pm = _block_power(cum, rate, 0.4, 0.1)
+    if not len(pm):
+        return m
+    lm = _lufs(pm)
+    m.lufs_m_max = float(lm.max())
+    g = lm > -70.0
+    if not np.any(g):
+        return m
+    m.measurable = True
+    rel = _lufs(np.mean(pm[g])) - 10.0
+    g2 = lm > max(rel, -70.0)
+    m.lufs_i = float(_lufs(np.mean(pm[g2]))) if np.any(g2) else float(lm.max())
+    ps = _block_power(cum, rate, 3.0, 0.1)
+    if len(ps):
+        ls = _lufs(ps)
+        m.lufs_s_max = float(ls.max())
+        a = ls > -70.0
+        if np.any(a):
+            relr = _lufs(np.mean(ps[a])) - 20.0
+            vals = ls[ls > max(relr, -70.0)]
+            if len(vals) > 3:
+                m.lra = float(np.percentile(vals, 95) - np.percentile(vals, 10))
+    else:
+        m.lufs_s_max = m.lufs_i
+    return m
+
+
+def _release_env(r, rel_ms, rate):
+    d = math.exp(-1.0 / max(1.0, rel_ms * 1e-3 * rate))
+    B = 8192
+    idx = np.arange(B)
+    pw, ipw = d ** idx, d ** (-idx.astype(np.float64))
+    out = np.empty_like(r)
+    carry = 0.0
+    for a in range(0, len(r), B):
+        blk = r[a:a + B]
+        n = len(blk)
+        cm = np.maximum.accumulate(blk * ipw[:n]) * pw[:n]
+        cm = np.maximum(cm, carry * d ** (idx[:n] + 1))
+        out[a:a + n] = cm
+        carry = cm[-1]
+    return out
+
+
+def fx_true_peak_limit(x, rate, ceiling_db=-1.0, lookahead_ms=3.0, release_ms=150.0):
+    """Look-ahead limiter driven by the 4x-oversampled (true) peak, with smooth release."""
+    if len(x) == 0:
+        return x
+    ceil = 10 ** (ceiling_db / 20.0)
+    tp = _true_peak_env(x, rate).astype(np.float64)
+    over = tp > ceil
+    if not np.any(over):
+        return x.astype(np.float32)
+    r = np.zeros(len(x))
+    r[over] = 20 * np.log10(tp[over] / ceil)
+    A = max(1, int(lookahead_ms * 1e-3 * rate))
+    ra = ndimage.maximum_filter1d(r, size=2 * A + 1)
+    ra = ndimage.uniform_filter1d(ra, size=A + 1)
+    ra = _release_env(ra, release_ms, rate)
+    y = (x * (10 ** (-ra / 20.0))[:, None]).astype(np.float32)
+    pk = float(np.max(_true_peak_env(y, rate)))
+    if pk > ceil * 1.001:                       # tiny safety trim
+        y *= np.float32(ceil / pk)
+    return y
+
+
+def fx_loudness_normalize(x, rate, target_lufs=-14.0, ceiling_db=-1.0):
+    """Gain to the target integrated loudness, then true-peak limit; re-balances after limiting."""
+    if len(x) == 0:
+        return x
+    cur = integrated_lufs(x, rate)
+    if cur <= -69.9:
+        return x
+    gain = max(-40.0, min(30.0, target_lufs - cur))
+    y = (x * (10 ** (gain / 20.0))).astype(np.float32)
+    for _ in range(4):
+        y = fx_true_peak_limit(y, rate, ceiling_db)
+        short = target_lufs - integrated_lufs(y, rate)
+        if short < 0.15:
+            break
+        y = (y * (10 ** (min(short, 6.0) / 20.0))).astype(np.float32)
+    return fx_true_peak_limit(y, rate, ceiling_db)
+
+
+# ---------------------------------------------------------------- clipping / declip
+def _clip_runs(x, min_run=3):
+    """-> (level, [(ch, start, end_inclusive, sign), ...]) of flat-topped runs at the signal's maximum."""
+    n = len(x)
+    m = float(np.max(np.abs(x))) if n else 0.0
+    if m < 0.01:                      # silence: nothing to judge
+        return m, []
+    thr = m * 0.998
+    runs = []
+    for ch in range(x.shape[1]):
+        a = x[:, ch]
+        for sign, mask in ((1, a >= thr), (-1, a <= -thr)):
+            d = np.diff(np.concatenate([[0], mask.astype(np.int8), [0]]))
+            st, en = np.where(d == 1)[0], np.where(d == -1)[0]
+            keep = (en - st) >= min_run
+            st, en = st[keep], en[keep]
+            if not len(st):
+                continue
+            # a real clipped plateau is entered steeply; a rounded sine top approaches its peak smoothly
+            drop = np.maximum(m - np.abs(a[np.maximum(st - 1, 0)]), m - np.abs(a[np.minimum(en, n - 1)]))
+            ok = drop >= 0.008 * m
+            for s_, e_ in zip(st[ok], en[ok]):
+                runs.append((ch, int(s_), int(e_ - 1), sign))
+    return m, runs
+
+
+def detect_clipping(x):
+    level, runs = _clip_runs(x)
+    n = len(x) * (x.shape[1] if len(x) else 1)
+    samples = sum(r[2] - r[1] + 1 for r in runs)
+    pct = 100.0 * samples / max(1, n)
+    if len(runs) < 3:                  # one or two flat peaks are incidental; clipping repeats at the same level
+        sev = "None"
+    elif pct < 0.002 and len(runs) < 20:
+        sev = "Mild"
+    elif pct < 0.05:
+        sev = "Moderate"
+    else:
+        sev = "Severe"
+    return dict(runs=len(runs), samples=samples, percent=pct, level_db=20 * math.log10(max(level, 1e-9)),
+                severity=sev)
+
+
+def fx_declip(x, rate, max_run=48, headroom_db=-1.0):
+    """Reconstruct flat-topped (clipped) peaks with a cubic spline through the unclipped neighbours."""
+    if len(x) == 0:
+        return x
+    from scipy.interpolate import CubicSpline
+    level, runs = _clip_runs(x)
+    out = x.astype(np.float32).copy()
+    if not runs:
+        return out
+    thr = level * 0.998
+    n = len(x)
+    chans = {}
+    for ch, a, b, sg in runs:
+        chans.setdefault(ch, []).append((a, b, sg))
+    for ch, lst in chans.items():
+        sig = out[:, ch].astype(np.float64)
+        for a, b, sg in lst:
+            L = b - a + 1
+            if L > max_run:
+                continue
+            lo, hi = max(0, a - 6), min(n, b + 7)
+            ix = np.r_[np.arange(lo, a), np.arange(b + 1, hi)]
+            ix = ix[np.abs(sig[ix]) < thr]
+            if len(ix) < 4:
+                continue
+            y = CubicSpline(ix, sig[ix], bc_type="natural")(np.arange(a, b + 1))
+            mag = np.maximum(sg * y, level)
+            mag = np.minimum(mag, level * min(2.0, 1.0 + 0.05 * L))
+            sig[a:b + 1] = sg * mag
+        out[:, ch] = sig.astype(np.float32)
+    ceil = 10 ** (headroom_db / 20.0)
+    pk = float(np.max(np.abs(out)))
+    if pk > ceil:
+        out *= np.float32(ceil / pk)
+    return out
+
+
+# ---------------------------------------------------------------- presence / exciter
+def spectrum_balance(x, rate):
+    """Deviation (dB) of the presence (3 kHz) and air (8 kHz) regions from a typical -4 dB/oct tilt."""
+    mono = x.mean(axis=1) if x.ndim == 2 else x
+    if len(mono) > 90 * rate:
+        a = (len(mono) - 90 * rate) // 2
+        mono = mono[a:a + 90 * rate]
+    if len(mono) < 8192:
+        return 0.0, 0.0
+    f, P = signal.welch(mono, rate, nperseg=8192)
+
+    def band(lo, hi):
+        m = (f >= lo) & (f < hi)
+        return 10 * math.log10(float(np.mean(P[m])) + 1e-20) if np.any(m) else -200.0
+    ref = band(700, 1400)
+    dev3 = band(2400, 3800) - (ref - 4.0 * math.log2(3.0))
+    hi = min(11000.0, rate * 0.45)
+    dev8 = (band(6000, hi) - (ref - 4.0 * math.log2(8.0))) if hi > 7000 else 0.0
+    return dev3, dev8
+
+
+def fx_presence(x, rate, gain_db=2.5, freq=3000.0, q=0.9):
+    """Peaking EQ centred on the presence region (RBJ biquad)."""
+    if len(x) < 64 or abs(gain_db) < 0.05:
+        return x
+    A = 10 ** (gain_db / 40.0)
+    w0 = 2 * math.pi * min(freq, rate * 0.45) / rate
+    al = math.sin(w0) / (2 * q)
+    cw = math.cos(w0)
+    b = [1 + al * A, -2 * cw, 1 - al * A]
+    a = [1 + al / A, -2 * cw, 1 - al / A]
+    sos = signal.tf2sos(b, a)
+    return np.clip(signal.sosfilt(sos, x.astype(np.float64), axis=0), -1.0, 1.0).astype(np.float32)
+
+
+def fx_exciter(x, rate, amount=0.18, drive=3.0, lo_hz=2800.0):
+    """Harmonic exciter: saturate the upper band, keep only the new harmonics, blend in parallel."""
+    if len(x) < 256:
+        return x
+    nyq = rate / 2.0
+    lo = min(lo_hz, nyq * 0.6) / nyq
+    hp = signal.butter(2, lo, "high", output="sos")
+    band = signal.sosfilt(hp, x.astype(np.float64), axis=0)
+    sat = np.tanh(band * drive) / math.tanh(drive)
+    harm = signal.sosfilt(signal.butter(2, min(lo * 1.35, 0.9), "high", output="sos"), sat, axis=0)
+    ceil_f = min(0.45 * rate, 16000.0) / nyq
+    harm = signal.sosfilt(signal.butter(2, ceil_f, "low", output="sos"), harm, axis=0)
+    rb = float(np.sqrt(np.mean(band ** 2))) + 1e-12
+    rh = float(np.sqrt(np.mean(harm ** 2))) + 1e-12
+    out = x + harm * (amount * rb / rh)
+    return np.clip(out, -1.0, 1.0).astype(np.float32)
+
+
+# ---------------------------------------------------------------- mono compatibility
+def _corr(a, b):
+    d = math.sqrt(float(np.sum(a * a)) * float(np.sum(b * b)))
+    return float(np.sum(a * b) / d) if d > 1e-12 else 1.0
+
+
+def _mono_loss_db(a, b):
+    pm = float(np.mean(((a + b) / 2.0) ** 2))
+    ps = float(np.mean((a * a + b * b) / 2.0))
+    return max(-40.0, 10 * math.log10((pm + 1e-20) / (ps + 1e-20)))
+
+
+def mono_metrics(x, rate):
+    L, R = x[:, 0].astype(np.float64), x[:, 1].astype(np.float64)
+    out = dict(corr=_corr(L, R), loss_db=_mono_loss_db(L, R))
+    nyq = rate / 2.0
+    bands = (("low", None, 150.0), ("mid", 150.0, 2000.0), ("high", 2000.0, None))
+    for name, lo, hi in bands:
+        try:
+            if lo is None:
+                sos = signal.butter(4, hi / nyq, "low", output="sos")
+            elif hi is None:
+                sos = signal.butter(4, min(lo / nyq, 0.95), "high", output="sos")
+            else:
+                sos = signal.butter(4, [lo / nyq, min(hi / nyq, 0.95)], "band", output="sos")
+            a, b = signal.sosfilt(sos, L), signal.sosfilt(sos, R)
+            out[f"corr_{name}"] = _corr(a, b)
+            out[f"loss_{name}_db"] = _mono_loss_db(a, b)
+            out[f"energy_{name}"] = float(np.mean(a * a + b * b))
+        except Exception:
+            out[f"corr_{name}"], out[f"loss_{name}_db"], out[f"energy_{name}"] = 1.0, 0.0, 0.0
+    tot = sum(out[f"energy_{n}"] for n, _, _ in bands) + 1e-20
+    out["low_share"] = out["energy_low"] / tot
+    out["polarity_inverted"] = out["corr"] < -0.25
+    out["verdict"] = ("Poor" if (out["loss_db"] < -6 or out["polarity_inverted"]) else
+                      "Caution" if (out["loss_db"] < -3 or out["corr_low"] < 0.7) else "Good")
+    return out
+
+
+def fx_fix_polarity(x):
+    out = x.copy()
+    out[:, 1] *= -1
+    return out
+
+
+def fx_bass_mono(x, rate, cutoff=120.0):
+    if len(x) < 512:
+        return x
+    sos = signal.butter(4, min(cutoff, rate * 0.2) / (rate / 2.0), "low", output="sos")
+    low = signal.sosfiltfilt(sos, x.astype(np.float64), axis=0)
+    if _corr(low[:, 0], low[:, 1]) < -0.3:          # bass is anti-phase: flip one side so it survives the sum
+        flipped = low.copy()
+        flipped[:, 1] *= -1
+        mono = flipped.mean(axis=1, keepdims=True)
+        mono_out = np.repeat(mono, 2, axis=1)
+    else:
+        mono_out = np.repeat(low.mean(axis=1, keepdims=True), 2, axis=1)
+    return np.clip(x - low + mono_out, -1.0, 1.0).astype(np.float32)
+
+
+def fx_side_reduce(x, factor):
+    mid = (x[:, 0] + x[:, 1]) / 2.0
+    side = (x[:, 0] - x[:, 1]) / 2.0 * factor
+    return np.clip(np.column_stack([mid + side, mid - side]), -1, 1).astype(np.float32)
+
+
+def side_factor_for_loss(x, target_loss_db=-2.5):
+    mid = (x[:, 0] + x[:, 1]) / 2.0
+    side = (x[:, 0] - x[:, 1]) / 2.0
+    pm, ps = float(np.mean(mid ** 2)), float(np.mean(side ** 2))
+    if ps < 1e-12 or pm < 1e-12:
+        return 1.0
+    k2 = pm * (10 ** (-target_loss_db / 10.0) - 1.0) / ps
+    return float(min(1.0, max(0.35, math.sqrt(max(k2, 0.0)))))
+
+
+# =====================================================================
 #  AUTO 5_STAR EFFECT HELPERS
 # =====================================================================
 def _widen_stereo(x, factor):
@@ -773,12 +1195,49 @@ class AudioStats:
         self.clipping_regions = 0
         self.duration = 0.0
         self.rate = DEFAULT_RATE
+        # loudness / true peak
+        self.lufs_i = -70.0
+        self.lufs_s_max = -70.0
+        self.lufs_m_max = -70.0
+        self.lra = 0.0
+        self.true_peak_db = -120.0
+        self.loud_ok = False
+        # clipping
+        self.clip_level_db = 0.0
+        self.clip_severity = "None"
+        # tone
+        self.presence_dev = 0.0
+        self.air_dev = 0.0
+        # mono compatibility
+        self.corr = 1.0
+        self.corr_low = 1.0
+        self.loss_db = 0.0
+        self.loss_low_db = 0.0
+        self.low_share = 0.0
+        self.polarity_inverted = False
+        self.mono_verdict = "Good"
 
     def summary(self):
-        return (f"Peak {self.peak_db:.1f} dBFS · RMS {self.rms_db:.1f} dBFS · "
-                f"Crest {self.crest_db:.1f} dB · "
-                f"Noise floor {self.noise_floor_db:.1f} dB · "
+        return (f"Peak {self.peak_db:.1f} dBFS \u00b7 RMS {self.rms_db:.1f} dBFS \u00b7 "
+                f"Crest {self.crest_db:.1f} dB \u00b7 "
+                f"Noise floor {self.noise_floor_db:.1f} dB \u00b7 "
                 f"Duration {self.duration:.1f}s")
+
+    def loudness_line(self):
+        if not self.loud_ok:
+            return f"True peak {self.true_peak_db:+.1f} dBTP \u00b7 loudness needs at least 0.4 s of audio"
+        return (f"Loudness {self.lufs_i:.1f} LUFS \u00b7 True peak {self.true_peak_db:+.1f} dBTP \u00b7 "
+                f"LRA {self.lra:.1f} LU \u00b7 Short-term max {self.lufs_s_max:.1f} LUFS")
+
+    def health_line(self):
+        clip = ("none" if self.clip_severity == "None" else
+                f"{self.clip_severity.lower()} ({self.clipping_regions} regions, {self.clip_ratio:.2f}%)")
+        return (f"Clipping: {clip} \u00b7 Mono: {self.mono_verdict.lower()} "
+                f"(corr {self.corr:+.2f}, sum {self.loss_db:+.1f} dB) \u00b7 "
+                f"Presence 3 kHz {self.presence_dev:+.1f} dB vs typical")
+
+    def full_summary(self):
+        return self.summary() + "\n" + self.loudness_line() + "\n" + self.health_line()
 
 
 class Recommendation:
@@ -801,6 +1260,30 @@ class Recommendation:
 class AudioAnalyzer:
     def __init__(self):
         self.stats = AudioStats()
+        # shared with the dialog's "Loudness target" controls and read when the step runs
+        self.targets = {"target_lufs": LOUDNESS_TARGETS[0][1], "ceiling_dbtp": LOUDNESS_TARGETS[0][2]}
+
+    def loudness_gap(self):
+        s = self.stats
+        return self.targets["target_lufs"] - s.lufs_i if s.loud_ok else 0.0
+
+    def loudness_needed(self):
+        s = self.stats
+        if not s.loud_ok:
+            return False
+        return abs(self.loudness_gap()) > 0.5 or s.true_peak_db > self.targets["ceiling_dbtp"] + 0.05
+
+    def loudness_reason(self):
+        s, t = self.stats, self.targets
+        if not s.loud_ok:
+            return "Audio is too short to measure loudness (needs 0.4 s)."
+        gap = self.loudness_gap()
+        base = (f"Measured {s.lufs_i:.1f} LUFS, true peak {s.true_peak_db:+.1f} dBTP, LRA {s.lra:.1f} LU. "
+                f"Target {t['target_lufs']:g} LUFS / {t['ceiling_dbtp']:g} dBTP \u2192 gain {gap:+.1f} dB, "
+                "then true-peak limiting so inter-sample peaks never exceed the ceiling.")
+        if not self.loudness_needed():
+            base += "  (Already within 0.5 LU of the target \u2014 not needed.)"
+        return base
 
     def analyze(self, data, rate):
         s = AudioStats()
@@ -819,10 +1302,9 @@ class AudioAnalyzer:
         s.dc_l = float(np.mean(data[:, 0]))
         s.dc_r = float(np.mean(data[:, 1]))
 
-        clipped = np.any(np.abs(data) >= 0.999, axis=1)
-        s.clip_ratio = float(clipped.mean()) * 100.0
-        edges = np.where(np.diff(np.concatenate([[0], clipped.astype(int), [0]])))[0]
-        s.clipping_regions = len(edges) // 2
+        cd = detect_clipping(data)
+        s.clip_ratio, s.clipping_regions = cd["percent"], cd["runs"]
+        s.clip_level_db, s.clip_severity = cd["level_db"], cd["severity"]
 
         mono = np.max(np.abs(data), axis=1)
         s.silence_ratio = float((mono < 10 ** (-60 / 20.0)).mean()) * 100.0
@@ -853,6 +1335,17 @@ class AudioAnalyzer:
             s.high_energy = float(np.sum(spec[freqs >= 4000]) / total)
             s.spectral_centroid = float(np.sum(freqs * spec) / total)
 
+        try:
+            ld = measure_loudness(data, rate)
+            s.lufs_i, s.lufs_s_max, s.lufs_m_max, s.lra = ld.lufs_i, ld.lufs_s_max, ld.lufs_m_max, ld.lra
+            s.true_peak_db, s.loud_ok = ld.true_peak_db, ld.measurable
+            s.presence_dev, s.air_dev = spectrum_balance(data, rate)
+            mm = mono_metrics(data, rate)
+            s.corr, s.corr_low, s.loss_db, s.loss_low_db = mm["corr"], mm["corr_low"], mm["loss_db"], mm["loss_low_db"]
+            s.low_share, s.polarity_inverted, s.mono_verdict = mm["low_share"], mm["polarity_inverted"], mm["verdict"]
+        except Exception as ex:                       # never let a metering problem block the enhancer
+            print("[5_Star] health metrics skipped:", ex)
+
         self.stats = s
         return s
 
@@ -867,12 +1360,21 @@ class AudioAnalyzer:
                 "Centering the waveform recovers headroom.",
                 fx_dc, {}, priority=1, weight=9.0))
 
-        if s.clip_ratio > 0.001:
+        if s.polarity_inverted:
             recs.append(Recommendation(
-                "clipfix", "Clip Fix / Declip",
-                f"{s.clipping_regions} clipped region(s) "
-                f"({s.clip_ratio:.2f}% of samples). Reconstructing peaks.",
-                lambda x, r: fx_clip_fix(x, r, 0.95), {"threshold": 0.95},
+                "polarity", "Fix Inverted Channel Polarity",
+                f"Left and right are in anti-phase (correlation {s.corr:+.2f}); the mono sum cancels "
+                f"{abs(s.loss_db):.0f} dB. Flipping the right channel restores the mix.",
+                lambda x, r: fx_fix_polarity(x), {"flip": "right channel"},
+                priority=1.5, weight=10.0))
+
+        if s.clip_severity != "None":
+            recs.append(Recommendation(
+                "declip", "Declip (cubic-spline peak reconstruction)",
+                f"{s.clipping_regions} flat-topped region(s) at {s.clip_level_db:.1f} dBFS "
+                f"({s.clip_ratio:.2f}% of samples, {s.clip_severity.lower()}). Rebuilding the lost peaks from the "
+                "surrounding waveform, then restoring \u22121 dB of headroom.",
+                lambda x, r: fx_declip(x, r, 48, -1.0), {"max_run_samples": 48, "headroom_db": -1.0},
                 priority=2, weight=10.0))
 
         if s.noise_floor_db > -78 and s.rms_db > -50:
@@ -908,13 +1410,35 @@ class AudioAnalyzer:
                 lambda x, r: fx_bass_treble(x, r, 0.0, -2.0),
                 {"bass_db": 0.0, "treble_db": -2.0},
                 priority=6, weight=5.0))
-        elif s.high_energy < 0.05 and s.spectral_centroid < 800:
+
+        if s.presence_dev <= -6.0:
+            g_db = round(min(4.0, (-s.presence_dev - 3.0) * 0.6), 1)
             recs.append(Recommendation(
-                "treble_lift", "Treble Boost +2 dB",
-                "Dull top end detected. A gentle shelf restores presence.",
-                lambda x, r: fx_bass_treble(x, r, 0.0, 2.0),
-                {"bass_db": 0.0, "treble_db": 2.0},
-                priority=6, weight=4.0))
+                "presence", f"Presence Boost +{g_db:g} dB @ 3 kHz",
+                f"The 2.4\u20133.8 kHz region sits {abs(s.presence_dev):.1f} dB below a typical music spectrum "
+                "(voices and lead instruments sound distant). A narrow peaking boost lifts only that band, "
+                "unlike a broadband treble shelf.",
+                lambda x, r: fx_presence(x, r, g_db, 3000.0, 0.9),
+                {"gain_db": g_db, "freq_hz": 3000.0, "q": 0.9},
+                priority=6.5, weight=6.0))
+        elif s.presence_dev >= 4.0:
+            g_db = round(-min(3.0, (s.presence_dev - 2.5) * 0.6), 1)
+            recs.append(Recommendation(
+                "presence_cut", f"Presence Cut {g_db:g} dB @ 3 kHz (harshness)",
+                f"The 2.4\u20133.8 kHz region is {s.presence_dev:.1f} dB above a typical spectrum \u2014 "
+                "often heard as harsh or fatiguing. A narrow cut tames it.",
+                lambda x, r: fx_presence(x, r, g_db, 3000.0, 0.9),
+                {"gain_db": g_db, "freq_hz": 3000.0, "q": 0.9},
+                priority=6.5, weight=5.0))
+
+        if s.air_dev <= -12.0 and s.rate >= 32000 and s.high_energy < 0.12:
+            recs.append(Recommendation(
+                "exciter", "Harmonic Exciter (presence / air)",
+                f"The 6\u201311 kHz region is {abs(s.air_dev):.0f} dB below a typical spectrum. A saturating exciter "
+                "generates new upper harmonics and blends them in (parallel), adding clarity without EQ-boosting noise.",
+                lambda x, r: fx_exciter(x, r, 0.18, 3.0, 2800.0),
+                {"amount": 0.18, "drive": 3.0, "from_hz": 2800.0},
+                priority=6.8, weight=5.0))
 
         if s.low_energy > 0.30 and s.spectral_centroid < 900:
             recs.append(Recommendation(
@@ -923,6 +1447,23 @@ class AudioAnalyzer:
                 lambda x, r: fx_bass_treble(x, r, -2.0, 0.0),
                 {"bass_db": -2.0, "treble_db": 0.0},
                 priority=7, weight=5.0))
+
+        if (not s.polarity_inverted and s.low_share > 0.02
+                and (s.corr_low < 0.85 or s.loss_low_db < -0.8)):
+            recs.append(Recommendation(
+                "bass_mono", "Mono Bass Below 120 Hz",
+                f"Low frequencies are not centred (bass correlation {s.corr_low:+.2f}, "
+                f"{s.loss_low_db:+.1f} dB lost in mono). Wide bass cancels on phones, club systems and vinyl.",
+                lambda x, r: fx_bass_mono(x, r, 120.0), {"cutoff_hz": 120.0},
+                priority=8.4, weight=6.0))
+
+        if not s.polarity_inverted and s.loss_db < -4.0:
+            recs.append(Recommendation(
+                "side_reduce", "Mono-Safe Stereo (reduce side level)",
+                f"Folding to mono loses {abs(s.loss_db):.1f} dB (correlation {s.corr:+.2f}) \u2014 "
+                "phase-heavy width that thins out on mono speakers. Reducing the side signal makes it mono-safe.",
+                lambda x, r: fx_side_reduce(x, side_factor_for_loss(x, -2.5)), {"target_mono_loss_db": -2.5},
+                priority=8.6, weight=5.0))
 
         if s.stereo_width < 0.15:
             recs.append(Recommendation(
@@ -942,14 +1483,16 @@ class AudioAnalyzer:
                 {"gain_l": round(gain_l, 3), "gain_r": round(gain_r, 3)},
                 priority=9, weight=7.0))
 
-        if s.peak_db < -12:
-            target = -1.0
-            recs.append(Recommendation(
-                "normalize_up", "Normalize to \u22121 dBFS",
-                f"Peak only {s.peak_db:.1f} dBFS. Normalizing adds loudness headroom.",
-                lambda x, r: fx_normalize(x, target),
-                {"peak_db": target},
-                priority=10, weight=8.0))
+        if s.loud_ok:
+            tg = self.targets
+            needed = self.loudness_needed()
+            lr = Recommendation(
+                "loudness", "Loudness Normalize (LUFS) + True-Peak Limit",
+                self.loudness_reason(),
+                lambda x, r: fx_loudness_normalize(x, r, tg["target_lufs"], tg["ceiling_dbtp"]),
+                tg, priority=12.5, weight=9.0 if needed else 3.0)
+            lr.enabled.set(bool(needed))
+            recs.append(lr)
         elif s.peak_db > -0.1:
             recs.append(Recommendation(
                 "normalize_down", "Limiter to \u22121 dBFS",
@@ -1078,7 +1621,9 @@ class Auto5StarDialog(tk.Toplevel):
         self.recommendations = self.analyzer.recommend(self.rate)
 
         self.row_frames = []
+        self._tgt_busy = True
         self._build_ui()
+        self._tgt_busy = False
         self.grab_set()
         self.lift()
         self.focus_force()
@@ -1125,10 +1670,13 @@ class Auto5StarDialog(tk.Toplevel):
                  text="Analyze \u2192 review recommendations \u2192 run enhancement chain",
                  bg="#1f2530", fg="#c7ccd8",
                  font=fnt(28), anchor="w").pack(fill="x", padx=u(24))
-        tk.Label(header, text=self.stats.summary(),
-                 bg="#1f2530", fg="#9fd2ff",
-                 font=fnt(26), anchor="w").pack(fill="x", padx=u(24),
-                                                pady=(0, u(16)))
+        tk.Label(header, text=self.stats.summary(), bg="#1f2530", fg="#9fd2ff",
+                 font=fnt(26), anchor="w").pack(fill="x", padx=u(24))
+        tk.Label(header, text=self.stats.loudness_line(), bg="#1f2530", fg="#ffd966",
+                 font=fnt(26, True), anchor="w").pack(fill="x", padx=u(24))
+        tk.Label(header, text=self.stats.health_line(), bg="#1f2530", fg="#9fd2ff",
+                 font=fnt(24), anchor="w").pack(fill="x", padx=u(24), pady=(0, u(16)))
+        self._build_target_bar()
 
         # ---- footer (bottom, packed BEFORE the list so it is always visible) ----
         foot = tk.Frame(self, bg=P["bottom"])
@@ -1212,8 +1760,8 @@ class Auto5StarDialog(tk.Toplevel):
         info.columnconfigure(1, weight=0)
 
         tk.Label(info,
-                 text=("The analyzer measured peak, RMS, crest, DC offset, clipping, "
-                       "spectral balance, noise floor and stereo width. "
+                 text=("The analyzer measured loudness (LUFS), true peak, clipping, DC offset, "
+                       "presence/air balance, noise floor, stereo width and mono compatibility. "
                        "Recommendations are ordered by importance. "
                        "Uncheck anything you don't want \u2014 checked items turn green. "
                        "Press  \u25b6  Run Enhancement  to apply the enabled steps and save "
@@ -1227,6 +1775,81 @@ class Auto5StarDialog(tk.Toplevel):
                                     font=fnt(24), justify="left", anchor="e",
                                     relief="flat", padx=u(14), pady=u(10))
         self.preview_lbl.grid(row=0, column=1, sticky="e", padx=(u(16), 0))
+        self._update_preview()
+
+    # ---------------- loudness target (LUFS / true peak) ----------------
+    def _build_target_bar(self):
+        P = PAL
+        bar = tk.Frame(self, bg=P["bottom"])
+        bar.pack(side="top", fill="x", padx=u(18), pady=(u(12), 0))
+        tk.Label(bar, text="Loudness target:", bg=P["bottom"], fg=P["ink"],
+                 font=fnt(28, True)).pack(side="left")
+        self._presets = [f"{n}  ({l:g} LUFS, {tp:g} dBTP)" for n, l, tp in LOUDNESS_TARGETS] + ["Custom"]
+        self.tgt_combo = ttk.Combobox(bar, values=self._presets, state="readonly", width=46)
+        self.tgt_combo.pack(side="left", padx=u(10))
+        self.tgt_combo.current(0)
+        self.lufs_var = tk.StringVar(value=f"{LOUDNESS_TARGETS[0][1]:g}")
+        self.tp_var = tk.StringVar(value=f"{LOUDNESS_TARGETS[0][2]:g}")
+        tk.Label(bar, text="LUFS", bg=P["bottom"], fg=P["ink"], font=fnt(26)).pack(side="left")
+        ttk.Spinbox(bar, from_=-40, to=-5, increment=0.5, width=6, textvariable=self.lufs_var).pack(side="left", padx=(u(6), u(14)))
+        tk.Label(bar, text="True-peak ceiling", bg=P["bottom"], fg=P["ink"], font=fnt(26)).pack(side="left")
+        ttk.Spinbox(bar, from_=-9, to=0, increment=0.1, width=5, textvariable=self.tp_var).pack(side="left", padx=(u(6), u(14)))
+        self.gap_lbl = tk.Label(bar, text="", bg=P["bottom"], fg=P["navy"], font=fnt(26, True))
+        self.gap_lbl.pack(side="left", padx=u(10))
+        self._tgt_busy = False
+        self.tgt_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_preset())
+        self.lufs_var.trace_add("write", lambda *_a: self._on_target_edit())
+        self.tp_var.trace_add("write", lambda *_a: self._on_target_edit())
+        self._update_gap_label()
+
+    def _update_gap_label(self):
+        a = self.analyzer
+        if not self.stats.loud_ok:
+            self.gap_lbl.config(text="")
+            return
+        gap = a.loudness_gap()
+        tp_after = self.stats.true_peak_db + gap
+        txt = f"gain {gap:+.1f} dB"
+        if tp_after > a.targets["ceiling_dbtp"]:
+            txt += f"  \u00b7  limiter will remove {tp_after - a.targets['ceiling_dbtp']:.1f} dB of peaks"
+        self.gap_lbl.config(text=txt)
+
+    def _on_preset(self):
+        i = self.tgt_combo.current()
+        if 0 <= i < len(LOUDNESS_TARGETS):
+            self._tgt_busy = True
+            self.lufs_var.set(f"{LOUDNESS_TARGETS[i][1]:g}")
+            self.tp_var.set(f"{LOUDNESS_TARGETS[i][2]:g}")
+            self._tgt_busy = False
+            self._on_target_edit()
+
+    def _on_target_edit(self):
+        if getattr(self, "_tgt_busy", True):
+            return
+        try:
+            lufs = max(-40.0, min(-5.0, float(self.lufs_var.get())))
+            tp = max(-9.0, min(0.0, float(self.tp_var.get())))
+        except ValueError:
+            return
+        t = self.analyzer.targets
+        t["target_lufs"], t["ceiling_dbtp"] = lufs, tp
+        match = [i for i, (_n, l, p) in enumerate(LOUDNESS_TARGETS) if abs(l - lufs) < 1e-6 and abs(p - tp) < 1e-6]
+        self.tgt_combo.current(match[0] if match else len(self._presets) - 1)
+        for rec in self.recommendations:
+            if rec.key == "loudness":
+                rec.reason = self.analyzer.loudness_reason()
+                rec.enabled.set(self.analyzer.loudness_needed())
+                rec.weight = 9.0 if self.analyzer.loudness_needed() else 3.0
+        self._update_gap_label()
+        if hasattr(self, "inner"):
+            self._rebuild_rows()
+
+    def _rebuild_rows(self):
+        for w in self.inner.winfo_children():
+            w.destroy()
+        self.row_frames = []
+        for idx, rec in enumerate(self.recommendations):
+            self._add_recommendation_row(self.inner, idx, rec)
         self._update_preview()
 
     def _add_recommendation_row(self, parent, idx, rec):
@@ -1363,13 +1986,30 @@ class Auto5StarDialog(tk.Toplevel):
                 except Exception as ex:
                     report.append(f"\u2717 {rec.title}: {ex}")
 
+            # The enhanced audio goes on a NEW track directly beneath the source; the source is not touched.
             self.app.proj.push_undo()
-            track = self.target_track
+            src = self.target_track
+            track = src.clone()
             track.data = to_stereo(data)
+            track.name = f"{src.name} (5_Star)"
+            track.mute = track.solo = False
+            tracks = self.app.proj.tracks
+            pos = tracks.index(src) + 1 if src in tracks else len(tracks)
+            tracks.insert(pos, track)
+            self.app.selected = {pos}
+            report.append("")
+            report.append(f"\u2192 New track \u201c{track.name}\u201d was placed under \u201c{src.name}\u201d. "
+                          "The original track is unchanged (use Mute / Solo to compare them).")
 
             final_stats = AudioAnalyzer().analyze(track.data, rate)
             report.append("")
-            report.append("Final: " + final_stats.summary())
+            for tag, st_ in (("Before", self.stats), ("After ", final_stats)):
+                report.append(f"{tag}: " + st_.summary())
+                report.append("        " + st_.loudness_line())
+                report.append("        " + st_.health_line())
+            tg = self.analyzer.targets
+            report.append(f"Loudness target: {tg['target_lufs']:g} LUFS / {tg['ceiling_dbtp']:g} dBTP "
+                          f"\u2192 reached {final_stats.lufs_i:.1f} LUFS, {final_stats.true_peak_db:+.1f} dBTP")
 
             out_path = self._choose_output_path()
             if out_path:
@@ -1381,10 +2021,12 @@ class Auto5StarDialog(tk.Toplevel):
                     with open(sidecar, "w", encoding="utf-8") as f:
                         f.write("Studio Audio Editor - Auto 5_Star Enhance report\n")
                         f.write(f"Source: {self.app.proj.path or '(unsaved project)'}\n")
-                        f.write(f"Track: {track.name}\n")
+                        f.write(f"Source track: {src.name} (unchanged)\n")
+                        f.write(f"Enhanced track: {track.name}\n")
                         f.write(f"Rate: {rate} Hz\n")
-                        f.write(f"Before: {self.stats.summary()}\n")
-                        f.write(f"After:  {final_stats.summary()}\n\n")
+                        f.write(f"Before: {self.stats.full_summary()}\n")
+                        f.write(f"After:  {final_stats.full_summary()}\n")
+                        f.write(f"Loudness target: {tg['target_lufs']:g} LUFS / {tg['ceiling_dbtp']:g} dBTP\n\n")
                         f.write("Recommendations applied:\n")
                         for rec in sorted(selected, key=lambda r: r.priority):
                             f.write(f"  - {rec.title}\n")
@@ -1448,6 +2090,168 @@ class Auto5StarDialog(tk.Toplevel):
 
 
 # =====================================================================
+#  AUDIO HEALTH CHECK  (loudness / clipping / tone / mono compatibility)
+# =====================================================================
+class HealthCheckDialog(tk.Toplevel):
+    COL = {"Good": "#2e9d52", "Caution": "#d98a12", "Poor": "#c83c3c", "Info": "#4a6fb0"}
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        tracks = app.targets()
+        if not tracks:
+            self.destroy()
+            messagebox.showinfo("Audio Health Check", "Load or select some audio first.")
+            return
+        self.title("Audio Health Check")
+        self.transient(app)
+        self.configure(bg=PAL["bottom"])
+        self.config(cursor="watch")
+        self.update_idletasks()
+        mix = _mix_for_key([(t.data, t.offset) for t in tracks])
+        rate = app.proj.rate
+        self.rate = rate
+        try:
+            self.stats = AudioAnalyzer().analyze(mix, rate)
+        finally:
+            self.config(cursor="")
+        self.n_tracks = len(tracks)
+        w, h = u(1560), u(1290)
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        w, h = min(w, sw - u(40)), min(h, sh - u(80))
+        x = app.winfo_rootx() + max(0, (app.winfo_width() - w) // 2)
+        y = app.winfo_rooty() + u(40)
+        self.geometry(f"{w}x{h}+{max(0, x)}+{max(0, y)}")
+        self._build()
+        self.bind("<Escape>", lambda _e: self.destroy())
+
+    # ---- status helpers ----
+    def _loud_status(self):
+        s = self.stats
+        if not s.loud_ok:
+            return "Info"
+        if s.true_peak_db > -0.3:
+            return "Poor"
+        if -17.0 <= s.lufs_i <= -11.0 and s.true_peak_db <= -0.9:
+            return "Good"
+        return "Caution"
+
+    def _tone_status(self):
+        s = self.stats
+        d = s.presence_dev
+        if d <= -9.0 or d >= 7.0:
+            return "Poor"
+        if not (-6.0 < d < 4.0):
+            return "Caution"
+        if s.air_dev <= -15.0 and s.rate >= 32000 and s.high_energy < 0.12:
+            return "Caution"
+        return "Good"
+
+    def _card(self, parent, row, col, title, status, lines, advice):
+        P = PAL
+        f = tk.Frame(parent, bg="#ffffff", highlightthickness=max(1, u(3)),
+                     highlightbackground=self.COL[status])
+        f.grid(row=row, column=col, sticky="nsew", padx=u(8), pady=u(8))
+        top = tk.Frame(f, bg="#ffffff")
+        top.pack(fill="x", padx=u(14), pady=(u(10), u(4)))
+        tk.Label(top, text=title, bg="#ffffff", fg=P["ink"], font=fnt(32, True)).pack(side="left")
+        tk.Label(top, text=f"  {status.upper()}  ", bg=self.COL[status], fg="#ffffff",
+                 font=fnt(24, True)).pack(side="right")
+        for k, v in lines:
+            r = tk.Frame(f, bg="#ffffff")
+            r.pack(fill="x", padx=u(16), pady=u(1))
+            tk.Label(r, text=k, bg="#ffffff", fg="#5d6988", font=fnt(26), width=24, anchor="w").pack(side="left")
+            tk.Label(r, text=v, bg="#ffffff", fg=P["ink"], font=fnt(26, True), anchor="w").pack(side="left")
+        tk.Label(f, text=advice, bg="#ffffff", fg="#3a3a44", font=fnt(24), justify="left", anchor="w",
+                 wraplength=u(660)).pack(fill="x", padx=u(16), pady=(u(8), u(12)))
+
+    def _build(self):
+        P, s = PAL, self.stats
+        head = tk.Frame(self, bg="#1f2530")
+        head.pack(side="top", fill="x")
+        tk.Label(head, text="Audio Health Check", bg="#1f2530", fg="#ffd966", font=fnt(44, True),
+                 anchor="w").pack(fill="x", padx=u(24), pady=(u(14), 0))
+        tk.Label(head, text=f"{self.n_tracks} track(s)  \u00b7  {s.duration:.1f} s  \u00b7  {self.rate} Hz  \u00b7  "
+                            "LUFS (ITU-R BS.1770 / EBU R128)  \u00b7  true peak (4x oversampled)",
+                 bg="#1f2530", fg="#9fd2ff", font=fnt(24), anchor="w").pack(fill="x", padx=u(24), pady=(0, u(14)))
+
+        foot = tk.Frame(self, bg=P["bottom"])
+        foot.pack(side="bottom", fill="x", padx=u(18), pady=u(12))
+        ttk.Button(foot, text="\u2605  Fix with Auto 5_Star Enhance...", command=self._to_5star).pack(side="left", padx=u(5))
+        ttk.Button(foot, text="Close", command=self.destroy).pack(side="right", padx=u(5))
+
+        grid = tk.Frame(self, bg=P["bottom"])
+        grid.pack(side="top", fill="both", expand=True, padx=u(12), pady=u(6))
+        grid.columnconfigure(0, weight=1)
+        grid.columnconfigure(1, weight=1)
+
+        f = lambda v, fmt="{:.1f}": fmt.format(v)
+        loud = [("Integrated loudness", f"{s.lufs_i:.1f} LUFS" if s.loud_ok else "n/a (too short)"),
+                ("Short-term max (3 s)", f"{s.lufs_s_max:.1f} LUFS" if s.loud_ok else "n/a"),
+                ("Momentary max (0.4 s)", f"{s.lufs_m_max:.1f} LUFS" if s.loud_ok else "n/a"),
+                ("Loudness range (LRA)", f"{s.lra:.1f} LU"),
+                ("Sample peak", f"{s.peak_db:+.1f} dBFS"),
+                ("True peak", f"{s.true_peak_db:+.1f} dBTP")]
+        adv = ("Streaming services normalise to about \u221214 LUFS; a true peak above \u22121 dBTP can distort "
+               "after lossy encoding.")
+        if s.loud_ok and s.true_peak_db > -1.0:
+            adv = "True peak is above \u22121 dBTP \u2014 inter-sample overs likely after MP3/AAC encoding. " + adv
+        self._card(grid, 0, 0, "Loudness", self._loud_status(), loud, adv)
+
+        csev = {"None": "Good", "Mild": "Caution", "Moderate": "Poor", "Severe": "Poor"}[s.clip_severity]
+        clip = [("Severity", s.clip_severity), ("Clipped regions", str(s.clipping_regions)),
+                ("Samples affected", f"{s.clip_ratio:.3f} %"), ("Clip level", f"{s.clip_level_db:+.1f} dBFS")]
+        cadv = ("No flat-topped peaks found." if s.clip_severity == "None" else
+                "Flat-topped waveform peaks cause harsh distortion. Effect \u2192 Declip rebuilds them from the "
+                "surrounding waveform; Analyze \u2192 Find Clipping labels every region.")
+        self._card(grid, 0, 1, "Clipping", csev, clip, cadv)
+
+        tone = [("Presence 2.4\u20133.8 kHz", f"{s.presence_dev:+.1f} dB vs typical"),
+                ("Air 6\u201311 kHz", f"{s.air_dev:+.1f} dB vs typical"),
+                ("Spectral centroid", f"{s.spectral_centroid:.0f} Hz"),
+                ("High-band energy", f"{s.high_energy * 100:.0f} %")]
+        tadv = ("Balanced presence region." if self._tone_status() == "Good" else
+                ("Presence is fine, but the top end (6–11 kHz) is far below a typical spectrum. A harmonic "
+                 "exciter adds clarity and air without boosting hiss." if -6.0 < s.presence_dev < 4.0 else
+                ("Presence is low \u2014 vocals/leads sound distant. A narrow 3 kHz boost plus a harmonic exciter "
+                 "fixes it without lifting hiss." if s.presence_dev < 0 else
+                 "Presence is high \u2014 sound may be harsh. A narrow 3 kHz cut helps.")))
+        self._card(grid, 1, 0, "Tone / Presence", self._tone_status(), tone, tadv)
+
+        mono = [("L/R correlation", f"{s.corr:+.2f}"), ("Mono-sum level change", f"{s.loss_db:+.1f} dB"),
+                ("Bass (<150 Hz) correlation", f"{s.corr_low:+.2f}"), ("Bass lost in mono", f"{s.loss_low_db:+.1f} dB"),
+                ("Polarity inverted", "YES" if s.polarity_inverted else "no")]
+        madv = ("Mono-compatible." if s.mono_verdict == "Good" else
+                ("Channels are in anti-phase \u2014 the mix vanishes in mono. Effect \u2192 Fix Inverted Polarity."
+                 if s.polarity_inverted else
+                 "Parts of the mix cancel when summed to mono (phones, club PA, smart speakers). "
+                 "Effect \u2192 Bass to Mono / Mono-Safe Stereo help."))
+        self._card(grid, 1, 1, "Mono compatibility", s.mono_verdict, mono, madv)
+
+        # normalisation preview table
+        tab = tk.Frame(self, bg=P["bottom"])
+        tab.pack(side="bottom", fill="x", padx=u(20), pady=(0, u(4)))
+        grid.pack_forget()
+        grid.pack(side="top", fill="both", expand=True, padx=u(12), pady=u(6))
+        tk.Label(tab, text="Gain needed to reach each loudness target", bg=P["bottom"], fg=P["ink"],
+                 font=fnt(28, True)).pack(anchor="w")
+        if s.loud_ok:
+            for name, tgt, tp in LOUDNESS_TARGETS:
+                gain = tgt - s.lufs_i
+                lim = s.true_peak_db + gain > tp
+                txt = (f"  {name:<40} {tgt:>6g} LUFS   {gain:+6.1f} dB"
+                       + ("   (true-peak limiter needed)" if lim else ""))
+                tk.Label(tab, text=txt, bg=P["bottom"], fg="#b04a1a" if lim else P["ink"],
+                         font=("Consolas", -int(u(24))) if sys.platform == "win32" else ("DejaVu Sans Mono", -int(u(24))),
+                         anchor="w").pack(anchor="w")
+
+    def _to_5star(self):
+        app = self.app
+        self.destroy()
+        app.open_auto_5star()
+
+
+# =====================================================================
 #  LABELS
 # =====================================================================
 class Label:
@@ -1468,6 +2272,7 @@ class Track:
         self.data = to_stereo(data) if data is not None else np.zeros((0, 2), np.float32)
         self.offset = int(offset)
         self.gain, self.pan = 1.0, 0.0
+        self.gain_l = self.gain_r = 1.0      # left / right channel faders
         self.mute = self.solo = False
         self.source_path = None      # remembered source file (for output naming)
 
@@ -1478,6 +2283,7 @@ class Track:
     def clone(self):
         t = Track(self.name, None, self.offset)
         t.data, t.gain, t.pan, t.mute, t.solo = self.data, self.gain, self.pan, self.mute, self.solo
+        t.gain_l, t.gain_r = self.gain_l, self.gain_r
         t.source_path = self.source_path
         return t
 
@@ -1539,6 +2345,7 @@ class Track:
         i = at - self.offset
         new = Track(self.name + " (split)", self.data[i:].copy(), at)
         new.gain, new.pan, new.mute, new.solo = self.gain, self.pan, self.mute, self.solo
+        new.gain_l, new.gain_r = self.gain_l, self.gain_r
         new.source_path = self.source_path
         self.data = self.data[:i].copy()
         return new
@@ -1609,8 +2416,8 @@ class Project:
             if b <= a:
                 continue
             seg = t.data[a - t.offset:b - t.offset]
-            lg = t.gain * min(1.0, 1.0 - t.pan)
-            rg = t.gain * min(1.0, 1.0 + t.pan)
+            lg = t.gain * min(1.0, 1.0 - t.pan) * t.gain_l
+            rg = t.gain * min(1.0, 1.0 + t.pan) * t.gain_r
             out[a - s:b - s, 0] += seg[:, 0] * lg
             out[a - s:b - s, 1] += seg[:, 1] * rg
         return np.clip(out, -1.0, 1.0, out=out)
@@ -1618,7 +2425,7 @@ class Project:
     def save(self, path):
         meta = {"rate": self.rate,
                 "tracks": [{"name": t.name, "offset": t.offset, "gain": t.gain,
-                            "pan": t.pan, "mute": t.mute, "solo": t.solo,
+                            "pan": t.pan, "mute": t.mute, "solo": t.solo, "gain_l": t.gain_l, "gain_r": t.gain_r,
                             "source_path": t.source_path} for t in self.tracks],
                 "labels": [{"pos": lb.pos, "name": lb.name} for lb in self.labels]}
         arrays = {f"t{i}": t.data for i, t in enumerate(self.tracks)}
@@ -1634,6 +2441,7 @@ class Project:
         for i, m in enumerate(meta["tracks"]):
             t = Track(m["name"], z[f"t{i}"], m["offset"])
             t.gain, t.pan, t.mute, t.solo = m["gain"], m["pan"], m["mute"], m["solo"]
+            t.gain_l, t.gain_r = m.get("gain_l", 1.0), m.get("gain_r", 1.0)
             t.source_path = m.get("source_path")
             self.tracks.append(t)
         self.labels = [Label(lb["pos"], lb["name"]) for lb in meta.get("labels", [])]
@@ -1779,7 +2587,7 @@ def p_play(c, cx, cy, s):
 
 def p_stop(c, cx, cy, s):
     q = s * .2
-    col = c.ink("#16161a") if c.enabled else "#9b9ca4"
+    col = c.ink()
     c.create_rectangle(cx - q / 2, cy - q / 2, cx + q / 2, cy + q / 2, fill=col, outline="")
 
 
@@ -1971,13 +2779,172 @@ def p_5star(c, cx, cy, s):
 
 
 # ---------------------------------------------------------------- widgets
+# =====================================================================
+#  STUDIO BLUE SKIN - anti-aliased images drawn with numpy (no extra packages)
+# =====================================================================
+from collections import OrderedDict
+
+_SKIN = OrderedDict()
+
+
+def _rgb(c):
+    c = c.lstrip("#")
+    return np.array([int(c[i:i + 2], 16) for i in (0, 2, 4)], np.float32)
+
+
+def _png(rgba):
+    h, w, _ = rgba.shape
+    raw = np.concatenate([np.zeros((h, 1), np.uint8), rgba.reshape(h, w * 4)], axis=1).tobytes()
+
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 4)) + chunk(b"IEND", b""))
+
+
+def _cached(key, make):
+    img = _SKIN.get(key)
+    if img is None:
+        img = make()
+        _SKIN[key] = img
+        while len(_SKIN) > 700:
+            _SKIN.popitem(last=False)
+    else:
+        _SKIN.move_to_end(key)
+    return img
+
+
+def _photo(rgba):
+    return tk.PhotoImage(data=base64.b64encode(_png(rgba)).decode("ascii"))
+
+
+def _sdf(w, h, r, inset=0.0, dy=0.0):
+    """Signed distance to a rounded rectangle (negative inside)."""
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    xx += 0.5
+    yy += 0.5
+    hw, hh = w / 2.0 - inset, h / 2.0 - inset
+    r = max(0.5, min(r, hw, hh))
+    qx = np.abs(xx - w / 2.0) - (hw - r)
+    qy = np.abs(yy - h / 2.0 - dy) - (hh - r)
+    return np.hypot(np.maximum(qx, 0), np.maximum(qy, 0)) + np.minimum(np.maximum(qx, qy), 0) - r
+
+
+def skin_img(w, h, r, top, bot, border=None, gloss=0.0, shadow=0, bw=1.3):
+    """Rounded rectangle / circle with vertical gradient, optional border, gloss and soft shadow."""
+    w, h, shadow = max(2, int(w)), max(2, int(h)), int(shadow)
+    key = ("s", w, h, round(float(r), 1), top, bot, border, gloss, shadow, bw)
+
+    def make():
+        pad = shadow
+        d = _sdf(w, h, r, inset=pad)
+        a_shape = np.clip(0.5 - d, 0, 1)
+        yy = np.arange(h, dtype=np.float32)[:, None] + 0.5
+        t = np.clip((yy - pad) / max(1.0, h - 2 * pad), 0, 1)
+        col = _rgb(top)[None, None, :] * (1 - t[..., None]) + _rgb(bot)[None, None, :] * t[..., None]
+        col = np.broadcast_to(col, (h, w, 3)).copy()
+        if gloss:
+            g = (np.clip(1.0 - t * 2.0, 0, 1) ** 1.4) * gloss
+            col += (255.0 - col) * g[..., None]
+        if border:
+            inner = np.clip(0.5 - (d + bw), 0, 1)
+            ring = np.clip(a_shape - inner, 0, 1)
+            rgb = (col * inner[..., None] + _rgb(border)[None, None, :] * ring[..., None])
+            rgb = rgb / np.maximum(a_shape[..., None], 1e-3)
+        else:
+            rgb = col
+        alpha = a_shape
+        if shadow:
+            ds = _sdf(w, h, r, inset=pad, dy=shadow * 0.35)
+            a_sh = np.exp(-(np.maximum(ds, 0) ** 2) / (2 * (shadow * 0.5) ** 2)) * 0.30
+            out_a = alpha + a_sh * (1 - alpha)
+            rgb = ((rgb * alpha[..., None]
+                    + np.array([16, 30, 70], np.float32) * (a_sh * (1 - alpha))[..., None])
+                   / np.maximum(out_a[..., None], 1e-3))
+            alpha = out_a
+        rgba = np.dstack([np.clip(rgb, 0, 255), np.clip(alpha * 255, 0, 255)]).astype(np.uint8)
+        return _photo(rgba)
+    return _cached(key, make)
+
+
+def metal_img(w, h, sel=False):
+    """Brushed silver panel (soft diagonal sheen + fine horizontal brushing)."""
+    w, h = max(2, int(w)), max(2, int(h))
+    key = ("m", w, h, bool(sel))
+
+    def make():
+        top, bot = ("#eaf0fd", "#b4c7ee") if sel else ("#f0f2f6", "#b9c0cd")
+        t = np.linspace(0, 1, h, dtype=np.float32)[:, None, None]
+        x = np.linspace(0, 1, w, dtype=np.float32)[None, :, None]
+        col = _rgb(top)[None, None, :] * (1 - t) + _rgb(bot)[None, None, :] * t
+        sheen = 0.5 + 0.5 * np.sin((x * 1.5 + t * 0.4) * np.pi * 2)
+        rows = np.random.default_rng(11).normal(0, 1.3, (h, 1, 1)).astype(np.float32)
+        img = np.clip(col + sheen * 11.0 - 5.0 + rows, 0, 255)
+        rgba = np.concatenate([img, np.full((h, w, 1), 255, np.float32)], axis=2).astype(np.uint8)
+        return _photo(rgba)
+    return _cached(key, make)
+
+
+def knob_img(d, hot=False):
+    return skin_img(d, d, d / 2.0, "#6aa0f6" if hot else "#5b95f0", "#0b3a8c" if not hot else "#0f47aa",
+                    border="#062a6c", gloss=0.38, shadow=max(2, d // 9))
+
+
+def _mix(c1, c2, t):
+    a, b = _rgb(c1), _rgb(c2)
+    m = a * (1 - t) + b * t
+    return "#%02x%02x%02x" % tuple(int(v) for v in m)
+
+
+def meter_color(f):
+    """0..1 along the meter -> blue, cyan, green, yellow, orange, red."""
+    stops = [(0.00, (28, 84, 255)), (0.20, (0, 165, 255)), (0.40, (0, 210, 145)),
+             (0.60, (115, 220, 40)), (0.76, (255, 208, 0)), (0.89, (255, 128, 0)), (1.00, (255, 46, 46))]
+    f = min(1.0, max(0.0, f))
+    for (a, ca), (b, cb) in zip(stops, stops[1:]):
+        if f <= b:
+            k = (f - a) / (b - a)
+            return "#%02x%02x%02x" % tuple(int(ca[i] + (cb[i] - ca[i]) * k) for i in range(3))
+    return "#e13232"
+
+
+class PillGroup(tk.Canvas):
+    """A rounded 'pill' container: put widgets into `.inner`."""
+
+    def __init__(self, master, bg=None, pad=None, radius=None):
+        self.padp = pad if pad is not None else u(6)
+        self.rad = radius if radius is not None else u(16)
+        super().__init__(master, bg=bg or PAL["toolbar"], highlightthickness=0, bd=0)
+        self.inner = tk.Frame(self, bg=PAL["pill"])
+        self.create_window(self.padp, self.padp, window=self.inner, anchor="nw", tags="win")
+        self._wh = None
+        self.inner.bind("<Configure>", self._sync)
+
+    def _sync(self, _e=None):
+        w = self.inner.winfo_reqwidth() + 2 * self.padp
+        h = self.inner.winfo_reqheight() + 2 * self.padp
+        if (w, h) == self._wh:
+            return
+        self._wh = (w, h)
+        self.configure(width=w, height=h)
+        img = skin_img(w, h, self.rad, PAL["pill"], PAL["pill"], border=PAL["pill_edge"], bw=max(1.2, u(1.6)))
+        self.delete("bg")
+        self.create_image(0, 0, image=img, anchor="nw", tags="bg")
+        self.tag_lower("bg")
+
+
+
+
 class IconButton(tk.Canvas):
+    """styles: navy (glossy blue circle) | round (silver circle) | pill (silver rounded) | tool (flat)"""
+
     def __init__(self, master, w, h, painter, command=None, text=None, layout="icon",
-                 dim_face=False, bg=None):
-        super().__init__(master, width=w, height=h, bg=bg or PAL["toolbar"], highlightthickness=0, bd=0)
+                 dim_face=False, bg=None, style="tool"):
+        super().__init__(master, width=w, height=h, bg=bg or PAL["pill"], highlightthickness=0, bd=0)
         self.w, self.h, self.painter, self.command = w, h, painter, command
-        self.text, self.layout, self.dim_face = text, layout, dim_face
-        self.enabled, self.active = True, False
+        self.text, self.layout, self.dim_face, self.style = text, layout, dim_face, style
+        self.enabled, self.active, self.alert = True, False, False
         self._hover = self._down = False
         self.bind("<Enter>", lambda e: self._set_state(hover=True))
         self.bind("<Leave>", lambda e: self._set_state(hover=False, down=False))
@@ -1986,7 +2953,11 @@ class IconButton(tk.Canvas):
         self.draw()
 
     def ink(self, col=None):
-        return (col or PAL["icon"]) if self.enabled else PAL["icon_off"]
+        if not self.enabled:
+            return PAL["icon_off"]
+        if self.style in ("navy", "navysq"):
+            return "#ffffff"
+        return col or PAL["icon"]
 
     def _set_state(self, hover=None, down=None):
         if hover is not None:
@@ -2010,19 +2981,72 @@ class IconButton(tk.Canvas):
         if changed:
             self.draw()
 
+    def _face(self):
+        w, h, st = self.w, self.h, self.style
+        down, hov, on, act = self._down and self.enabled, self._hover and self.enabled, self.enabled, self.active
+        if st == "navysq":
+            c = ("#4f8bee", "#0b3a8c", "#06265f") if on else ("#b9c3d9", "#9aa7c4", "#8995b3")
+            if on and down:
+                c = ("#0d4cc0", "#06285f", "#041c47")
+            elif on and hov:
+                c = ("#6aa5f7", "#1650bc", "#0a2f78")
+            return skin_img(w, h, u(13), c[0], c[1], border=c[2], gloss=0.35, shadow=max(2, u(3)))
+        if st == "navy":
+            sh = max(3, u(5))
+            if not on:
+                c = ("#b9c3d9", "#9aa7c4", "#8995b3")
+            elif act:
+                c = ("#ff7676", "#c3272f", "#7d1118") if self.alert else ("#62a6ff", "#1459d8", "#0a3ea0")
+            elif down:
+                c = ("#0d4cc0", "#06285f", "#041c47")
+            elif hov:
+                c = ("#6aa5f7", "#1650bc", "#0a2f78")
+            else:
+                c = ("#4f8bee", "#0b3a8c", "#06265f")
+            return skin_img(w, h, min(w, h) / 2.0, c[0], c[1], border=c[2], gloss=0.40, shadow=sh)
+        if st == "round":
+            sh = max(2, u(3))
+            if not on:
+                c = ("#f3f5f9", "#e2e6ee", "#d0d6e4")
+            elif act:
+                c = ("#d6e5ff", "#9dbcf4", "#5a86da")
+            elif down:
+                c = ("#c2cde6", "#e3e9f6", "#8f9dbd")
+            elif hov:
+                c = ("#ffffff", "#e8eefa", "#9fb0d3")
+            else:
+                c = ("#ffffff", "#d6ddec", "#a9b4cc")
+            return skin_img(w, h, min(w, h) / 2.0, c[0], c[1], border=c[2], shadow=sh)
+        if st == "pill":
+            if not on:
+                c = ("#eef0f5", "#e3e6ee", "#d3d9e6")
+            elif act:
+                c = ("#d6e5ff", "#a9c5f6", "#5a86da")
+            elif down:
+                c = ("#c4cfe8", "#e4eaf6", "#8f9dbd")
+            elif hov:
+                c = ("#ffffff", "#e9eefa", "#9fb0d3")
+            else:
+                c = ("#fdfeff", "#d8deec", "#b0bad0")
+            return skin_img(w, h, u(14), c[0], c[1], border=c[2])
+        # tool: flat until hovered / active
+        if not on:
+            return skin_img(w, h, u(8), "#e6e9ef", "#e6e9ef") if self.dim_face else None
+        if act:
+            c = ("#e0ebff", "#bcd2fb", "#6f95e8")
+        elif down:
+            c = ("#c9d5ee", "#dde5f5", "#9aa9cb")
+        elif hov:
+            c = ("#ffffff", "#e3e9f6", "#bcc7de")
+        else:
+            return None
+        return skin_img(w, h, u(8), c[0], c[1], border=c[2])
+
     def draw(self):
         self.delete("all")
-        if not self.enabled and self.dim_face:
-            face = PAL["btn_off"]
-        elif self._down and self.enabled:
-            face = PAL["btn_down"]
-        elif self.active:
-            face = PAL["btn_active"]
-        elif self._hover and self.enabled:
-            face = PAL["btn_hover"]
-        else:
-            face = PAL["btn"]
-        rrect(self, 1, 1, self.w - 1, self.h - 1, u(7), fill=face, outline=face)
+        img = self._face()
+        if img is not None:
+            self.create_image(0, 0, image=img, anchor="nw")
         if self.layout == "stacked":
             self.painter(self, self.w / 2, self.h * .36, self.h * .46)
             self.create_text(self.w / 2, self.h * .8, text=self.text, fill=self.ink(), font=fnt(27))
@@ -2030,7 +3054,8 @@ class IconButton(tk.Canvas):
             self.painter(self, self.h * .52, self.h / 2, self.h * .66)
             self.create_text(self.h * 1.02, self.h / 2, text=self.text, anchor="w", fill=self.ink(), font=fnt(28))
         else:
-            self.painter(self, self.w / 2, self.h / 2, min(self.w, self.h))
+            k = {"navy": 1.45, "round": 1.2, "navysq": 1.25}.get(self.style, 1.0)
+            self.painter(self, self.w / 2, self.h / 2, min(self.w, self.h) * k)
 
 
 class Gripper(tk.Canvas):
@@ -2045,11 +3070,13 @@ class Gripper(tk.Canvas):
 
 
 class CheckBox(tk.Canvas):
+    """Toggle switch (replaces the tick box; same variable, same behaviour)."""
+
     def __init__(self, master, text, var, command=None):
         self.var, self.command, self.text = var, command, text
-        self.box = u(34)
+        self.sw_w, self.sw_h = u(64), u(32)
         font = fnt(26)
-        super().__init__(master, width=self.box + u(14) + measure(font, text) + u(4), height=self.box + u(6),
+        super().__init__(master, width=self.sw_w + u(14) + measure(font, text) + u(8), height=self.sw_h + u(10),
                          bg=PAL["bottom"], highlightthickness=0, cursor="arrow")
         self.bind("<ButtonPress-1>", self._toggle)
         self.draw()
@@ -2062,25 +3089,27 @@ class CheckBox(tk.Canvas):
 
     def draw(self):
         self.delete("all")
-        b, y = self.box, 3
-        on = self.var.get()
-        rrect(self, 2, y, b, y + b - 2, u(6), fill=PAL["check"] if on else "#ffffff",
-              outline=PAL["check"] if on else "#7a7a80", width=max(1, u(2)))
-        if on:
-            self.create_line(b * .26, y + b * .5, b * .45, y + b * .68, b * .78, y + b * .3,
-                             fill="#ffffff", width=max(2, u(4)), joinstyle="round", capstyle="round")
-        self.create_text(b + u(14), y + b / 2 - 1, text=self.text, anchor="w", fill="#16161a", font=fnt(26))
+        on = bool(self.var.get())
+        w, h = self.sw_w, self.sw_h
+        top, bot, bd = ("#4f8bee", "#1450c8", "#0a2f7a") if on else ("#aab3c5", "#cdd3df", "#8c97ad")
+        self.create_image(1, 4, image=skin_img(w, h, h / 2.0, top, bot, border=bd), anchor="nw")
+        kd = h - u(8)
+        kx = (w - kd - u(4)) if on else u(4)
+        self.create_image(kx, 4 + (h - kd) / 2.0, anchor="nw",
+                          image=skin_img(kd, kd, kd / 2.0, "#ffffff", "#dfe5f2", border="#8f9bb8", shadow=max(2, u(2))))
+        self.create_text(w + u(14), 4 + h / 2.0 - 1, text=self.text, anchor="w", fill=PAL["ink"], font=fnt(26))
 
 
 class LevelMeter(tk.Canvas):
     LABELS = (-54, -48, -42, -36, -30, -24, -18, -12, 0)
 
     def __init__(self, master, w, h, knob_db=-6.0, on_knob=None):
-        super().__init__(master, width=w, height=h, bg=PAL["toolbar"], highlightthickness=0)
+        super().__init__(master, width=w, height=h, bg=PAL["pill"], highlightthickness=0)
         self.w, self.h = w, h
         self.lv = [0.0, 0.0]
         self.knob_db, self.on_knob = knob_db, on_knob
-        self.x54, self.step = u(60), u(45)
+        self.x54, self.step = u(52), u(43)
+        self._built = False
         if on_knob:
             self.bind("<ButtonPress-1>", self._drag)
             self.bind("<B1-Motion>", self._drag)
@@ -2102,27 +3131,54 @@ class LevelMeter(tk.Canvas):
             self.lv = new
             self.draw()
 
-    def draw(self):
-        self.delete("all")
+    @staticmethod
+    def _dim(col):
+        a, b = _rgb(col), _rgb(PAL["pill"])
+        m = a * 0.78 + b * 0.22
+        return "#%02x%02x%02x" % tuple(int(v) for v in m)
+
+    def _build(self):
         h, mid = self.h, self.h / 2
-        self.create_rectangle(self.x54 - u(6), 1, self.x(0) + u(24), h - 1, outline=PAL["meter_edge"], fill="")
-        self.create_text(u(8), h * .30, text="L", anchor="w", fill="#16161a", font=fnt(21))
-        self.create_text(u(8), h * .72, text="R", anchor="w", fill="#16161a", font=fnt(21))
-        bt = u(7)
-        for k, lvl in enumerate(self.lv):
-            if lvl > 1e-5:
-                db = max(-54.0, 20 * math.log10(lvl))
-                col = "#4caf50" if db < -12 else ("#f0b429" if db < -3 else "#e53935")
-                y = u(3) if k == 0 else h - u(3) - bt
-                self.create_rectangle(self.x54, y, self.x(db), y + bt, fill=col, outline="")
+        rrect(self, self.x54 - u(6), 1, self.x(0) + u(24), h - 1, u(9), fill="", outline=PAL["meter_edge"],
+              width=max(1, u(2)))
+        self.create_text(u(8), h * .30, text="L", anchor="w", fill=PAL["icon"], font=fnt(21))
+        self.create_text(u(8), h * .72, text="R", anchor="w", fill=PAL["icon"], font=fnt(21))
+        x0, x1 = self.x54, self.x(0)
+        seg, gap, bt = max(2, u(6)), max(1, u(2)), u(12)
+        n = max(8, int((x1 - x0) / (seg + gap)))
+        self.segs = [[], []]
+        self._lit = [[False] * n, [False] * n]
+        for k in (0, 1):
+            y = u(2) if k == 0 else h - u(2) - bt
+            for i in range(n):
+                xs = x0 + i * (seg + gap)
+                col = meter_color((xs - x0) / max(1.0, x1 - x0))
+                rid = self.create_rectangle(xs, y, xs + seg, y + bt, fill=self._dim(col), outline="")
+                self.segs[k].append((rid, col, xs + seg))
         for db in self.LABELS:
             x = self.x(db)
-            self.create_line(x, mid - u(15), x, mid - u(10), fill="#16161a")
-            self.create_text(x, mid + u(2), text=str(db), fill="#16161a", font=fnt(22))
+            self.create_text(x, mid, text=str(db), fill=PAL["icon"], font=fnt(15))
+        self._knob = None
+        self._built = True
+
+    def draw(self):
+        if not self._built:
+            self._build()
+        for k, lvl in enumerate(self.lv):
+            lit_x = self.x(max(-54.0, 20 * math.log10(lvl))) if lvl > 1e-5 else -1
+            for i, (rid, col, xe) in enumerate(self.segs[k]):
+                on = xe <= lit_x
+                if on != self._lit[k][i]:
+                    self._lit[k][i] = on
+                    self.itemconfig(rid, fill=col if on else self._dim(col))
         if self.knob_db is not None:
-            x, r = self.x(self.knob_db), u(11)
-            self.create_oval(x - r, mid - r, x + r, mid + r, fill="#ffffff", outline="#202024",
-                             width=max(2, u(2)))
+            x, r, mid = self.x(self.knob_db), u(11), self.h / 2
+            if self._knob is None:
+                self._knob = self.create_oval(x - r, mid - r, x + r, mid + r, fill="#ffffff", outline=PAL["navy"],
+                                              width=max(2, u(2)))
+            else:
+                self.coords(self._knob, x - r, mid - r, x + r, mid + r)
+            self.tag_raise(self._knob)
 
 
 class ThinScroll(tk.Canvas):
@@ -2160,10 +3216,10 @@ class ThinScroll(tk.Canvas):
         th = max(2, u(4))
         if self.horiz:
             cy = self.winfo_height() / 2
-            self.create_rectangle(a, cy - th / 2, b, cy + th / 2, fill=PAL["thumb"], outline="")
+            self.create_line(a + th / 2, cy, b - th / 2, cy, fill=PAL["thumb"], width=th * 1.6, capstyle="round")
         else:
             cx = self.winfo_width() / 2
-            self.create_rectangle(cx - th / 2, a, cx + th / 2, b, fill=PAL["thumb"], outline="")
+            self.create_line(cx, a + th / 2, cx, b - th / 2, fill=PAL["thumb"], width=th * 1.6, capstyle="round")
 
     def _press(self, ev):
         pos = ev.x if self.horiz else ev.y
@@ -2486,7 +3542,8 @@ class App(tk.Tk):
     def __init__(self, files=()):
         super().__init__()
         init_metrics(self.winfo_screenwidth())
-        self.title("Studio Audio Editor")
+        self.title("Studio Audio Editor  \u00b7  Blue skin v2")
+        print("Studio Audio Editor - Blue skin v2 loaded from:", os.path.abspath(__file__), flush=True)
         self.configure(bg=PAL["desk"])
         self.minsize(u(1500), u(800))
         try:
@@ -2543,13 +3600,62 @@ class App(tk.Tk):
 
     def _style(self):
         st = ttk.Style(self)
-        for th in ("vista", "xpnative", "clam"):
-            try:
-                st.theme_use(th)
-                break
-            except tk.TclError:
-                continue
+        try:
+            st.theme_use("clam")
+        except tk.TclError:
+            pass
+        P = PAL
+        ink, bg, edge = P["ink"], P["bottom"], "#8d99b6"
+        st.configure(".", background=bg, foreground=ink, bordercolor=edge, lightcolor="#eef1f8",
+                     darkcolor="#aab4c8", troughcolor="#a8b6d4", focuscolor=bg, fieldbackground="#ffffff",
+                     selectbackground=P["navy"], selectforeground="#ffffff")
+        for w_ in ("TFrame", "TLabelframe", "TNotebook"):
+            st.configure(w_, background=bg)
+        st.configure("TLabel", background=bg, foreground=ink)
+        st.configure("TLabelframe.Label", background=bg, foreground=ink)
+        for w_ in ("TCheckbutton", "TRadiobutton"):
+            st.configure(w_, background=bg, foreground=ink, indicatorcolor="#ffffff")
+            st.map(w_, indicatorcolor=[("selected", P["navy"]), ("pressed", "#c3cfe8")],
+                   background=[("active", bg)])
+        st.configure("TButton", background="#eef1f8", foreground=ink, bordercolor=edge, padding=(10, 4))
+        st.map("TButton", background=[("pressed", "#c3cfe8"), ("active", "#ffffff"), ("disabled", "#dfe3ea")],
+               foreground=[("disabled", "#98a2b6")])
+        for w_ in ("TEntry", "TSpinbox", "TCombobox"):
+            st.configure(w_, fieldbackground="#ffffff", bordercolor=edge, arrowcolor=P["navy"], padding=3,
+                         background="#e4e9f3")
+        st.map("TCombobox", fieldbackground=[("readonly", "#ffffff")], foreground=[("readonly", ink)],
+               selectbackground=[("readonly", "#ffffff")], selectforeground=[("readonly", ink)])
+        st.configure("Horizontal.TScale", background=P["navy"], troughcolor="#a8b6d4", bordercolor=edge,
+                     lightcolor=P["navy"], darkcolor=P["navy"])
+        st.configure("Horizontal.TProgressbar", background=P["navy"], troughcolor="#c5cde0", bordercolor=edge,
+                     lightcolor="#3f78e0", darkcolor=P["navy"])
+        st.configure("TScrollbar", background="#c5cde0", troughcolor="#e1e6f0", arrowcolor=P["navy"],
+                     bordercolor=edge)
         self.option_add("*TCombobox*Listbox.font", fnt(26))
+        self.option_add("*TCombobox*Listbox.background", "#ffffff")
+        self.option_add("*TCombobox*Listbox.selectBackground", P["navy"])
+        self.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
+        self.option_add("*Menu.background", "#eef1f7")
+        self.option_add("*Menu.foreground", ink)
+        self.option_add("*Menu.activeBackground", P["navy"])
+        self.option_add("*Menu.activeForeground", "#ffffff")
+        self.option_add("*Menu.disabledForeground", "#98a2b6")
+        self.after(250, self._style_titlebar)
+
+    def _style_titlebar(self):
+        """Windows 11: navy title bar with white text (silently ignored elsewhere)."""
+        try:
+            import ctypes
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+
+            def put(attr, rgb):
+                val = ctypes.c_int(rgb[2] << 16 | rgb[1] << 8 | rgb[0])
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(val), ctypes.sizeof(val))
+            put(35, (0x08, 0x30, 0x77))      # caption colour
+            put(36, (255, 255, 255))         # caption text
+            put(34, (0x08, 0x30, 0x77))      # window border
+        except Exception:
+            pass
 
     # -------------------- recent files --------------------
     def _rebuild_recent_menu(self):
@@ -2729,12 +3835,22 @@ class App(tk.Tk):
         add_effect("Invert", lambda: self.run_effect(fx_invert))
         add_effect("Remove DC Offset", lambda: self.run_effect(fx_dc))
         sep()
+        add_effect("Declip (restore clipped peaks)", self.fx_declip)
+        add_effect("Presence / Air EQ...", self.fx_presence)
+        add_effect("Harmonic Exciter...", self.fx_exciter)
+        add_effect("Loudness Normalize (LUFS)...", self.fx_loudness)
+        add_effect("True-Peak Limiter...", self.fx_tp_limiter)
+        add_effect("Bass to Mono...", self.fx_bass_mono)
+        add_effect("Mono-Safe Stereo (reduce side)...", self.fx_side_reduce)
+        add_effect("Fix Inverted Polarity (right channel)", lambda: self.run_effect(fx_fix_polarity))
+        sep()
         add_effect("Repeat Last Effect", self.repeat_last_effect)
         sep()
         add_effect("Audio Plus  \u00b7  Auto 5_Star Enhance...", self.open_auto_5star)
         m.add_cascade(label="Effect", menu=eff)
 
         menu("Analyze", [
+            ("Audio Health Check  (LUFS \u00b7 Clipping \u00b7 Mono \u00b7 Presence)...", self.open_health_check),
             ("Plot Spectrum...", self.plot_spectrum),
             ("Find Clipping...", self.find_clipping),
             ("Silence Finder...", self.silence_finder),
@@ -2762,17 +3878,16 @@ class App(tk.Tk):
         self.key_var = tk.StringVar(value="No selection")
         self.key_sub_var = tk.StringVar(value="select a track on the left")
         self._key_sig, self._key_cache, self._key_q = None, {}, queue.Queue()
-        kb = tk.Frame(bar, bg=P["toolbar"])
+        kb = PillGroup(bar, pad=u(5), radius=u(20))
         kb.pack(side="right", padx=(u(8), u(14)), pady=u(8))
-        box = tk.Frame(kb, bg="#ffffff", highlightbackground=P["grip"],
-                       highlightthickness=max(1, u(2)), cursor="hand2")
-        box.pack()
-        cap = tk.Label(box, text="KEY OF SELECTED TRACK", bg="#ffffff", fg="#70707a", font=fnt(12, True))
-        cap.pack(padx=u(18), pady=(u(6), 0))
-        self._key_lbl = tk.Label(box, textvariable=self.key_var, bg="#ffffff", fg="#9a9aa4",
-                                 font=fnt(38, True), width=12)
+        box = kb.inner
+        box.configure(cursor="hand2")
+        cap = tk.Label(box, text="KEY OF SELECTED TRACK", bg=P["pill"], fg="#5d6988", font=fnt(12, True))
+        cap.pack(padx=u(14), pady=(u(5), 0))
+        self._key_lbl = tk.Label(box, textvariable=self.key_var, bg=P["pill"], fg="#9a9aa4",
+                                 font=fnt(30, True), width=12)
         self._key_lbl.pack(padx=u(10))
-        sub = tk.Label(box, textvariable=self.key_sub_var, bg="#ffffff", fg="#70707a", font=fnt(12))
+        sub = tk.Label(box, textvariable=self.key_sub_var, bg=P["pill"], fg="#5d6988", font=fnt(12))
         sub.pack(pady=(0, u(6)))
         for w_ in (box, cap, self._key_lbl, sub):
             w_.bind("<Button-1>", lambda _e: self.open_key_changer())
@@ -2785,20 +3900,23 @@ class App(tk.Tk):
             Gripper(row).pack(side="left", padx=(u(6), u(8)))
 
         def group():
-            f = tk.Frame(row, bg=P["toolbar"])
-            f.pack(side="left")
-            return f
+            pg = PillGroup(row)
+            pg.pack(side="left")
+            return pg.inner
 
         g = group()
         bs = u(103)
-        spec = (("pause", p_pause, self.pause, 0), ("play", p_play, self.play, 0),
-                ("stop", p_stop, self.stop, 0), ("start", p_skip_start, lambda: self.set_cursor(0), 0),
-                ("end", p_skip_end, lambda: self.set_cursor(self.proj.length()), 6),
-                ("record", p_record, self.toggle_record, 6), ("loop", p_loop, self._toggle_loop, 0))
-        for key, painter, cmd, extra in spec:
-            b = IconButton(g, bs, bs, painter, cmd)
-            b.pack(side="left", padx=(0, u(9 + extra)))
+        spec = (("play", p_play, self.play, "navy"), ("record", p_record, self.toggle_record, "navy"),
+                ("pause", p_pause, self.pause, "round"), ("stop", p_stop, self.stop, "round"),
+                ("start", p_skip_start, lambda: self.set_cursor(0), "round"),
+                ("end", p_skip_end, lambda: self.set_cursor(self.proj.length()), "round"),
+                ("loop", p_loop, self._toggle_loop, "round"))
+        for key, painter, cmd, style in spec:
+            sz = int(bs * .96) if style == "navy" else int(bs * .78)
+            b = IconButton(g, sz, sz, painter, cmd, style=style)
+            b.pack(side="left", padx=(0, u(6)))
             self.btn[key] = b
+        self.btn["record"].alert = True
         grip()
         g = group()
         ts = (u(49), u(48))
@@ -2828,26 +3946,26 @@ class App(tk.Tk):
         grip()
         g = group()
         self.btn["setup"] = IconButton(g, u(176), u(103), p_audio_setup, self.audio_setup,
-                                       text="Audio Setup", layout="stacked")
+                                       text="Audio Setup", layout="stacked", style="pill")
         self.btn["setup"].pack()
         grip()
         g = group()
         self.btn["share"] = IconButton(g, u(246), u(50), p_share, lambda: self.export_dialog(),
-                                       text="Share Audio", layout="inline")
+                                       text="Share Audio", layout="inline", style="pill")
         self.btn["effects"] = IconButton(g, u(246), u(50), p_plug, self._effects_popup,
-                                         text="Get Effects", layout="inline")
+                                         text="Get Effects", layout="inline", style="pill")
         self.btn["share"].grid(row=0, column=0, pady=u(1))
         self.btn["effects"].grid(row=1, column=0, pady=u(1))
         grip()
         g5 = group()
         self.btn["5star"] = IconButton(
-            g5, u(246), u(103), p_5star, self.open_auto_5star,
-            text="Auto 5_Star Enhance", layout="stacked")
+            g5, max(u(246), measure(fnt(27), "Auto 5_Star Enhance") + u(34)), u(103), p_5star, self.open_auto_5star,
+            text="Auto 5_Star Enhance", layout="stacked", style="pill")
         self.btn["5star"].pack()
         grip()
         g = group()
-        self.meter_in = LevelMeter(g, u(470), u(48), knob_db=-7.0)
-        self.meter_out = LevelMeter(g, u(470), u(48), knob_db=-3.0, on_knob=self._set_volume)
+        self.meter_in = LevelMeter(g, u(500), u(56), knob_db=-7.0)
+        self.meter_out = LevelMeter(g, u(500), u(56), knob_db=-3.0, on_knob=self._set_volume)
         for r, (icon, meter) in enumerate(((p_mic, self.meter_in), (p_speaker, self.meter_out))):
             IconButton(g, u(46), u(48), icon, None).grid(row=r, column=0, padx=(0, u(6)), pady=u(1))
             meter.grid(row=r, column=1, pady=u(1))
@@ -2856,7 +3974,7 @@ class App(tk.Tk):
         P = PAL
         status = tk.Frame(self, bg=P["status"])
         status.pack(side="bottom", fill="x")
-        tk.Frame(status, bg="#dfdfe4", height=max(1, u(2))).pack(fill="x")
+        tk.Frame(status, bg="#d9dee8", height=max(1, u(2))).pack(fill="x")
         srow = tk.Frame(status, bg=P["status"], height=u(44))
         srow.pack(fill="x")
         srow.pack_propagate(False)
@@ -2865,7 +3983,7 @@ class App(tk.Tk):
         cell.pack_propagate(False)
         tk.Label(cell, textvariable=self.status_var, anchor="w", bg=P["status"], fg="#16161a",
                  font=fnt(25)).pack(fill="both", padx=u(14))
-        tk.Frame(srow, bg="#c8c8cd", width=max(1, u(2))).pack(side="left", fill="y")
+        tk.Frame(srow, bg="#98a2b6", width=max(1, u(2))).pack(side="left", fill="y")
 
         bt = tk.Frame(self, bg=P["bottom"])
         bt.pack(side="bottom", fill="x")
@@ -2885,7 +4003,7 @@ class App(tk.Tk):
             f.pack(side="left")
             return f
 
-        lab = lambda p, t: tk.Label(p, text=t, bg=bgc, fg="#16161a", font=fnt(25))
+        lab = lambda p, t: tk.Label(p, text=t, bg=bgc, fg=P["ink"], font=fnt(25))
         grip()
         g = col()
         lab(g, "Tempo").pack(anchor="w")
@@ -2910,11 +4028,11 @@ class App(tk.Tk):
         sep()
         grip(pad=(0, u(8)))
         tf = tk.Frame(inner, bg=P["time_bg"], highlightthickness=max(1, u(2)),
-                      highlightbackground="#8a8c9c")
+                      highlightbackground="#33415f")
         tf.pack(side="left")
-        tk.Label(tf, textvariable=self.time_var, bg=P["time_bg"], fg="#ffffff",
+        tk.Label(tf, textvariable=self.time_var, bg=P["time_bg"], fg=P["digits"],
                  font=fnt(60), padx=u(10)).pack(side="left", pady=u(6))
-        tk.Label(tf, text="\u25BE", bg=P["time_bg"], fg="#ffffff",
+        tk.Label(tf, text="\u25BE", bg=P["time_bg"], fg=P["digits"],
                  font=fnt(30)).pack(side="left", padx=(0, u(6)))
         sep()
         grip(pad=(0, u(8)))
@@ -2924,16 +4042,16 @@ class App(tk.Tk):
         gear.grid(row=1, column=0, sticky="e", padx=(0, u(12)), pady=(u(6), 0))
         for rr, var in enumerate((self.sel_a_var, self.sel_b_var)):
             f = tk.Frame(g, bg=P["time_bg"], highlightthickness=max(1, u(2)),
-                         highlightbackground="#8a8c9c")
+                         highlightbackground="#33415f")
             f.grid(row=rr, column=1, pady=u(2))
-            tk.Label(f, textvariable=var, bg=P["time_bg"], fg="#ffffff",
+            tk.Label(f, textvariable=var, bg=P["time_bg"], fg=P["digits"],
                      font=fnt(29), padx=u(8)).pack(side="left")
-            tk.Label(f, text="\u25BE", bg=P["time_bg"], fg="#ffffff",
+            tk.Label(f, text="\u25BE", bg=P["time_bg"], fg=P["digits"],
                      font=fnt(24)).pack(side="left", padx=(0, u(4)))
         sep()
         grip(pad=(0, u(8)))
         g = col()
-        self.btn["speed"] = IconButton(g, u(74), u(66), p_play_speed, self._play_speed, bg=bgc)
+        self.btn["speed"] = IconButton(g, u(74), u(66), p_play_speed, self._play_speed, bg=bgc, style="navysq")
         self.btn["speed"].grid(row=0, column=0, rowspan=2, padx=(0, u(10)))
         lab(g, "\u2013").grid(row=0, column=1, sticky="w")
         lab(g, "+").grid(row=0, column=2, sticky="e")
@@ -3279,6 +4397,13 @@ class App(tk.Tk):
         self.sel_a_var.set(fmt_hmsms(a / r))
         self.sel_b_var.set(fmt_hmsms(b / r))
 
+    @staticmethod
+    def _fader_frac(g):
+        """0..1 position of a channel fader (-36 dB .. +12 dB; unity sits at 75%)."""
+        if g <= 1e-3:
+            return 0.0
+        return min(1.0, max(0.0, (20 * math.log10(g) + 36.0) / 48.0))
+
     def _slider_x(self, kind, t, x1, x2):
         if kind == "gain":
             db = 20 * math.log10(max(t.gain, 1e-6))
@@ -3301,8 +4426,8 @@ class App(tk.Tk):
         cx1, cy1, cx2, cy2 = xl + INSET, yt + INSET, xr - INSET, yb - INSET
         black = P["black"]
 
-        c.create_rectangle(cx1, cy1, HEAD_W, cy2,
-                           fill=P["panel_sel"] if sel else P["panel"], outline="")
+        c.create_rectangle(cx1, cy1, HEAD_W, cy2, fill=P["scale_sel"] if sel else P["scale"], outline="")
+        c.create_image(cx1, cy1, image=metal_img(HEADER_W - cx1, cy2 - cy1, sel), anchor="nw")
         c.create_line(HEADER_W, cy1, HEADER_W, cy2, fill=black, width=LINE)
         c.create_line(HEAD_W, cy1, HEAD_W, cy2, fill=black, width=LINE)
         ink = P["icon"]
@@ -3326,11 +4451,23 @@ class App(tk.Tk):
                    ("Solo", t.solo, P["solo"], "solo", u(167), u(304)))
         for lab, on, col, kind, bx1, bx2 in gain_on:
             by1, by2 = yt + u(57), yt + u(92)
-            rrect(c, bx1, by1, bx2, by2, u(5), fill=col if on else P["ctl"], outline="")
+            if on:
+                _t, _b, _bd = _mix(col, "#ffffff", .5), col, _mix(col, "#000000", .35)
+            else:
+                _t, _b, _bd = "#fdfeff", "#d3dae9", "#a3aec6"
+            c.create_image(bx1, by1, anchor="nw",
+                           image=skin_img(bx2 - bx1, by2 - by1, u(12), _t, _b, border=_bd))
             c.create_text((bx1 + bx2) / 2, (by1 + by2) / 2, text=lab, fill=ink, font=fnt(26))
             self._hits.append((bx1, by1, bx2, by2, kind, i, None))
         by1, by2 = yt + u(101), yt + u(143)
-        rrect(c, u(20), by1, u(304), by2, u(5), fill=P["ctl"], outline="")
+        c.create_image(u(20), by1, anchor="nw",
+                       image=skin_img(u(304) - u(20), by2 - by1, u(12), "#fdfeff", "#d3dae9", border="#a3aec6"))
+        _ix, _iy, _q = u(304) - u(32), (by1 + by2) / 2.0, u(8)
+        c.create_line(_ix - _q * .2, _iy - _q * .9, _ix - _q, _iy - _q * .9, _ix - _q, _iy + _q, _ix + _q * .9, _iy + _q,
+                      _ix + _q * .9, _iy + _q * .1, fill=P["navy"], width=max(1, u(2)))
+        c.create_line(_ix - _q * .2, _iy + _q * .3, _ix + _q * 1.0, _iy - _q * 1.0, fill=P["navy"], width=max(1, u(2)))
+        c.create_line(_ix + _q * .2, _iy - _q * 1.0, _ix + _q * 1.0, _iy - _q * 1.0, _ix + _q * 1.0, _iy - _q * .2,
+                      fill=P["navy"], width=max(1, u(2)))
         c.create_text((u(20) + u(304)) / 2, (by1 + by2) / 2, text="Effects", fill=ink, font=fnt(26))
         self._hits.append((u(20), by1, u(304), by2, "effects", i, None))
         sx1, sx2 = u(31), u(294)
@@ -3340,15 +4477,34 @@ class App(tk.Tk):
                           font=fnt(20, True))
             c.create_text(sx2 - u(3), y_line - u(23), text=lab_r, anchor="e", fill=ink,
                           font=fnt(20, True))
-            c.create_line(sx1, y_line, sx2, y_line, fill="#9aa6bb", width=max(1, u(2)))
-            for n in range(13):
-                tx = sx1 + (sx2 - sx1) * n / 12.0
-                c.create_line(tx, y_line - u(4), tx, y_line + u(4), fill="#9aa6bb")
-            kx, kr = self._slider_x(kind, t, sx1, sx2), u(12)
-            c.create_oval(kx - kr, y_line - kr, kx + kr, y_line + kr, fill="#ffffff",
-                          outline="#303036", width=max(1, u(2)))
+            kx, kr = self._slider_x(kind, t, sx1, sx2), u(13)
+            th = max(3, u(5))
+            c.create_line(sx1, y_line, sx2, y_line, fill="#9fb0d3", width=th, capstyle="round")
+            x_from = (sx1 + sx2) / 2.0 if kind == "pan" else sx1
+            c.create_line(x_from, y_line, kx, y_line, fill=P["navy"], width=th, capstyle="round")
+            c.create_image(kx - kr, y_line - kr, image=knob_img(int(2 * kr)), anchor="nw")
             self._hits.append((sx1 - u(14), y_line - u(22), sx2 + u(14), y_line + u(22),
                                kind, i, (sx1, sx2)))
+
+        # two vertical faders: LEFT and RIGHT channel level
+        fy1, fy2 = yt + u(298), cy2 - u(58)
+        if fy2 - fy1 > u(90):
+            uy = fy2 - self._fader_frac(1.0) * (fy2 - fy1)
+            for key, fx, lab, g in (("gain_l", u(98), "L", t.gain_l), ("gain_r", u(222), "R", t.gain_r)):
+                ky = fy2 - self._fader_frac(g) * (fy2 - fy1)
+                tw = max(3, u(6))
+                c.create_line(fx, fy1, fx, ky, fill="#aebbd6", width=tw, capstyle="round")
+                c.create_line(fx, ky, fx, fy2, fill=P["navy"], width=tw + u(3), capstyle="round")
+                c.create_line(fx - u(27), uy, fx - u(18), uy, fill="#6f7fa6", width=max(1, u(2)))
+                kw, kh = u(52), u(28)
+                c.create_image(fx - kw / 2, ky - kh / 2, anchor="nw",
+                               image=skin_img(kw, kh, u(8), "#5b95f0", "#0b3a8c", border="#06265f",
+                                              gloss=0.35, shadow=max(2, u(3))))
+                c.create_line(fx - kw / 2 + u(10), ky, fx + kw / 2 - u(10), ky, fill="#d6e5ff", width=max(1, u(2)))
+                txt = "-\u221e dB" if g < 1e-3 else f"{20 * math.log10(g):+.1f} dB"
+                c.create_text(fx, fy1 - u(18), text=txt, fill=ink, font=fnt(19))
+                c.create_text(fx, fy2 + u(26), text=lab, fill=ink, font=fnt(24, True))
+                self._hits.append((fx - u(36), fy1 - u(16), fx + u(36), fy2 + u(16), key, i, (fy1, fy2)))
 
         ch_total = cy2 - cy1 - HDR_H
         chh = (ch_total - LINE) / 2.0
@@ -3598,6 +4754,12 @@ class App(tk.Tk):
             kind, i, sx1, sx2 = self._slider
             if i < len(self.proj.tracks):
                 t = self.proj.tracks[i]
+                if kind in ("gain_l", "gain_r"):          # vertical faders: sx1 = top y, sx2 = bottom y
+                    fr = min(1.0, max(0.0, (sx2 - self.canvas.canvasy(ev.y)) / float(sx2 - sx1)))
+                    db = -36.0 + 48.0 * fr
+                    setattr(t, kind, 0.0 if fr < 0.015 else (1.0 if abs(db) < 1.0 else 10 ** (db / 20.0)))
+                    self.redraw()
+                    return
                 frac = min(1.0, max(0.0, (ev.x - sx1) / float(sx2 - sx1)))
                 if kind == "gain":
                     db = -36.0 + 72.0 * frac
@@ -3641,7 +4803,7 @@ class App(tk.Tk):
                 self.proj.push_undo()
                 setattr(t, kind, not getattr(t, kind))
                 return self.redraw()
-            if kind in ("gain", "pan"):
+            if kind in ("gain", "pan", "gain_l", "gain_r"):
                 self.proj.push_undo()
                 self._slider = (kind, i, extra[0], extra[1])
                 return self._on_drag(ev)
@@ -3934,6 +5096,42 @@ class App(tk.Tk):
             return messagebox.showinfo("Repeat Last Effect", "No effect has been applied yet.")
         title, fields, make = self._last_effect
         self._fx_dialog(title, fields, make)
+
+    def open_health_check(self):
+        HealthCheckDialog(self)
+
+    def fx_declip(self):
+        self.run_effect(lambda x: fx_declip(x, self.proj.rate))
+
+    def fx_presence(self):
+        self._fx_dialog("Presence / Air EQ",
+                        [("db", "Gain (dB, \u22128 to +8)", 2.5), ("hz", "Centre frequency (Hz)", 3000.0)],
+                        lambda p, r: lambda x: fx_presence(x, r, max(-8.0, min(8.0, p["db"])),
+                                                           max(200.0, min(p["hz"], r * 0.45)), 0.9))
+
+    def fx_exciter(self):
+        self._fx_dialog("Harmonic Exciter",
+                        [("amount", "Amount (0 - 0.6)", 0.18), ("hz", "Excite above (Hz)", 2800.0)],
+                        lambda p, r: lambda x: fx_exciter(x, r, max(0.0, min(0.6, p["amount"])), 3.0,
+                                                          max(500.0, min(p["hz"], r * 0.4))))
+
+    def fx_loudness(self):
+        self._fx_dialog("Loudness Normalize (LUFS)",
+                        [("lufs", "Target loudness (LUFS)", -14.0), ("tp", "True-peak ceiling (dBTP)", -1.0)],
+                        lambda p, r: lambda x: fx_loudness_normalize(x, r, max(-40.0, min(-5.0, p["lufs"])),
+                                                                     max(-9.0, min(0.0, p["tp"]))))
+
+    def fx_tp_limiter(self):
+        self._fx_dialog("True-Peak Limiter", [("tp", "Ceiling (dBTP)", -1.0)],
+                        lambda p, r: lambda x: fx_true_peak_limit(x, r, max(-9.0, min(0.0, p["tp"]))))
+
+    def fx_bass_mono(self):
+        self._fx_dialog("Bass to Mono", [("hz", "Mono below (Hz)", 120.0)],
+                        lambda p, r: lambda x: fx_bass_mono(x, r, max(40.0, min(400.0, p["hz"]))))
+
+    def fx_side_reduce(self):
+        self._fx_dialog("Mono-Safe Stereo", [("k", "Side level (0.3 - 1.0)", 0.8)],
+                        lambda p, r: lambda x: fx_side_reduce(x, max(0.3, min(1.0, p["k"]))))
 
     def fx_amplify(self):
         self._fx_dialog("Amplify", [("db", "Amplification (dB)", 6.0)],
@@ -4276,15 +5474,17 @@ class App(tk.Tk):
         t = tg[0]
         a, b = t.local(*self.sel) if self._has_sel() else (0, len(t.data))
         seg = t.data[a:b]
-        mask = np.any(np.abs(seg) >= 0.999, axis=1)
-        runs = np.where(np.diff(np.concatenate([[0], mask.astype(int), [0]])))[0]
+        det = detect_clipping(seg)
+        _lvl, runs = _clip_runs(seg)
+        starts = sorted({r[1] for r in runs})
         self.proj.push_undo()
-        for k in range(0, len(runs), 2):
-            start = t.offset + a + runs[k]
-            self.proj.labels.append(Label(start, "clip"))
+        for st in starts:
+            self.proj.labels.append(Label(t.offset + a + st, "clip"))
         self.after_edit()
         messagebox.showinfo("Find Clipping",
-                            f"Found {len(runs)//2} clipped regions (labeled).")
+                            f"Found {len(starts)} clipped region(s) (labelled).\n"
+                            f"Severity: {det['severity']} \u00b7 {det['percent']:.3f}% of samples flat at "
+                            f"{det['level_db']:.1f} dBFS.\n\nTip: Effect \u2192 Declip restores them.")
 
     def silence_finder(self):
         tg = self.targets()
@@ -4517,6 +5717,7 @@ class App(tk.Tk):
             "Ctrl+B  add label            Ctrl+M  label at playback\n"
             "Ctrl+R  repeat last effect   Ctrl+Shift+5  Auto 5_Star Enhance\n"
             "Ctrl+K  Key Changer (change the song's key)\n"
+            "Analyze > Audio Health Check: LUFS, true peak, clipping, mono, presence\n"
             "Ctrl+Shift+I  import   Ctrl+Shift+E  export   Ctrl+S  save   Ctrl+O  open\n"
             "Ctrl+1 / Ctrl+3  zoom in / out        Ctrl+Shift+F  fit to width\n"
             "Home / End  go to start / end\n\n"
