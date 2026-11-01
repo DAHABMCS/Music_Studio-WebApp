@@ -396,7 +396,7 @@ def download_archive(item_id, kind, work_dir):
 C = {
     "bg": "#eaf0ff", "card": "#ffffff", "ink": "#1e293b", "muted": "#64748b",
     "indigo": "#4f46e5", "teal": "#0d9488", "green": "#16a34a",
-    "orange": "#f97316", "pink": "#db2777", "gray": "#9ca3af",
+    "orange": "#f97316", "pink": "#db2777", "gray": "#9ca3af","red":"#e74c3c",
     "log_bg": "#0f172a", "log_fg": "#e2e8f0",
 }
 FONT = ("Segoe UI", 10)
@@ -1063,14 +1063,15 @@ class App:
             self.logo_img = tk.PhotoImage(data="".join(LOGO_B64))
         except tk.TclError:
             self.logo_img = None
-        Header(root, "Media Check and Replace",
+        Header(root, "Media Check, Replace & Search",
                "Test your MP3 / MP4 files, repair them, or find a replacement online",
                "#4f46e5", LOGO_BG, self.logo_img).pack(fill="x")
 
         bar = tk.Frame(root, bg="#1e1b4b")
         bar.pack(fill="x")
-        FancyButton(bar, "User Manual", self.show_manual, C["orange"]).pack(
-            side="left", padx=(12, 8), pady=5)
+        FancyButton(bar, "User Manual", self.show_manual, C["green"]).pack(
+            side="left", padx=(12, 8), pady=5
+        )
         tk.Label(bar, text="Press F1 at any time to open the manual", bg="#1e1b4b",
                  fg="#a5b4fc", font=("Segoe UI", 9)).pack(side="left")
         root.bind("<F1>", lambda e: self.show_manual())
@@ -1154,7 +1155,7 @@ class App:
         self.logbox = scrolledtext.ScrolledText(
             body, state="disabled", height=8, wrap="word", relief="flat",
             bg=C["log_bg"], fg=C["log_fg"], insertbackground=C["log_fg"],
-            font=("Consolas", 9), padx=8, pady=6)
+            font=("Consolas", 11), padx=8, pady=6)
         self.logbox.pack(fill="both", expand=True)
         self.logbox.tag_configure("head", foreground="#67e8f9", font=("Consolas", 9, "bold"))
         self.logbox.tag_configure("ok", foreground="#4ade80")
