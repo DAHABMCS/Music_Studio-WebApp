@@ -1,0 +1,15 @@
+
+2 copies, 33,904,710 bytes each (hash 6c089ca4596d...)
+  C:\Users\dahab\AppData\Local\MusicStudio\outputs\admin\You_Mean_Everything_to_Me\Transcription\2026-11-07_08-40-56\00_INPUT.wav
+  C:\Users\dahab\AppData\Local\MusicStudio\outputs\admin\You_Mean_Everything_to_Me\Transcription\2026-11-09_06-06-05\00_INPUT.wav
+
+2 copies, 16,265,272 bytes each (hash fd812ba11f06...)
+  C:\Users\dahab\AppData\Local\MusicStudio\outputs\admin\mp4\Transcription\2026-11-03_07-12-35\00_INPUT.wav
+  C:\Users\dahab\AppData\Local\MusicStudio\outputs\admin\خارج_نص_الأدوار\Transcription\2026-11-03_09-41-32\00_INPUT.wav
+
+2 copies, 15,876,308 bytes each (hash c97a890ae65f...)
+  C:\Users\dahab\AppData\Local\MusicStudio\outputs\admin\celione_dion_Enhanced_5_Star\Transcription\2026-11-05_20-28-03\00_INPUT.wav
+  C:\Users\dahab\AppData\Local\MusicStudio\outputs\admin\celione_dion_Enhanced_5_Star\Transcription\2026-11-06_22-35-08\00_INPUT.wav
+
+Duplicate groups: 3
+Space wasted by extra copies: 63.0 MB

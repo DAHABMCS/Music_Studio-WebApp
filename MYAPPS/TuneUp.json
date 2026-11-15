@@ -1,0 +1,13 @@
+{
+    "script_path": "C:/Users/dahab/Music_Studio-webapp/MYAPPS/TuneUp.py",
+    "name": "TuneUp",
+    "onefile": true,
+    "console": false,
+    "icon": "D:/favicon93KS02NC.ico",
+    "hidden_imports": [],
+    "datas": [],
+    "exclude_modules": [],
+    "upx": false,
+    "clean": true,
+    "debug": false
+}

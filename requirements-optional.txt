@@ -1,0 +1,5 @@
+# Installed one by one at first run. A failure here is only a warning (the app still works,
+# that single feature is just unavailable).
+madmom                     # "madmom" / "hybrid" chord methods (often fails to build on new setups)
+accelerate                 # faster MusicGen / transformers model loading
+basic-pitch

@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+{% block title %}Admin — Music Studio{% endblock %}
+{% block content %}
+
+<style>
+  .admin-wrap {
+    max-width: 800px;
+    margin: 40px auto;
+    padding: 24px;
+    background: #161b22;
+    border-radius: 14px;
+    color: #e6edf3;
+  }
+  .admin-wrap h1 { margin: 0 0 20px; font-size: 22px; }
+  .admin-table { width: 100%; border-collapse: collapse; margin-bottom: 24px; }
+  .admin-table th, .admin-table td {
+    text-align: left; padding: 10px 12px; border-bottom: 1px solid #30363d;
+  }
+  .admin-table th { background: #21262d; font-size: 13px; }
+  .admin-form { display: flex; gap: 8px; flex-wrap: wrap; }
+  .admin-form input, .admin-form select {
+    padding: 8px 10px; border-radius: 6px; border: 1px solid #30363d;
+    background: #0d1117; color: #e6edf3; font-size: 14px;
+  }
+  .admin-form button {
+    padding: 8px 16px; border-radius: 6px; border: none;
+    background: #238636; color: #fff; font-weight: 600; cursor: pointer;
+  }
+  .admin-msg { margin: 12px 0; padding: 8px 12px; border-radius: 6px;
+               background: #21262d; font-size: 13px; }
+  .del-btn { background: #da3633 !important; padding: 4px 10px !important; font-size: 12px; }
+</style>
+
+<div class="admin-wrap">
+  <h1>User Management</h1>
+  <div id="msg" class="admin-msg" style="display:none;"></div>
+
+  <table class="admin-table" id="userTable">
+    <thead>
+      <tr><th>Username</th><th>Role</th><th></th></tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <h3 style="margin-top: 24px;">Add User</h3>
+  <form class="admin-form" id="addForm">
+    <input name="username" placeholder="username" required>
+    <input name="password" type="password" placeholder="password" required>
+    <select name="role">
+      <option value="user">user</option>
+      <option value="admin">admin</option>
+    </select>
+    <button type="submit">Add</button>
+  </form>
+</div>
+
+<script>
+async function loadUsers() {
+  const r = await fetch('/admin/api/users');
+  const d = await r.json();
+  const tbody = document.querySelector('#userTable tbody');
+  tbody.innerHTML = '';
+  d.users.forEach(u => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${u.username}</td>
+      <td>${u.role}</td>
+      <td><button class="del-btn" data-user="${u.username}">Delete</button></td>
+    `;
+    tbody.appendChild(tr);
+  });
+  tbody.querySelectorAll('.del-btn').forEach(btn => {
+    btn.onclick = async () => {
+      if (!confirm('Delete ' + btn.dataset.user + '?')) return;
+      const r = await fetch('/admin/api/users/' + encodeURIComponent(btn.dataset.user), { method: 'DELETE' });
+      const d = await r.json();
+      showMsg(d.ok ? 'Deleted.' : (d.error || 'Failed.'));
+      loadUsers();
+    };
+  });
+}
+
+function showMsg(text) {
+  const m = document.getElementById('msg');
+  m.textContent = text;
+  m.style.display = 'block';
+  setTimeout(() => m.style.display = 'none', 3000);
+}
+
+document.getElementById('addForm').onsubmit = async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const body = Object.fromEntries(fd);
+  const r = await fetch('/admin/api/users', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  });
+  const d = await r.json();
+  showMsg(d.ok ? 'User added.' : (d.error || 'Failed.'));
+  if (d.ok) { e.target.reset(); loadUsers(); }
+};
+
+loadUsers();
+</script>
+
+{% endblock %}

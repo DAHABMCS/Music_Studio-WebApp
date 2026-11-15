@@ -1,0 +1,66 @@
+# Virtual environments
+buildenv/
+.buildenv/
+.venv/
+.venv/
+venv/
+env/
+.venv-old/
+.buildenv/
+buildenv/
+.buildenv/
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Large media
+*.mp4
+*.wav
+*.mp3
+*.flac
+*.afpk
+
+# Outputs
+outputs/
+installer_output/
+build/
+dist/
+
+# Prerequisites / binaries
+prereqs/
+extras/
+*.exe
+*.dll
+
+# IDE
+.idea/
+.vscode/
+PyCharm_2026.2.23/
+
+# Logs
+*.log
+
+# Runtime state
+runtime/
+jobs/
+jobs.json
+
+# User data
+uploads/
+users.json.bak*
+
+# Backups
+*.bak
+*.bak*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Third-party drop-ins
+ACE-Step/
+ACE-Step-1.5/users.json.key
+users.json
+
+start_claude.bat

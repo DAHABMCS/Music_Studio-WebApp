@@ -1,0 +1,7446 @@
+#!/usr/bin/env python3
+"""
+Studio Audio Editor - multi-track audio editor with Auto 5_Star Enhance, Media Check and Recent Files.
+
+Install once:      pip install numpy scipy soundfile sounddevice
+Run:               python strudi_audio_editor.py [song.wav ...]
+"""
+import os
+import queue
+import re
+import sys
+import threading
+import base64
+import struct
+import zlib
+import json
+import math
+import shutil
+import tempfile
+import subprocess
+from fractions import Fraction
+
+# ======================= splash screen =======================
+# Shown immediately (before numpy / scipy load) and closed when the main window is ready.
+# Set STUDIO_NO_SPLASH=1 to disable it.
+class _Splash:
+    BASE_W, BASE_H = 760, 420
+    MIN_SECONDS = 1.6
+
+    def __init__(self):
+        import time as _time
+        import tkinter as _tk
+        self._time, self._tk = _time, _tk
+        self.t0 = _time.time()
+        self.root = None
+        try:
+            try:
+                import ctypes
+                ctypes.windll.shcore.SetProcessDpiAwareness(1)      # crisp on high-DPI screens
+            except Exception:
+                pass
+            r = _tk.Tk()
+            _tk._default_root = None          # the editor window must become the default root
+            r.withdraw()
+            k = max(1.0, r.winfo_fpixels("1i") / 96.0)
+            self.k = k
+            w, h = int(self.BASE_W * k), int(self.BASE_H * k)
+            r.overrideredirect(True)
+            r.attributes("-topmost", True)
+            x, y = (r.winfo_screenwidth() - w) // 2, (r.winfo_screenheight() - h) // 2 - int(30 * k)
+            r.geometry(f"{w}x{h}+{x}+{y}")
+            c = _tk.Canvas(r, width=w, height=h, highlightthickness=0, bd=0, bg="#0b0e14")
+            c.pack()
+            self.c, self.w, self.h, self.root = c, w, h, r
+            self._paint()
+            r.deiconify()
+            r.update()
+        except Exception:
+            self.root = None
+
+    def _hex(self, a, b, t):
+        pa = [int(a[i:i + 2], 16) for i in (1, 3, 5)]
+        pb = [int(b[i:i + 2], 16) for i in (1, 3, 5)]
+        return "#%02x%02x%02x" % tuple(int(pa[i] + (pb[i] - pa[i]) * t) for i in range(3))
+
+    def _paint(self):
+        c, k, w, h = self.c, self.k, self.w, self.h
+        for yy in range(0, h, 2):                                   # background gradient
+            col = self._hex("#161d2b", "#090c12", yy / h)
+            c.create_rectangle(0, yy, w, yy + 2, fill=col, outline=col)
+        c.create_rectangle(1, 1, w - 2, h - 2, outline="#2e394f", width=2)
+        tile = int(150 * k)                                          # logo tile with waveform bars
+        tx, ty = int(56 * k), int(80 * k)
+        rad = int(30 * k)
+        for i in range(tile):                                        # rounded gradient tile
+            col = self._hex("#34d9c4", "#0a6a60", i / tile)
+            d = min(i, tile - 1 - i)
+            inset = 0 if d >= rad else int(rad - (rad * rad - (rad - d) ** 2) ** 0.5)
+            c.create_line(tx + inset, ty + i, tx + tile - inset, ty + i, fill=col)
+        heights = (.22, .46, .72, .40, .60, .30, .16)
+        gap, x = tile * .115, tx + tile / 2 - 3 * tile * .115
+        for hh in heights:
+            c.create_line(x, ty + tile / 2 - tile * hh / 2, x, ty + tile / 2 + tile * hh / 2,
+                          fill="#ffffff", width=max(3, int(tile * .075)), capstyle="round")
+            x += gap
+        px = tx + tile + int(36 * k)
+        f = "Segoe UI"
+        c.create_text(px, ty + int(36 * k), text="Studio Audio Editor", anchor="w", fill="#ffffff",
+                      font=(f, -int(44 * k), "bold"))
+        c.create_text(px, ty + int(86 * k), text="Create  \u00b7  Edit  \u00b7  Enhance  \u00b7  Enjoy", anchor="w",
+                      fill="#7d8aa8", font=(f, -int(21 * k)))
+        c.create_text(px, ty + int(124 * k), text="Record  \u00b7  Repair  \u00b7  Master", anchor="w",
+                      fill="#2dd4bf", font=(f, -int(17 * k)))
+        bx1, bx2, by = int(56 * k), w - int(56 * k), h - int(92 * k)
+        c.create_rectangle(bx1, by, bx2, by + int(8 * k), fill="#1d2433", outline="")
+        self.bar = c.create_rectangle(bx1, by, bx1, by + int(8 * k), fill="#2dd4bf", outline="")
+        self.bx = (bx1, bx2)
+        self.msg = c.create_text(bx1, by + int(30 * k), text="Starting...", anchor="w", fill="#9fb0cf",
+                                 font=(f, -int(17 * k)))
+        c.create_text(bx2, by + int(30 * k), text="ABOUL DAHAB", anchor="e", fill="#56627e",
+                      font=(f, -int(15 * k), "bold"))
+
+    def step(self, text, frac):
+        if self.root is None:
+            return
+        try:
+            self.c.itemconfigure(self.msg, text=text)
+            x1, x2 = self.bx
+            self.c.coords(self.bar, x1, self.c.coords(self.bar)[1], x1 + (x2 - x1) * max(0.0, min(1.0, frac)),
+                          self.c.coords(self.bar)[3])
+            self.root.update()
+        except Exception:
+            self.root = None
+
+    def close(self):
+        if self.root is None:
+            return
+        try:
+            self.step("Ready", 1.0)
+            while self._time.time() - self.t0 < self.MIN_SECONDS:       # never just flash by
+                self.root.update()
+                self._time.sleep(0.02)
+            self.root.destroy()
+        except Exception:
+            pass
+        self.root = None
+
+
+_SPLASH = None if os.environ.get("STUDIO_NO_SPLASH") else _Splash()
+try:                                    # PyInstaller boot splash (if the exe was built with one)
+    import pyi_splash
+    pyi_splash.close()
+except Exception:
+    pass
+
+
+def _splash(text, frac):
+    if _SPLASH is not None:
+        _SPLASH.step(text, frac)
+
+
+def _splash_close():
+    if _SPLASH is not None:
+        _SPLASH.close()
+
+
+_splash("Loading audio engine...", 0.10)
+import numpy as np
+_splash("Loading signal processing...", 0.30)
+from scipy import signal
+_splash("Loading file formats...", 0.45)
+import soundfile as sf
+import tkinter as tk
+import tkinter.font as tkfont
+from tkinter import ttk, filedialog, messagebox, simpledialog
+_splash("Detecting audio devices...", 0.55)
+
+try:
+    import sounddevice as sd
+except Exception:
+    sd = None
+_splash("Preparing the editor...", 0.62)
+
+DEFAULT_RATE = 44100
+MAX_UNDO = 30
+
+PAL = dict(
+    toolbar="#141821", bottom="#141821", status="#10141b", sep="#2a3243", grip="#3a455c",
+    pill="#1d2330", pill_edge="#2e394f",
+    btn="#262e41", btn_hover="#313b54", btn_down="#171c28", btn_active="#134e4a", btn_off="#1a1f2c",
+    icon="#d9e2f3", icon_off="#586380",
+    ruler="#171c27", ruler_fg="#9fb0cf", ruler_tick="#56627e",
+    panel_sel="#1f2a3a", panel="#1a202c", scale="#141925", scale_sel="#18202e",
+    frame_sel="#2dd4bf", frame="#262e3f",
+    ctl="#232a3a", mute="#f59e0b", solo="#22c55e",
+    clip_hdr="#1c2433", clip_bg="#0d1118", clip_sel="#131b28",
+    wave="#2dd4bf", wave_sel="#99f6e4", wave_mute="#46506a",
+    empty="#0a0d13", empty_sel="#0f1520", desk="#0b0e14", black="#06080c",
+    time_bg="#090c11", cursor="#fbbf24", play="#22c55e", thumb="#2dd4bf",
+    check="#2dd4bf", meter_edge="#2a3243", digits="#2dd4bf",
+    navy="#14b8a6", navy_dark="#0f766e", ink="#e4ebf8",
+    label="#fb7185", label_bg="#3a1f27", marker="#fbbf24",
+    grid_bar="#5a6e9c", grid_bar_top="#c9d6f5", grid_beat="#2f3b5a", grid_sub="#1f283e")
+
+TRACK_ACCENTS = ("#2dd4bf", "#a78bfa", "#fbbf24", "#fb7185", "#60a5fa", "#34d399")
+
+U_SCALE = 1.0
+HEADER_W = HEAD_W = LANE_H = RULER_H = HDR_H = RIGHT_M = 0
+LINE = BAND = INSET = FR_L = FR_R = 0
+
+
+def editor_build_id():
+    """Short id of the code that is running. Frozen exe: read the stamp StudioEditor.spec wrote at build time.
+    Plain python: hash of this very file. Shown in the title bar so you can see which version you are using."""
+    try:
+        import hashlib
+        if getattr(sys, "frozen", False):
+            p = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(sys.executable)), "editor_build.txt")
+            with open(p, "r", encoding="utf-8") as f:
+                return f.readline().strip()[:8] or "unknown"
+        with open(os.path.abspath(__file__), "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:8]
+    except Exception:
+        return "unknown"
+
+
+def u(px):
+    return max(1, int(round(px * U_SCALE)))
+
+
+def fnt(px, bold=False):
+    n = max(9, int(round(px * U_SCALE)))
+    return ("Segoe UI", -n, "bold") if bold else ("Segoe UI", -n)
+
+
+def work_area(win):
+    """(left, top, right, bottom) of the usable desktop, i.e. without the Windows taskbar."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        r = wintypes.RECT()
+        if ctypes.windll.user32.SystemParametersInfoW(48, 0, ctypes.byref(r), 0):   # SPI_GETWORKAREA
+            return r.left, r.top, r.right, r.bottom
+    except Exception:
+        pass
+    return 0, 0, win.winfo_screenwidth(), win.winfo_screenheight()
+
+
+def place_window(win, w=None, h=None, parent=None):
+    """Open a dialog near the TOP of the usable desktop, centred sideways over `parent`.
+
+    The height is shrunk when needed so the whole window (title bar and bottom edge
+    included) stays above the taskbar instead of hanging off the bottom of the screen.
+    With no w/h given, the window keeps its natural size unless that is too tall."""
+    try:
+        win.update_idletasks()
+        l, t, r, b = work_area(win)
+        m = max(6, u(10))
+        deco = max(80, u(70))                       # title bar + window border
+        avail_w, avail_h = r - l - 2 * m, b - t - deco - 2 * m
+        keep_natural = w is None and h is None
+        rw, rh = (w or win.winfo_reqwidth()), (h or win.winfo_reqheight())
+        w, h = max(200, min(rw, avail_w)), max(150, min(rh, avail_h))
+        try:
+            mw, mh = win.wm_minsize()
+            win.minsize(min(int(mw), w), min(int(mh), h))
+        except Exception:
+            pass
+        if parent is not None and parent.winfo_width() > 100:
+            cx = parent.winfo_rootx() + parent.winfo_width() // 2
+        else:
+            cx = (l + r) // 2
+        x = max(l + m, min(cx - w // 2, r - w - m))
+        y = t + m + max(0, (avail_h - h) // 4)      # upper part of the screen
+        if keep_natural and rw <= avail_w and rh <= avail_h:
+            win.geometry(f"+{x}+{y}")
+        else:
+            win.geometry(f"{w}x{h}+{x}+{y}")
+    except Exception:
+        pass
+
+
+def init_metrics(screen_w):
+    global U_SCALE, HEADER_W, HEAD_W, LANE_H, RULER_H, HDR_H, RIGHT_M, LINE, BAND, INSET, FR_L, FR_R
+    U_SCALE = max(0.5, screen_w / 2880.0)
+    HEADER_W, HEAD_W = u(312), u(376)
+    LANE_H, RULER_H, HDR_H = u(606), u(56), u(32)
+    LINE, BAND = max(2, u(2)), u(6)
+    INSET = 2 * LINE + BAND
+    FR_L, FR_R = u(8), u(6)
+    RIGHT_M = FR_R + INSET
+
+
+init_metrics(2880)
+
+
+# =====================================================================
+#  RECENT FILES
+# =====================================================================
+RECENT_DIR = os.path.join(os.path.expanduser("~"), ".strudi_audio_editor")
+_OLD_RECENT_DIR = os.path.join(os.path.expanduser("~"), ".studio" + "_audio_editor")   # name used before the rename
+if os.path.isdir(_OLD_RECENT_DIR) and not os.path.exists(RECENT_DIR):
+    try:
+        shutil.copytree(_OLD_RECENT_DIR, RECENT_DIR)
+    except Exception:
+        pass
+
+RECENT_PATH = os.path.join(RECENT_DIR, "recent.json")
+MAX_RECENT = 15
+
+
+def _load_recent():
+    try:
+        with open(RECENT_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                return [p for p in data if isinstance(p, str)]
+    except Exception:
+        pass
+    return []
+
+
+def _save_recent(items):
+    try:
+        os.makedirs(RECENT_DIR, exist_ok=True)
+        with open(RECENT_PATH, "w", encoding="utf-8") as f:
+            json.dump(items, f, indent=2)
+    except Exception:
+        pass
+
+
+def push_recent(path):
+    if not path:
+        return
+    try:
+        path = os.path.abspath(path)
+    except Exception:
+        return
+    items = [p for p in _load_recent() if os.path.abspath(p) != path]
+    items.insert(0, path)
+    _save_recent(items[:MAX_RECENT])
+
+
+# =====================================================================
+#  AUDIO HELPERS
+# =====================================================================
+def to_stereo(a):
+    a = np.asarray(a, dtype=np.float32)
+    if a.ndim == 1:
+        a = a[:, None]
+    if a.shape[1] == 1:
+        a = np.repeat(a, 2, axis=1)
+    elif a.shape[1] > 2:
+        a = a[:, :2]
+    return np.ascontiguousarray(a)
+
+
+def resample(a, src, dst):
+    if int(src) == int(dst) or len(a) == 0:
+        return a
+    g = math.gcd(int(src), int(dst))
+    return signal.resample_poly(a, int(dst) // g, int(src) // g, axis=0).astype(np.float32)
+
+
+def fmt_time(sec):
+    sec = max(0.0, float(sec))
+    return f"{int(sec // 3600):02d}:{int(sec % 3600 // 60):02d}:{sec % 60:06.3f}"
+
+
+def fmt_hms(sec):
+    sec = max(0.0, float(sec))
+    return f"{int(sec // 3600):02d} h {int(sec % 3600 // 60):02d} m {int(sec % 60):02d} s"
+
+
+def fmt_hmsms(sec):
+    sec = max(0.0, float(sec))
+    return f"{int(sec // 3600):02d} h {int(sec % 3600 // 60):02d} m {sec % 60:06.3f} s"
+
+
+def _ffmpeg():
+    return shutil.which("ffmpeg")
+
+
+def load_audio(path):
+    try:
+        data, sr = sf.read(path, dtype="float32", always_2d=True)
+    except Exception:
+        ff = _ffmpeg()
+        if not ff:
+            raise RuntimeError("This format needs ffmpeg installed (or use wav/flac/ogg/mp3).")
+        fd, tmp = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        try:
+            subprocess.run([ff, "-y", "-i", path, "-vn", "-acodec", "pcm_f32le", tmp],
+                           check=True, capture_output=True)
+            data, sr = sf.read(tmp, dtype="float32", always_2d=True)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+    return to_stereo(data), int(sr)
+
+
+def _save_dolby_format(path, data, rate, ext, bitrate, surround51):
+    """AC-3 / E-AC-3 (Dolby Digital format) through ffmpeg's own encoders."""
+    ff = _ffmpeg()
+    if not ff:
+        raise RuntimeError("AC-3 / E-AC-3 export needs ffmpeg installed and on your PATH.")
+    if surround51:
+        data = upmix_51(data, rate)
+    fd, tmp = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    try:
+        sf.write(tmp, data, rate, format="WAV", subtype="PCM_16")
+        cmd = [ff, "-y", "-i", tmp, "-c:a", "ac3" if ext == ".ac3" else "eac3", "-b:a", bitrate]
+        if surround51:
+            cmd += ["-ac", "6"]
+        if rate not in (32000, 44100, 48000):
+            cmd += ["-ar", "48000"]
+        r = subprocess.run(cmd + [path], capture_output=True)
+        if r.returncode != 0:
+            tail = r.stderr.decode("utf-8", "replace").strip().splitlines()[-3:]
+            raise RuntimeError("ffmpeg could not write the file:\n" + "\n".join(tail))
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def save_audio(path, data, rate, bitrate=None, surround51=False):
+    ext = os.path.splitext(path)[1].lower()
+    data = np.clip(data, -1.0, 1.0)
+    if ext in (".ac3", ".eac3"):
+        return _save_dolby_format(path, data, rate, ext, bitrate or "448k", surround51)
+    fmts = {".wav": ("WAV", "PCM_16"), ".flac": ("FLAC", "PCM_16"),
+            ".ogg": ("OGG", "VORBIS"), ".mp3": ("MP3", None)}
+    if ext in fmts:
+        fmt, sub = fmts[ext]
+        try:
+            sf.write(path, data, rate, format=fmt, **({"subtype": sub} if sub else {}))
+            return
+        except Exception:
+            pass
+    ff = _ffmpeg()
+    if not ff:
+        raise RuntimeError(f"Cannot write {ext or 'this format'} without ffmpeg installed.")
+    fd, tmp = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    try:
+        sf.write(tmp, data, rate, format="WAV", subtype="PCM_16")
+        subprocess.run([ff, "-y", "-i", tmp, path], check=True, capture_output=True)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+# =====================================================================
+#  EFFECTS
+# =====================================================================
+def fx_amplify(x, db):
+    return (x * (10 ** (db / 20))).astype(np.float32)
+
+
+def fx_normalize(x, peak_db=-1.0):
+    pk = float(np.max(np.abs(x))) if len(x) else 0.0
+    return x if pk < 1e-9 else (x * (10 ** (peak_db / 20) / pk)).astype(np.float32)
+
+
+def fx_fade(x, fade_in=True):
+    if len(x) == 0:
+        return x
+    ramp = np.linspace(0, 1, len(x), dtype=np.float32)
+    return x * (ramp if fade_in else ramp[::-1])[:, None]
+
+
+def fx_reverse(x):
+    return x[::-1].copy()
+
+
+def fx_invert(x):
+    return -x
+
+
+def fx_dc(x):
+    return (x - x.mean(axis=0, keepdims=True)).astype(np.float32)
+
+
+def fx_speed(x, factor):
+    fr = Fraction(float(factor)).limit_denominator(1000)
+    return signal.resample_poly(x, fr.denominator, fr.numerator, axis=0).astype(np.float32)
+
+
+def fx_filter(x, rate, kind, freq, order=4):
+    if len(x) < 200:
+        return x
+    nyq = rate / 2.0
+    freq = min(max(float(freq), 10.0), nyq * 0.99)
+    sos = signal.butter(order, freq / nyq, btype=kind, output="sos")
+    return signal.sosfiltfilt(sos, x, axis=0).astype(np.float32)
+
+
+def fx_echo(x, rate, delay=0.3, decay=0.5, repeats=5):
+    d = max(1, int(delay * rate))
+    out = np.zeros((len(x) + d * repeats, 2), np.float32)
+    out[:len(x)] += x
+    for k in range(1, repeats + 1):
+        out[k * d:k * d + len(x)] += x * (decay ** k)
+    return out
+
+
+def fx_reverb(x, rate, room=0.5, wet=0.3):
+    tail = int(rate * (0.5 + 2 * room))
+    xp = np.concatenate([x, np.zeros((tail, 2), np.float32)]).astype(np.float64)
+    fb = 0.6 + 0.35 * room
+    acc = np.zeros_like(xp)
+    for dl in (0.0297, 0.0371, 0.0411, 0.0437):
+        d = int(dl * rate)
+        b = np.zeros(d + 1); b[d] = 1.0
+        a = np.zeros(d + 1); a[0] = 1.0; a[d] = -fb
+        acc += signal.lfilter(b, a, xp, axis=0)
+    acc /= 4.0
+    for dl, g in ((0.005, 0.7), (0.0017, 0.7)):
+        d = max(1, int(dl * rate))
+        b = np.zeros(d + 1); b[0] = -g; b[d] = 1.0
+        a = np.zeros(d + 1); a[0] = 1.0; a[d] = -g
+        acc = signal.lfilter(b, a, acc, axis=0)
+    return (xp * (1 - wet) + acc * wet).astype(np.float32)
+
+
+def fx_compress(x, rate, thresh_db=-18.0, ratio=3.0, makeup_db=0.0):
+    if len(x) == 0:
+        return x
+    env = np.max(np.abs(x), axis=1)
+    a = math.exp(-1.0 / (0.01 * rate))
+    env = signal.lfilter([1 - a], [1, -a], env)
+    lvl = 20 * np.log10(np.maximum(env, 1e-6))
+    over = np.maximum(lvl - thresh_db, 0)
+    gain_db = -over * (1 - 1 / max(ratio, 1.0)) + makeup_db
+    return (x * (10 ** (gain_db / 20))[:, None]).astype(np.float32)
+
+
+def fx_limiter(x, rate, ceiling_db=-1.0, lookahead_ms=5.0):
+    if len(x) == 0:
+        return x
+    ceil = 10 ** (ceiling_db / 20.0)
+    a = max(1, int(lookahead_ms / 1000.0 * rate))
+    pk = np.max(np.abs(x), axis=1)
+    smooth = np.convolve(pk, np.ones(a, dtype=np.float32) / a, mode="same")
+    peak_env = np.maximum(pk, smooth)
+    gain = np.ones_like(peak_env)
+    mask = peak_env > ceil
+    gain[mask] = ceil / peak_env[mask]
+    return (x * gain[:, None]).astype(np.float32)
+
+
+def fx_bass_treble(x, rate, bass_db=0.0, treble_db=0.0):
+    if len(x) < 512:
+        return x
+    nyq = rate / 2.0
+    out = x.astype(np.float64)
+    if abs(bass_db) > 0.01:
+        sos = signal.butter(2, min(200.0, nyq * 0.6) / nyq, btype="low", output="sos")
+        low = signal.sosfiltfilt(sos, out, axis=0)
+        out = out + low * (10 ** (bass_db / 20.0) - 1)
+    if abs(treble_db) > 0.01:
+        sos = signal.butter(2, min(4000.0, nyq * 0.6) / nyq, btype="high", output="sos")
+        hi = signal.sosfiltfilt(sos, out, axis=0)
+        out = out + hi * (10 ** (treble_db / 20.0) - 1)
+    return np.clip(out, -1.0, 1.0).astype(np.float32)
+
+
+def fx_distortion(x, rate, drive_db=10.0, tone_hz=3000.0):
+    if len(x) == 0:
+        return x
+    drive = 10 ** (drive_db / 20.0)
+    sat = np.tanh(x * drive) / np.tanh(drive)
+    if len(sat) >= 64:
+        nyq = rate / 2.0
+        fc = min(max(tone_hz, 20.0), nyq * 0.9) / nyq
+        sos = signal.butter(2, fc, btype="low", output="sos")
+        sat = signal.sosfiltfilt(sos, sat, axis=0)
+    return sat.astype(np.float32)
+
+
+def fx_phaser(x, rate, rate_hz=0.5, depth=0.5, feedback=0.3):
+    if len(x) < 64:
+        return x
+    t = np.arange(len(x)) / rate
+    lfo = 0.5 * (1 + np.sin(2 * np.pi * rate_hz * t))
+    fc = 200 + 2000 * lfo * depth
+    out = np.empty_like(x)
+    for ch in range(2):
+        for n in range(len(x)):
+            w = 2 * np.pi * fc[n] / rate
+            c = (1 - math.tan(w / 2)) / (1 + math.tan(w / 2))
+            y = c * x[n, ch]
+            if n:
+                y += c * out[n - 1, ch] - feedback * x[n - 1, ch]
+            out[n, ch] = y
+    return (0.5 * x + 0.5 * out).astype(np.float32)
+
+
+def fx_wahwah(x, rate, rate_hz=1.5, depth=0.7, resonance=2.0):
+    if len(x) < 256:
+        return x
+    out = np.zeros_like(x)
+    t = np.arange(len(x)) / rate
+    lfo = 0.5 * (1 + np.sin(2 * np.pi * rate_hz * t))
+    center = 500 + 1500 * lfo * depth
+    nyq = rate / 2.0
+    for n in range(0, len(x), 512):
+        end = min(len(x), n + 512)
+        f = center[n:end].mean()
+        lo = max(20.0, f / resonance) / nyq
+        hi = min(nyq * 0.99, f * resonance) / nyq
+        if lo < hi:
+            sos = signal.butter(2, [lo, hi], btype="band", output="sos")
+            for ch in range(2):
+                out[n:end, ch] = signal.sosfilt(sos, x[n:end, ch])
+    return np.clip(out, -1, 1).astype(np.float32)
+
+
+def fx_notch(x, rate, freq=60.0, q=30.0):
+    if len(x) < 128:
+        return x
+    nyq = rate / 2.0
+    b, a = signal.iirnotch(min(max(freq, 10.0), nyq * 0.99) / nyq, q)
+    return signal.filtfilt(b, a, x, axis=0).astype(np.float32)
+
+
+def fx_click_removal(x, rate, threshold=0.5, window_ms=3.0):
+    if len(x) == 0:
+        return x
+    d = np.abs(np.diff(x, axis=0))
+    mask = np.max(d, axis=1) > threshold
+    if not np.any(mask):
+        return x
+    w = max(1, int(window_ms / 1000 * rate))
+    out = x.copy()
+    for i in np.where(mask)[0]:
+        a, b = max(0, i - w), min(len(x), i + w + 1)
+        out[a:b] = np.median(x[a:b], axis=0)
+    return out
+
+
+def fx_noise_reduce(x, rate, threshold_db=-40.0, smooth=0.3):
+    """Soft spectral gate. threshold_db is relative to the 90th-percentile STFT magnitude.
+    Each channel is gated on its own, so a stereo file stays stereo."""
+    if len(x) < 2048:
+        return x
+    nper, nover = 1024, 768
+    mono = x.mean(axis=1) if x.ndim == 2 else x
+    _, _, Zm = signal.stft(mono, rate, nperseg=nper, noverlap=nover)
+    ref = np.percentile(np.abs(Zm), 90)
+    if ref < 1e-9:
+        return x
+    thresh = 10 ** (threshold_db / 20.0) * ref
+    chans = [x[:, c] for c in range(x.shape[1])] if x.ndim == 2 else [x]
+    out = []
+    for ch in chans:
+        _, _, Z = signal.stft(ch, rate, nperseg=nper, noverlap=nover)
+        mask = np.clip((np.abs(Z) - thresh * smooth) / (thresh * (1 - smooth) + 1e-9), 0, 1)
+        _, y = signal.istft(Z * mask, rate, nperseg=nper, noverlap=nover)
+        y = y[:len(x)]
+        if len(y) < len(x):
+            y = np.pad(y, (0, len(x) - len(y)))
+        out.append(y)
+    res = np.column_stack(out) if x.ndim == 2 else out[0]
+    return res.astype(np.float32)
+
+
+# ===== Key Changer DSP (numpy/scipy only) =====================================
+PV_PROGRESS = None          # optional callback(fraction 0..1) used by the Key Changer panel
+
+KEY_NAMES_MAJOR = ["C", "Db", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
+KEY_NAMES_MINOR = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "G#", "A", "Bb", "B"]
+_KS_MAJOR = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
+_KS_MINOR = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+_PC_LOOKUP = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
+
+
+def key_label(tonic, mode):
+    names = KEY_NAMES_MAJOR if mode == "major" else KEY_NAMES_MINOR
+    return f"{names[tonic % 12]} {mode}"
+
+
+def parse_key(text):
+    """'F#m', 'Bb major', 'a min', 'D' -> (tonic 0-11, mode or None).  None if not understood."""
+    s = (text or "").strip().replace("\u266f", "#").replace("\u266d", "b")
+    m = re.fullmatch(r"([A-Ga-g])\s*([#b]?)\s*(.*)", s)
+    if not m:
+        return None
+    pc = _PC_LOOKUP[m.group(1).upper()] + {"#": 1, "b": -1, "": 0}[m.group(2)]
+    rest = m.group(3).strip()
+    if rest == "":
+        mode = None
+    elif rest == "m" or rest.lower() in ("min", "minor"):
+        mode = "minor"
+    elif rest == "M" or rest.lower() in ("maj", "major"):
+        mode = "major"
+    else:
+        return None
+    return pc % 12, mode
+
+
+def detect_song_key(x, rate, max_seconds=150):
+    """Krumhansl-Schmuckler key finder on a tuning-corrected chromagram.
+    x: (N,) or (N,2) float array.  Returns dict(tonic, mode, label, margin, cents, relative)."""
+    x = np.asarray(x, dtype=np.float32)
+    mono = x.mean(axis=1) if x.ndim == 2 else x
+    if len(mono) > max_seconds * rate:                       # analyse the middle of long songs
+        a = (len(mono) - int(max_seconds * rate)) // 2
+        mono = mono[a:a + int(max_seconds * rate)]
+    sr = 22050
+    if int(rate) != sr:
+        fr = Fraction(sr, int(rate)).limit_denominator(1000)
+        mono = signal.resample_poly(mono, fr.numerator, fr.denominator).astype(np.float32)
+    n_fft, hop = 8192, 4096
+    if len(mono) < n_fft * 2:
+        raise ValueError("Audio too short to detect a key.")
+    frames = np.lib.stride_tricks.sliding_window_view(mono, n_fft)[::hop]
+    win = np.hanning(n_fft).astype(np.float32)
+    mags = np.abs(np.fft.rfft(frames * win, axis=1)).astype(np.float32)
+    rms = np.sqrt(np.mean(frames ** 2, axis=1))
+    keep = rms > 0.15 * np.median(rms[rms > 0]) if np.any(rms > 0) else np.ones(len(rms), bool)
+    mags = mags[keep]
+    f = np.fft.rfftfreq(n_fft, 1.0 / sr)
+    band = (f >= 65) & (f <= 2100)
+    fb = f[band]
+    m = 69 + 12 * np.log2(fb / 440.0)                         # fractional MIDI note
+    # tuning offset from the sustained peaks of the long-term spectrum
+    lt = mags.mean(axis=0)[band]
+    pk, _ = signal.find_peaks(lt, prominence=0.2 * lt.max() if lt.max() > 0 else 0)
+    if len(pk) >= 4:
+        dev = m[pk] - np.round(m[pk])
+        w = lt[pk]
+        ang = np.arctan2(np.sum(w * np.sin(2 * np.pi * dev)), np.sum(w * np.cos(2 * np.pi * dev)))
+        tuning = ang / (2 * np.pi)
+    else:
+        tuning = 0.0
+    madj = m - tuning
+    near = np.round(madj)
+    closeness = np.cos(np.pi * (madj - near)) ** 2            # weight bins that sit on a pitch centre
+    fold = np.zeros((len(fb), 12), np.float32)
+    fold[np.arange(len(fb)), (near.astype(int) % 12)] = closeness
+    comp = np.log1p(30.0 * mags[:, band] / (mags[:, band].max() + 1e-9))
+    chroma = comp @ fold
+    chroma /= (chroma.max(axis=1, keepdims=True) + 1e-9)
+    prof = chroma.mean(axis=0)
+    scores = []
+    for t in range(12):
+        scores.append((np.corrcoef(prof, np.roll(_KS_MAJOR, t))[0, 1], t, "major"))
+        scores.append((np.corrcoef(prof, np.roll(_KS_MINOR, t))[0, 1], t, "minor"))
+    scores.sort(reverse=True)
+    best, second = scores[0], scores[1]
+    tonic, mode = best[1], best[2]
+    rel = ((tonic + 9) % 12, "minor") if mode == "major" else ((tonic + 3) % 12, "major")
+    margin = float(best[0] - second[0])
+    return dict(tonic=tonic, mode=mode, label=key_label(tonic, mode), margin=margin,
+                confidence=("None" if best[0] < 0.5 else "High" if margin > 0.08 else ("Medium" if margin > 0.03 else "Low")),
+                score=float(best[0]), cents=float(tuning * 100), relative=key_label(*rel),
+                alt=key_label(second[1], second[2]))
+
+
+def _mix_for_key(datas):
+    """datas = [(stereo array, offset)] -> one array to analyse (several tracks are summed)."""
+    if len(datas) == 1:
+        return datas[0][0]
+    a = min(o for _d, o in datas)
+    b = max(o + len(d) for d, o in datas)
+    out = np.zeros((b - a, 2), np.float32)
+    for d, o in datas:
+        out[o - a:o - a + len(d)] += d
+    return out
+
+
+def _time_stretch(x, rate, target_len):
+    """Phase-vocoder time stretch (pitch preserved) with identity phase locking.
+    Output has exactly `target_len` samples.  Works for mono or stereo."""
+    x = np.asarray(x, dtype=np.float32)
+    n = len(x)
+    if n == 0 or target_len <= 0:
+        return x
+    if n == target_len:
+        return x
+    mono_in = x.ndim == 1
+    if mono_in:
+        x = x[:, None]
+    C = x.shape[1]
+    n_fft, hop = 4096, 1024
+    nb = n_fft // 2 + 1
+    ratio = target_len / n
+    win = np.hanning(n_fft + 1)[:-1].astype(np.float32)
+    pad = n_fft
+    xp = np.pad(x.T, ((0, 0), (pad, pad + n_fft)))
+    n_frames = int(math.ceil((pad + target_len) / hop)) + 1
+    omega = (2 * np.pi * np.arange(nb) / n_fft).astype(np.float32)
+    idx = np.arange(nb)
+    out = np.zeros((C, (n_frames - 1) * hop + n_fft), np.float32)
+    prev_ph = prev_psi = None
+    prev_pos = 0
+    max_pos = xp.shape[1] - n_fft
+    for k in range(n_frames):
+        pos = int(round((k * hop + n_fft / 2 - pad) / ratio - n_fft / 2 + pad))
+        pos = min(max(pos, 0), max_pos)
+        X = np.fft.rfft(xp[:, pos:pos + n_fft] * win, axis=-1)
+        mag = np.abs(X)
+        ph = np.angle(X)
+        if prev_ph is None:
+            psi = ph
+        else:
+            d = max(1, pos - prev_pos)
+            dphi = ph - prev_ph - omega * d
+            dphi -= 2 * np.pi * np.round(dphi / (2 * np.pi))
+            psi_std = prev_psi + (omega * d + dphi) * (hop / d)
+            pk = np.zeros(mag.shape, bool)
+            c = mag[:, 2:-2]
+            pk[:, 2:-2] = (c > mag[:, 1:-3]) & (c > mag[:, 3:-1]) & (c >= mag[:, :-4]) & (c >= mag[:, 4:])
+            left = np.maximum.accumulate(np.where(pk, idx, -1), axis=1)
+            right = np.minimum.accumulate(np.where(pk, idx, 2 * nb)[:, ::-1], axis=1)[:, ::-1]
+            use_left = (left >= 0) & ((idx - left <= right - idx) | (right >= 2 * nb))
+            near = np.where(use_left, left, np.where(right < 2 * nb, right, idx))
+            psi = (np.take_along_axis(psi_std, near, axis=1) + ph - np.take_along_axis(ph, near, axis=1))
+        out[:, k * hop:k * hop + n_fft] += np.fft.irfft(mag * np.exp(1j * psi), n_fft, axis=-1) * win
+        prev_ph, prev_psi, prev_pos = ph, psi, pos
+        if PV_PROGRESS is not None and (k & 63) == 0:
+            PV_PROGRESS(k / n_frames)
+    res = (out[:, pad:pad + target_len] / 1.5).T
+    res = np.ascontiguousarray(res, dtype=np.float32)
+    if len(res) < target_len:
+        res = np.pad(res, ((0, target_len - len(res)), (0, 0)))
+    if mono_in:
+        return res[:, 0]
+    if res.shape[1] < 2:
+        res = np.repeat(res, 2, axis=1)
+    return np.ascontiguousarray(res[:, :2])
+
+
+def fx_pitch_shift(x, rate, semitones):
+    """Shift pitch by `semitones` (length unchanged): stretch by the pitch ratio, then resample back."""
+    if abs(semitones) < 0.01 or len(x) == 0:
+        return x
+    n = len(x)
+    factor = 2 ** (semitones / 12.0)
+    stretched = _time_stretch(x, rate, int(round(n * factor)))
+    fr = Fraction(factor).limit_denominator(256)
+    y = signal.resample_poly(stretched, fr.denominator, fr.numerator, axis=0).astype(np.float32)
+    if len(y) >= n:
+        y = y[:n]
+    else:
+        y = np.pad(y, ((0, n - len(y)),) + ((0, 0),) * (y.ndim - 1))
+    return np.clip(y, -1.0, 1.0)
+
+
+def fx_tempo(x, rate, factor):
+    if abs(factor - 1.0) < 1e-3 or len(x) == 0:
+        return x
+    return _time_stretch(x, rate, max(1, int(len(x) / factor)))
+
+
+def fx_crossfade_clips(x, rate, fade_seconds=0.1):
+    n = min(len(x), max(1, int(fade_seconds * rate)))
+    if n < 2:
+        return x
+    ramp = np.linspace(0, 1, n, dtype=np.float32)[:, None]
+    out = x.copy()
+    out[:n] *= ramp
+    out[-n:] *= ramp[::-1]
+    return out
+
+
+def fx_tremolo(x, rate, rate_hz=5.0, depth=0.5):
+    if len(x) == 0:
+        return x
+    t = np.arange(len(x)) / rate
+    mod = 1 - depth * 0.5 * (1 + np.sin(2 * np.pi * rate_hz * t))
+    return (x * mod[:, None]).astype(np.float32)
+
+
+def fx_clip_fix(x, rate, threshold=0.95):
+    if len(x) == 0:
+        return x
+    out = x.copy()
+    for ch in range(2):
+        sig = out[:, ch]
+        mask = np.abs(sig) >= threshold
+        if not np.any(mask):
+            continue
+        idx = np.where(mask)[0]
+        for run_start in np.split(idx, np.where(np.diff(idx) > 1)[0] + 1):
+            if len(run_start) < 2:
+                continue
+            a, b = run_start[0], run_start[-1]
+            if a > 0 and b < len(sig) - 1:
+                sig[a:b + 1] = np.linspace(sig[a - 1], sig[b + 1], b - a + 2)[1:-1]
+    return np.clip(out, -1.0, 1.0).astype(np.float32)
+
+
+def fx_noise_gate(x, rate, threshold_db=-40.0, attack_ms=10.0, release_ms=100.0):
+    if len(x) == 0:
+        return x
+    env = np.max(np.abs(x), axis=1)
+    a_att = math.exp(-1.0 / (attack_ms / 1000 * rate))
+    a_rel = math.exp(-1.0 / (release_ms / 1000 * rate))
+    env_s = np.empty_like(env)
+    prev = 0.0
+    for i, v in enumerate(env):
+        a = a_att if v > prev else a_rel
+        prev = a * prev + (1 - a) * v
+        env_s[i] = prev
+    lvl = 20 * np.log10(np.maximum(env_s, 1e-9))
+    gate = (lvl > threshold_db).astype(np.float32)
+    gate = signal.lfilter([0.01], [1, -0.99], gate)
+    return (x * gate[:, None]).astype(np.float32)
+
+
+def gen_tone(rate, secs, freq, shape="sine", amp=0.5):
+    t = np.arange(int(rate * secs)) / rate
+    if shape == "square":
+        y = np.sign(np.sin(2 * np.pi * freq * t))
+    elif shape == "saw":
+        y = 2 * ((freq * t) % 1) - 1
+    elif shape == "triangle":
+        y = 2 * np.abs(2 * ((freq * t) % 1) - 1) - 1
+    else:
+        y = np.sin(2 * np.pi * freq * t)
+    return to_stereo(y * amp)
+
+
+def gen_noise(rate, secs, amp=0.3):
+    return to_stereo(np.random.uniform(-1, 1, int(rate * secs)) * amp)
+
+
+def gen_click_track(rate, secs, tempo, beats_per_bar=4, amp=0.5):
+    out = np.zeros((int(rate * secs), 2), np.float32)
+    spb = 60.0 / max(1.0, tempo)
+    t = 0.0
+    beat = 0
+    while t < secs:
+        i = int(t * rate)
+        dur = int(min(0.05, spb * 0.3) * rate)
+        sig = np.sin(2 * np.pi * (1500 if beat % beats_per_bar == 0 else 1000) * np.arange(dur) / rate)
+        sig *= np.exp(-np.linspace(0, 6, dur))
+        n = min(dur, len(out) - i)
+        out[i:i + n] += (sig[:n] * amp)[:, None]
+        beat += 1
+        t += spb
+    return out
+
+
+def spectrogram_ppm(x, rate, W=900, H=320):
+    mono = x.mean(axis=1)
+    if len(mono) < 2048:
+        mono = np.pad(mono, (0, 2048 - len(mono)))
+    _, _, S = signal.spectrogram(mono, rate, nperseg=1024, noverlap=768, mode="magnitude")
+    db = 20 * np.log10(S + 1e-10)
+    v = np.clip((db - (db.max() - 90)) / 90, 0, 1)
+    cols = np.linspace(0, v.shape[1] - 1, W).astype(int)
+    rows = np.linspace(0, v.shape[0] - 1, H).astype(int)
+    img = (v[np.ix_(rows, cols)][::-1] * 255).astype(np.float32)
+    r = np.clip(img * 2, 0, 255)
+    g = np.clip((img - 100) * 2, 0, 255)
+    b = np.where(img < 128, img * 2, 255 - (img - 128) * 2)
+    rgb = np.stack([r, g, b], axis=-1).astype(np.uint8)
+    return b"P6 %d %d 255\n" % (W, H) + rgb.tobytes()
+
+
+# =====================================================================
+#  AUDIO HEALTH DSP  -  loudness (LUFS) / true peak, declipper, presence + exciter, mono compatibility
+#  (numpy / scipy only)
+# =====================================================================
+from scipy import ndimage
+
+LOUDNESS_TARGETS = (
+    ("Streaming - Spotify / YouTube / Tidal", -14.0, -1.0),
+    ("Apple Music / Podcasts", -16.0, -1.0),
+    ("Broadcast - EBU R128 (Europe)", -23.0, -1.0),
+    ("Broadcast - ATSC A/85 (USA)", -24.0, -2.0),
+    ("Loud master / Club", -9.0, -1.0),
+)
+
+
+def _k_sos(rate):
+    """ITU-R BS.1770 K-weighting (shelf + RLB high-pass) for any rate; exact at 48 kHz."""
+    f0, Q, G = 1681.974450955533, 0.7071752369554196, 3.999843853973347
+    K = math.tan(math.pi * f0 / rate)
+    Vh = 10 ** (G / 20.0)
+    Vb = Vh ** 0.4996667741545416
+    a0 = 1.0 + K / Q + K * K
+    s1 = [(Vh + Vb * K / Q + K * K) / a0, 2.0 * (K * K - Vh) / a0, (Vh - Vb * K / Q + K * K) / a0,
+          1.0, 2.0 * (K * K - 1.0) / a0, (1.0 - K / Q + K * K) / a0]
+    f0, Q = 38.13547087602444, 0.5003270373238773
+    K = math.tan(math.pi * f0 / rate)
+    a0 = 1.0 + K / Q + K * K
+    s2 = [1.0, -2.0, 1.0, 1.0, 2.0 * (K * K - 1.0) / a0, (1.0 - K / Q + K * K) / a0]
+    return np.array([s1, s2], dtype=np.float64)
+
+
+class Loudness:
+    def __init__(self):
+        self.lufs_i = -70.0        # integrated
+        self.lufs_s_max = -70.0    # max short-term (3 s)
+        self.lufs_m_max = -70.0    # max momentary (400 ms)
+        self.lra = 0.0
+        self.sample_peak_db = -120.0
+        self.true_peak_db = -120.0
+        self.measurable = False
+
+
+def _block_power(ms_cum, rate, win_s, hop_s):
+    w, h = int(round(win_s * rate)), int(round(hop_s * rate))
+    n = len(ms_cum) - 1
+    if n < w:
+        return np.zeros(0)
+    st = np.arange(0, n - w + 1, h)
+    return (ms_cum[st + w] - ms_cum[st]) / w
+
+
+def _lufs(power):
+    return -0.691 + 10 * np.log10(np.maximum(power, 1e-12))
+
+
+def _kweighted_power_cumsum(x, rate):
+    sos = _k_sos(rate)
+    n = len(x)
+    cum = np.zeros(n + 1, np.float64)
+    zi = [signal.sosfilt_zi(sos) * 0.0 for _ in range(x.shape[1])]
+    chunk = 1 << 20
+    acc = 0.0
+    for a in range(0, n, chunk):
+        seg = x[a:a + chunk].astype(np.float64)
+        ms = np.zeros(len(seg))
+        for ch in range(x.shape[1]):
+            y, zi[ch] = signal.sosfilt(sos, seg[:, ch], zi=zi[ch])
+            ms += y * y
+        cum[a + 1:a + 1 + len(seg)] = acc + np.cumsum(ms)
+        acc = cum[a + len(seg)]
+    return cum
+
+
+def integrated_lufs(x, rate):
+    """Fast path: gated integrated loudness only."""
+    if len(x) < int(0.4 * rate):
+        return -70.0
+    cum = _kweighted_power_cumsum(x, rate)
+    p = _block_power(cum, rate, 0.4, 0.1)
+    if not len(p):
+        return -70.0
+    l = _lufs(p)
+    m = l > -70.0
+    if not np.any(m):
+        return -70.0
+    rel = _lufs(np.mean(p[m])) - 10.0
+    m2 = l > max(rel, -70.0)
+    return float(_lufs(np.mean(p[m2]))) if np.any(m2) else -70.0
+
+
+def _true_peak_env(x, rate):
+    """Per-sample true-peak envelope (4x oversampled, linear)."""
+    over = 4 if rate < 96000 else (2 if rate < 192000 else 1)
+    n = len(x)
+    if over == 1 or n == 0:
+        return np.max(np.abs(x), axis=1) if n else np.zeros(0)
+    env = np.empty(n, np.float32)
+    chunk, pad = 1 << 19, 96
+    for a in range(0, n, chunk):
+        lo_i, hi_i = max(0, a - pad), min(n, a + chunk + pad)
+        y = signal.resample_poly(x[lo_i:hi_i].astype(np.float32), over, 1, axis=0)
+        s = (a - lo_i) * over
+        cnt = min(chunk, n - a)
+        blk = np.abs(y[s:s + cnt * over]).reshape(cnt, over, -1)
+        env[a:a + cnt] = blk.max(axis=(1, 2))
+    return env
+
+
+def true_peak_db(x, rate):
+    if len(x) == 0:
+        return -120.0
+    return 20 * math.log10(max(float(np.max(_true_peak_env(x, rate))), 1e-9))
+
+
+def measure_loudness(x, rate):
+    m = Loudness()
+    if len(x) == 0:
+        return m
+    m.sample_peak_db = 20 * math.log10(max(float(np.max(np.abs(x))), 1e-9))
+    m.true_peak_db = true_peak_db(x, rate)
+    if len(x) < int(0.4 * rate):
+        return m
+    cum = _kweighted_power_cumsum(x, rate)
+    pm = _block_power(cum, rate, 0.4, 0.1)
+    if not len(pm):
+        return m
+    lm = _lufs(pm)
+    m.lufs_m_max = float(lm.max())
+    g = lm > -70.0
+    if not np.any(g):
+        return m
+    m.measurable = True
+    rel = _lufs(np.mean(pm[g])) - 10.0
+    g2 = lm > max(rel, -70.0)
+    m.lufs_i = float(_lufs(np.mean(pm[g2]))) if np.any(g2) else float(lm.max())
+    ps = _block_power(cum, rate, 3.0, 0.1)
+    if len(ps):
+        ls = _lufs(ps)
+        m.lufs_s_max = float(ls.max())
+        a = ls > -70.0
+        if np.any(a):
+            relr = _lufs(np.mean(ps[a])) - 20.0
+            vals = ls[ls > max(relr, -70.0)]
+            if len(vals) > 3:
+                m.lra = float(np.percentile(vals, 95) - np.percentile(vals, 10))
+    else:
+        m.lufs_s_max = m.lufs_i
+    return m
+
+
+def _release_env(r, rel_ms, rate):
+    d = math.exp(-1.0 / max(1.0, rel_ms * 1e-3 * rate))
+    B = 8192
+    idx = np.arange(B)
+    pw, ipw = d ** idx, d ** (-idx.astype(np.float64))
+    out = np.empty_like(r)
+    carry = 0.0
+    for a in range(0, len(r), B):
+        blk = r[a:a + B]
+        n = len(blk)
+        cm = np.maximum.accumulate(blk * ipw[:n]) * pw[:n]
+        cm = np.maximum(cm, carry * d ** (idx[:n] + 1))
+        out[a:a + n] = cm
+        carry = cm[-1]
+    return out
+
+
+def fx_true_peak_limit(x, rate, ceiling_db=-1.0, lookahead_ms=3.0, release_ms=150.0):
+    """Look-ahead limiter driven by the 4x-oversampled (true) peak, with smooth release."""
+    if len(x) == 0:
+        return x
+    ceil = 10 ** (ceiling_db / 20.0)
+    tp = _true_peak_env(x, rate).astype(np.float64)
+    over = tp > ceil
+    if not np.any(over):
+        return x.astype(np.float32)
+    r = np.zeros(len(x))
+    r[over] = 20 * np.log10(tp[over] / ceil)
+    A = max(1, int(lookahead_ms * 1e-3 * rate))
+    ra = ndimage.maximum_filter1d(r, size=2 * A + 1)
+    ra = ndimage.uniform_filter1d(ra, size=A + 1)
+    ra = _release_env(ra, release_ms, rate)
+    y = (x * (10 ** (-ra / 20.0))[:, None]).astype(np.float32)
+    pk = float(np.max(_true_peak_env(y, rate)))
+    if pk > ceil * 1.001:                       # tiny safety trim
+        y *= np.float32(ceil / pk)
+    return y
+
+
+def fx_loudness_normalize(x, rate, target_lufs=-14.0, ceiling_db=-1.0):
+    """Gain to the target integrated loudness, then true-peak limit; re-balances after limiting."""
+    if len(x) == 0:
+        return x
+    cur = integrated_lufs(x, rate)
+    if cur <= -69.9:
+        return x
+    gain = max(-40.0, min(30.0, target_lufs - cur))
+    y = (x * (10 ** (gain / 20.0))).astype(np.float32)
+    for _ in range(4):
+        y = fx_true_peak_limit(y, rate, ceiling_db)
+        short = target_lufs - integrated_lufs(y, rate)
+        if short < 0.15:
+            break
+        y = (y * (10 ** (min(short, 6.0) / 20.0))).astype(np.float32)
+    return fx_true_peak_limit(y, rate, ceiling_db)
+
+
+# ---------------------------------------------------------------- clipping / declip
+def _clip_runs(x, min_run=3):
+    """-> (level, [(ch, start, end_inclusive, sign), ...]) of flat-topped runs at the signal's maximum."""
+    n = len(x)
+    m = float(np.max(np.abs(x))) if n else 0.0
+    if m < 0.01:                      # silence: nothing to judge
+        return m, []
+    thr = m * 0.998
+    runs = []
+    for ch in range(x.shape[1]):
+        a = x[:, ch]
+        for sign, mask in ((1, a >= thr), (-1, a <= -thr)):
+            d = np.diff(np.concatenate([[0], mask.astype(np.int8), [0]]))
+            st, en = np.where(d == 1)[0], np.where(d == -1)[0]
+            keep = (en - st) >= min_run
+            st, en = st[keep], en[keep]
+            if not len(st):
+                continue
+            # a real clipped plateau is entered steeply; a rounded sine top approaches its peak smoothly
+            drop = np.maximum(m - np.abs(a[np.maximum(st - 1, 0)]), m - np.abs(a[np.minimum(en, n - 1)]))
+            ok = drop >= 0.008 * m
+            for s_, e_ in zip(st[ok], en[ok]):
+                runs.append((ch, int(s_), int(e_ - 1), sign))
+    return m, runs
+
+
+def detect_clipping(x):
+    level, runs = _clip_runs(x)
+    n = len(x) * (x.shape[1] if len(x) else 1)
+    samples = sum(r[2] - r[1] + 1 for r in runs)
+    pct = 100.0 * samples / max(1, n)
+    if len(runs) < 3:                  # one or two flat peaks are incidental; clipping repeats at the same level
+        sev = "None"
+    elif pct < 0.002 and len(runs) < 20:
+        sev = "Mild"
+    elif pct < 0.05:
+        sev = "Moderate"
+    else:
+        sev = "Severe"
+    return dict(runs=len(runs), samples=samples, percent=pct, level_db=20 * math.log10(max(level, 1e-9)),
+                severity=sev)
+
+
+def fx_declip(x, rate, max_run=48, headroom_db=-1.0):
+    """Reconstruct flat-topped (clipped) peaks with a cubic spline through the unclipped neighbours."""
+    if len(x) == 0:
+        return x
+    from scipy.interpolate import CubicSpline
+    level, runs = _clip_runs(x)
+    out = x.astype(np.float32).copy()
+    if not runs:
+        return out
+    thr = level * 0.998
+    n = len(x)
+    chans = {}
+    for ch, a, b, sg in runs:
+        chans.setdefault(ch, []).append((a, b, sg))
+    for ch, lst in chans.items():
+        sig = out[:, ch].astype(np.float64)
+        for a, b, sg in lst:
+            L = b - a + 1
+            if L > max_run:
+                continue
+            lo, hi = max(0, a - 6), min(n, b + 7)
+            ix = np.r_[np.arange(lo, a), np.arange(b + 1, hi)]
+            ix = ix[np.abs(sig[ix]) < thr]
+            if len(ix) < 4:
+                continue
+            y = CubicSpline(ix, sig[ix], bc_type="natural")(np.arange(a, b + 1))
+            mag = np.maximum(sg * y, level)
+            mag = np.minimum(mag, level * min(2.0, 1.0 + 0.05 * L))
+            sig[a:b + 1] = sg * mag
+        out[:, ch] = sig.astype(np.float32)
+    ceil = 10 ** (headroom_db / 20.0)
+    pk = float(np.max(np.abs(out)))
+    if pk > ceil:
+        out *= np.float32(ceil / pk)
+    return out
+
+
+# ---------------------------------------------------------------- presence / exciter
+def spectrum_balance(x, rate):
+    """Deviation (dB) of the presence (3 kHz) and air (8 kHz) regions from a typical -4 dB/oct tilt."""
+    mono = x.mean(axis=1) if x.ndim == 2 else x
+    if len(mono) > 90 * rate:
+        a = (len(mono) - 90 * rate) // 2
+        mono = mono[a:a + 90 * rate]
+    if len(mono) < 8192:
+        return 0.0, 0.0
+    f, P = signal.welch(mono, rate, nperseg=8192)
+
+    def band(lo, hi):
+        m = (f >= lo) & (f < hi)
+        return 10 * math.log10(float(np.mean(P[m])) + 1e-20) if np.any(m) else -200.0
+    ref = band(700, 1400)
+    dev3 = band(2400, 3800) - (ref - 4.0 * math.log2(3.0))
+    hi = min(11000.0, rate * 0.45)
+    dev8 = (band(6000, hi) - (ref - 4.0 * math.log2(8.0))) if hi > 7000 else 0.0
+    return dev3, dev8
+
+
+def fx_presence(x, rate, gain_db=2.5, freq=3000.0, q=0.9):
+    """Peaking EQ centred on the presence region (RBJ biquad)."""
+    if len(x) < 64 or abs(gain_db) < 0.05:
+        return x
+    A = 10 ** (gain_db / 40.0)
+    w0 = 2 * math.pi * min(freq, rate * 0.45) / rate
+    al = math.sin(w0) / (2 * q)
+    cw = math.cos(w0)
+    b = [1 + al * A, -2 * cw, 1 - al * A]
+    a = [1 + al / A, -2 * cw, 1 - al / A]
+    sos = signal.tf2sos(b, a)
+    return np.clip(signal.sosfilt(sos, x.astype(np.float64), axis=0), -1.0, 1.0).astype(np.float32)
+
+
+def fx_exciter(x, rate, amount=0.18, drive=3.0, lo_hz=2800.0):
+    """Harmonic exciter: saturate the upper band, keep only the new harmonics, blend in parallel."""
+    if len(x) < 256:
+        return x
+    nyq = rate / 2.0
+    lo = min(lo_hz, nyq * 0.6) / nyq
+    hp = signal.butter(2, lo, "high", output="sos")
+    band = signal.sosfilt(hp, x.astype(np.float64), axis=0)
+    sat = np.tanh(band * drive) / math.tanh(drive)
+    harm = signal.sosfilt(signal.butter(2, min(lo * 1.35, 0.9), "high", output="sos"), sat, axis=0)
+    ceil_f = min(0.45 * rate, 16000.0) / nyq
+    harm = signal.sosfilt(signal.butter(2, ceil_f, "low", output="sos"), harm, axis=0)
+    rb = float(np.sqrt(np.mean(band ** 2))) + 1e-12
+    rh = float(np.sqrt(np.mean(harm ** 2))) + 1e-12
+    out = x + harm * (amount * rb / rh)
+    return np.clip(out, -1.0, 1.0).astype(np.float32)
+
+
+# ---------------------------------------------------------------- mono compatibility
+def _corr(a, b):
+    d = math.sqrt(float(np.sum(a * a)) * float(np.sum(b * b)))
+    return float(np.sum(a * b) / d) if d > 1e-12 else 1.0
+
+
+def _mono_loss_db(a, b):
+    pm = float(np.mean(((a + b) / 2.0) ** 2))
+    ps = float(np.mean((a * a + b * b) / 2.0))
+    return max(-40.0, 10 * math.log10((pm + 1e-20) / (ps + 1e-20)))
+
+
+def mono_metrics(x, rate):
+    L, R = x[:, 0].astype(np.float64), x[:, 1].astype(np.float64)
+    out = dict(corr=_corr(L, R), loss_db=_mono_loss_db(L, R))
+    nyq = rate / 2.0
+    bands = (("low", None, 150.0), ("mid", 150.0, 2000.0), ("high", 2000.0, None))
+    for name, lo, hi in bands:
+        try:
+            if lo is None:
+                sos = signal.butter(4, hi / nyq, "low", output="sos")
+            elif hi is None:
+                sos = signal.butter(4, min(lo / nyq, 0.95), "high", output="sos")
+            else:
+                sos = signal.butter(4, [lo / nyq, min(hi / nyq, 0.95)], "band", output="sos")
+            a, b = signal.sosfilt(sos, L), signal.sosfilt(sos, R)
+            out[f"corr_{name}"] = _corr(a, b)
+            out[f"loss_{name}_db"] = _mono_loss_db(a, b)
+            out[f"energy_{name}"] = float(np.mean(a * a + b * b))
+        except Exception:
+            out[f"corr_{name}"], out[f"loss_{name}_db"], out[f"energy_{name}"] = 1.0, 0.0, 0.0
+    tot = sum(out[f"energy_{n}"] for n, _, _ in bands) + 1e-20
+    out["low_share"] = out["energy_low"] / tot
+    out["polarity_inverted"] = out["corr"] < -0.25
+    out["verdict"] = ("Poor" if (out["loss_db"] < -6 or out["polarity_inverted"]) else
+                      "Caution" if (out["loss_db"] < -3 or out["corr_low"] < 0.7) else "Good")
+    return out
+
+
+def fx_fix_polarity(x):
+    out = x.copy()
+    out[:, 1] *= -1
+    return out
+
+
+def fx_bass_mono(x, rate, cutoff=120.0):
+    if len(x) < 512:
+        return x
+    sos = signal.butter(4, min(cutoff, rate * 0.2) / (rate / 2.0), "low", output="sos")
+    low = signal.sosfiltfilt(sos, x.astype(np.float64), axis=0)
+    if _corr(low[:, 0], low[:, 1]) < -0.3:          # bass is anti-phase: flip one side so it survives the sum
+        flipped = low.copy()
+        flipped[:, 1] *= -1
+        mono = flipped.mean(axis=1, keepdims=True)
+        mono_out = np.repeat(mono, 2, axis=1)
+    else:
+        mono_out = np.repeat(low.mean(axis=1, keepdims=True), 2, axis=1)
+    return np.clip(x - low + mono_out, -1.0, 1.0).astype(np.float32)
+
+
+def fx_side_reduce(x, factor):
+    mid = (x[:, 0] + x[:, 1]) / 2.0
+    side = (x[:, 0] - x[:, 1]) / 2.0 * factor
+    return np.clip(np.column_stack([mid + side, mid - side]), -1, 1).astype(np.float32)
+
+
+def side_factor_for_loss(x, target_loss_db=-2.5):
+    mid = (x[:, 0] + x[:, 1]) / 2.0
+    side = (x[:, 0] - x[:, 1]) / 2.0
+    pm, ps = float(np.mean(mid ** 2)), float(np.mean(side ** 2))
+    if ps < 1e-12 or pm < 1e-12:
+        return 1.0
+    k2 = pm * (10 ** (-target_loss_db / 10.0) - 1.0) / ps
+    return float(min(1.0, max(0.35, math.sqrt(max(k2, 0.0)))))
+
+
+# =====================================================================
+#  AUTO 5_STAR EFFECT HELPERS
+# =====================================================================
+def _widen_stereo(x, factor):
+    mid = (x[:, 0] + x[:, 1]) / 2.0
+    side = (x[:, 0] - x[:, 1]) / 2.0
+    side = side * factor
+    return np.clip(np.column_stack([mid + side, mid - side]), -1, 1).astype(np.float32)
+
+
+def _delay(x, n):
+    n = int(n)
+    if n <= 0:
+        return x
+    return np.concatenate([np.zeros(n, x.dtype), x[:-n]]) if len(x) > n else np.zeros_like(x)
+
+
+def _spatial_stage(x, rate, width=1.0, surround=0.0, st=None):
+    """Stereo width (1.0 = unchanged) + virtual surround (0..1). `st` keeps filter/delay state between
+    chunks so the same code runs live in playback and offline on whole files."""
+    if st is None:
+        st = {}
+    if abs(width - 1.0) < 0.005 and surround < 0.005:
+        return x
+    x = x.astype(np.float64)
+    mid = (x[:, 0] + x[:, 1]) / 2.0
+    side = (x[:, 0] - x[:, 1]) / 2.0 * width
+    amb_l = amb_r = 0.0
+    if surround > 0.005:
+        if "sos" not in st:
+            hi = min(7000.0, rate * 0.45)
+            st["sos"] = signal.butter(2, [200.0, hi], "bandpass", fs=rate, output="sos")
+            st["zi"] = np.zeros((len(st["sos"]), 2))
+            st["tail"] = np.zeros(int(0.017 * rate) + 1)
+        amb, st["zi"] = signal.sosfilt(st["sos"], (x[:, 0] - x[:, 1]) / 2.0, zi=st["zi"])
+        buf = np.concatenate([st["tail"], amb])
+        n, d1, d2 = len(amb), int(0.011 * rate), int(0.017 * rate)
+        amb_l = buf[len(buf) - n - d1:len(buf) - d1]
+        amb_r = buf[len(buf) - n - d2:len(buf) - d2]
+        st["tail"] = buf[-(int(0.017 * rate) + 1):]
+        side = side * (1.0 + 0.8 * surround)
+        amb_l = 0.30 * surround * amb_l
+        amb_r = 0.30 * surround * amb_r
+    return np.column_stack([mid + side + amb_l, mid - side - amb_r])
+
+
+def _peak_safe(y, ceiling=0.98):
+    pk = float(np.max(np.abs(y))) if len(y) else 0.0
+    if pk > ceiling:
+        y = y * (ceiling / pk)
+    return y.astype(np.float32)
+
+
+def fx_stereo_width(x, rate, width_pct=140.0, bass_hz=120.0):
+    """Stereo Widener. 0% = mono, 100% = unchanged, 200% = extra wide. Bass below bass_hz stays centred."""
+    w = max(0.0, min(300.0, width_pct)) / 100.0
+    if bass_hz and bass_hz > 20:
+        sos = signal.butter(4, min(bass_hz, rate * 0.4), "lowpass", fs=rate, output="sos")
+        low = signal.sosfiltfilt(sos, x.astype(np.float64), axis=0)
+        y = low + _spatial_stage(x - low, rate, w, 0.0, {})
+    else:
+        y = _spatial_stage(x, rate, w, 0.0, {})
+    return _peak_safe(y)
+
+
+def fx_virtual_surround(x, rate, strength_pct=60.0):
+    """Virtual Surround: wider stage plus delayed, filtered ambience that sounds like it comes from behind."""
+    k = max(0.0, min(100.0, strength_pct)) / 100.0
+    return _peak_safe(_spatial_stage(x, rate, 1.0 + 0.3 * k, k, {}))
+
+
+def upmix_51(x, rate):
+    """Stereo -> 5.1 (FL FR FC LFE BL BR) for AC-3 export."""
+    x = x.astype(np.float64)
+    mid = (x[:, 0] + x[:, 1]) / 2.0
+    side = (x[:, 0] - x[:, 1]) / 2.0
+    lfe_sos = signal.butter(4, 120.0, "lowpass", fs=rate, output="sos")
+    lfe = signal.sosfilt(lfe_sos, mid)
+    hi = min(8000.0, rate * 0.45)
+    amb_sos = signal.butter(2, [150.0, hi], "bandpass", fs=rate, output="sos")
+    amb = signal.sosfilt(amb_sos, side)
+    out = np.column_stack([x[:, 0] - 0.35 * mid, x[:, 1] - 0.35 * mid, 0.7 * mid, lfe,
+                           0.8 * _delay(amb, 0.012 * rate), -0.8 * _delay(amb, 0.016 * rate)])
+    return _peak_safe(out)
+
+
+def _balance_lr(x, gl, gr):
+    out = x.copy()
+    out[:, 0] *= gl
+    out[:, 1] *= gr
+    return np.clip(out, -1, 1).astype(np.float32)
+
+
+def _expander(x, rate, thresh_db, ratio):
+    if len(x) == 0:
+        return x
+    env = np.max(np.abs(x), axis=1)
+    a = math.exp(-1.0 / (0.01 * rate))
+    env = signal.lfilter([1 - a], [1, -a], env)
+    lvl = 20 * np.log10(np.maximum(env, 1e-6))
+    under = np.maximum(thresh_db - lvl, 0)
+    gain_db = under * (ratio - 1.0)
+    return (x * (10 ** (gain_db / 20))[:, None]).astype(np.float32)
+
+
+def _fade_end(x, rate, secs):
+    if len(x) == 0:
+        return x
+    n = min(len(x), max(1, int(secs * rate)))
+    ramp = np.linspace(1, 0, n, dtype=np.float32)[:, None]
+    out = x.copy()
+    out[-n:] *= ramp
+    return out
+
+
+def _trim_edges(x, threshold):
+    if len(x) == 0:
+        return x
+    mono = np.max(np.abs(x), axis=1)
+    idx = np.where(mono > threshold)[0]
+    if len(idx) == 0:
+        return x
+    a, b = idx[0], idx[-1] + 1
+    return x[a:b].copy()
+
+
+# =====================================================================
+#  AUTO 5_STAR ANALYZER
+# =====================================================================
+def _welch_avg(mono, rate, nper_max=8192, chunk_s=20.0, pieces_n=5):
+    """Average power spectrum of the REAL waveform, from up to ~100 s spread across the file."""
+    n = len(mono)
+    chunk = int(chunk_s * rate)
+    if n <= 2 * chunk:
+        pieces = [mono]
+    else:
+        starts = np.linspace(0, n - chunk, pieces_n).astype(int)
+        pieces = [mono[a:a + chunk] for a in starts]
+    shortest = min(len(p) for p in pieces)
+    if shortest < 1024:
+        return None, None
+    nper = min(nper_max, 1 << int(math.log2(shortest)))
+    f, P = None, None
+    for pc in pieces:
+        f, Pp = signal.welch(pc.astype(np.float64), rate, nperseg=nper, detrend="constant")
+        P = Pp if P is None else P + Pp
+    return f, P
+
+
+def spectral_summary(x, rate):
+    """(low <200 Hz, mid 200-4k, high >4k) energy shares and the spectral centroid in Hz."""
+    f, P = _welch_avg(x.mean(axis=1), rate, 8192)
+    if f is None:
+        return 0.0, 0.0, 0.0, 0.0
+    tot = float(np.sum(P)) + 1e-20
+    return (float(np.sum(P[f < 200]) / tot),
+            float(np.sum(P[(f >= 200) & (f < 4000)]) / tot),
+            float(np.sum(P[f >= 4000]) / tot),
+            float(np.sum(f * P) / tot))
+
+
+def low_end_metrics(x, rate):
+    """Things the low-end fixes can actually change: sub-25 Hz rumble share, mains hum, bass excess."""
+    out = {"sub_frac": 0.0, "hum_hz": 0.0, "hum_db": 0.0, "bass_dev": 0.0}
+    f, P = _welch_avg(x.mean(axis=1), rate, 32768)
+    if f is None or len(f) < 64:
+        return out
+    tot = float(np.sum(P)) + 1e-20
+    df = float(f[1] - f[0])
+    out["sub_frac"] = float(np.sum(P[(f > 0.5) & (f < 25.0)]) / tot)
+
+    def prom(f0):
+        c = np.abs(f - f0) <= max(1.5, 1.5 * df)
+        nb = (np.abs(f - f0) > max(5.0, 4 * df)) & (np.abs(f - f0) <= 20.0)
+        if not c.any() or not nb.any():
+            return 0.0, 0.0
+        peak = float(np.max(P[c]))
+        return (10 * math.log10((peak + 1e-20) / (float(np.median(P[nb])) + 1e-20)),
+                float(np.sum(P[c]) / tot))
+    best = 0.0
+    for f0 in (50.0, 60.0):
+        if 2 * f0 >= rate * 0.45:
+            continue
+        p1, share = prom(f0)
+        p2, _ = prom(2 * f0)
+        score = min(p1, p2)                     # genuine hum has a strong 2nd harmonic too
+        if score >= 10.0 and share > 1e-4 and score > best:
+            best, out["hum_hz"], out["hum_db"] = score, f0, score
+
+    def band(lo, hi):
+        m = (f >= lo) & (f < hi)
+        return 10 * math.log10(float(np.mean(P[m])) + 1e-20) if np.any(m) else -200.0
+    ref = band(700, 1400)
+    out["bass_dev"] = band(80, 200) - (ref + 4.0 * math.log2(1000.0 / 126.0))
+    return out
+
+
+def measure_noise(x, rate):
+    """(noise floor dBFS, gate threshold) or (None, None).
+
+    Floor = 10th percentile of 50 ms frame RMS (digital silence ignored). The threshold is in the units
+    fx_noise_reduce expects (dB relative to the 90th-percentile STFT magnitude), placed just above the noise."""
+    mono = x.mean(axis=1) if x.ndim == 2 else x
+    fl = max(256, int(rate * 0.05))
+    nf = len(mono) // fl
+    if nf < 8:
+        return None, None
+    fr = mono[:nf * fl].astype(np.float64).reshape(nf, fl)
+    db = 20 * np.log10(np.maximum(np.sqrt(np.mean(fr ** 2, axis=1)), 1e-9))
+    live = db[db > -90.0]
+    if len(live) < 8:
+        return None, None
+    floor_db = float(np.percentile(live, 10))
+    n = len(mono)
+    seg = mono if n <= 30 * rate else mono[(n - 30 * rate) // 2:(n - 30 * rate) // 2 + 30 * rate]
+    if len(seg) < 4096:
+        return floor_db, None
+    _, _, Z = signal.stft(seg.astype(np.float64), rate, nperseg=1024, noverlap=768)
+    mag = np.abs(Z)
+    ref = float(np.percentile(mag, 90))
+    if ref < 1e-9:
+        return floor_db, None
+    frame_lvl = np.median(mag, axis=0)
+    quiet = frame_lvl <= np.percentile(frame_lvl, 10)
+    noise = float(np.percentile(mag[:, quiet], 75))
+    thr = 20 * math.log10(max(3.0 * noise, 1e-9) / ref)       # fully closed at ~2.7x noise, fully open at 3x
+    return floor_db, float(min(12.0, max(-60.0, thr)))      # relative to p90 magnitude; may be >0 when noise dominates most bins
+
+
+class AudioStats:
+    def __init__(self):
+        self.peak_db = -120.0
+        self.rms_db = -120.0
+        self.crest_db = 0.0
+        self.dc_l = 0.0
+        self.dc_r = 0.0
+        self.clip_ratio = 0.0
+        self.noise_floor_db = -120.0
+        self.silence_ratio = 0.0
+        self.stereo_width = 0.0
+        self.balance = 0.0
+        self.low_energy = 0.0
+        self.mid_energy = 0.0
+        self.high_energy = 0.0
+        self.spectral_centroid = 0.0
+        self.noise_gate_db = None
+        self.end_level_db = -120.0
+        self.sub_frac = 0.0
+        self.hum_hz = 0.0
+        self.hum_db = 0.0
+        self.bass_dev = 0.0
+        self.clipping_regions = 0
+        self.duration = 0.0
+        self.rate = DEFAULT_RATE
+        # loudness / true peak
+        self.lufs_i = -70.0
+        self.lufs_s_max = -70.0
+        self.lufs_m_max = -70.0
+        self.lra = 0.0
+        self.true_peak_db = -120.0
+        self.loud_ok = False
+        # clipping
+        self.clip_level_db = 0.0
+        self.clip_severity = "None"
+        # tone
+        self.presence_dev = 0.0
+        self.air_dev = 0.0
+        # mono compatibility
+        self.corr = 1.0
+        self.corr_low = 1.0
+        self.loss_db = 0.0
+        self.loss_low_db = 0.0
+        self.low_share = 0.0
+        self.polarity_inverted = False
+        self.mono_verdict = "Good"
+
+    def summary(self):
+        return (f"Peak {self.peak_db:.1f} dBFS \u00b7 RMS {self.rms_db:.1f} dBFS \u00b7 "
+                f"Crest {self.crest_db:.1f} dB \u00b7 "
+                f"Noise floor {self.noise_floor_db:.1f} dB \u00b7 "
+                f"Duration {self.duration:.1f}s")
+
+    def loudness_line(self):
+        if not self.loud_ok:
+            return f"True peak {self.true_peak_db:+.1f} dBTP \u00b7 loudness needs at least 0.4 s of audio"
+        return (f"Loudness {self.lufs_i:.1f} LUFS \u00b7 True peak {self.true_peak_db:+.1f} dBTP \u00b7 "
+                f"LRA {self.lra:.1f} LU \u00b7 Short-term max {self.lufs_s_max:.1f} LUFS")
+
+    def health_line(self):
+        clip = ("none" if self.clip_severity == "None" else
+                f"{self.clip_severity.lower()} ({self.clipping_regions} regions, {self.clip_ratio:.2f}%)")
+        return (f"Clipping: {clip} \u00b7 Mono: {self.mono_verdict.lower()} "
+                f"(corr {self.corr:+.2f}, sum {self.loss_db:+.1f} dB) \u00b7 "
+                f"Presence 3 kHz {self.presence_dev:+.1f} dB vs typical")
+
+    def full_summary(self):
+        return self.summary() + "\n" + self.loudness_line() + "\n" + self.health_line()
+
+
+class Recommendation:
+    def __init__(self, key, title, reason, effect, params, priority, weight):
+        self.key = key
+        self.title = title
+        self.reason = reason
+        self.effect = effect
+        self.params = params
+        self.priority = priority
+        self.weight = weight
+        self.enabled = tk.BooleanVar(value=True)
+
+    def describe_params(self):
+        if not self.params:
+            return "(no parameters)"
+        return ", ".join(f"{k}={v}" for k, v in self.params.items())
+
+
+class AudioAnalyzer:
+    def __init__(self):
+        self.stats = AudioStats()
+        # shared with the dialog's "Loudness target" controls and read when the step runs
+        self.targets = {"target_lufs": LOUDNESS_TARGETS[0][1], "ceiling_dbtp": LOUDNESS_TARGETS[0][2]}
+
+    def loudness_gap(self):
+        s = self.stats
+        return self.targets["target_lufs"] - s.lufs_i if s.loud_ok else 0.0
+
+    def loudness_needed(self):
+        s = self.stats
+        if not s.loud_ok:
+            return False
+        return abs(self.loudness_gap()) > 0.5 or s.true_peak_db > self.targets["ceiling_dbtp"] + 0.05
+
+    def loudness_reason(self):
+        s, t = self.stats, self.targets
+        if not s.loud_ok:
+            return "Audio is too short to measure loudness (needs 0.4 s)."
+        gap = self.loudness_gap()
+        base = (f"Measured {s.lufs_i:.1f} LUFS, true peak {s.true_peak_db:+.1f} dBTP, LRA {s.lra:.1f} LU. "
+                f"Target {t['target_lufs']:g} LUFS / {t['ceiling_dbtp']:g} dBTP \u2192 gain {gap:+.1f} dB, "
+                "then true-peak limiting so inter-sample peaks never exceed the ceiling.")
+        if not self.loudness_needed():
+            base += "  (Already within 0.5 LU of the target \u2014 not needed.)"
+        return base
+
+    def analyze(self, data, rate):
+        s = AudioStats()
+        s.rate = rate
+        s.duration = len(data) / rate if rate else 0.0
+        if len(data) == 0:
+            self.stats = s
+            return s
+
+        pk = float(np.max(np.abs(data)))
+        s.peak_db = 20 * math.log10(max(pk, 1e-9))
+        rms = float(np.sqrt(np.mean(data ** 2)))
+        s.rms_db = 20 * math.log10(max(rms, 1e-9))
+        s.crest_db = s.peak_db - s.rms_db
+
+        s.dc_l = float(np.mean(data[:, 0]))
+        s.dc_r = float(np.mean(data[:, 1]))
+
+        cd = detect_clipping(data)
+        s.clip_ratio, s.clipping_regions = cd["percent"], cd["runs"]
+        s.clip_level_db, s.clip_severity = cd["level_db"], cd["severity"]
+
+        mono = np.max(np.abs(data), axis=1)
+        s.silence_ratio = float((mono < 10 ** (-60 / 20.0)).mean()) * 100.0
+        tail = data[-max(16, int(rate * 0.001)):]          # last ~1 ms: what actually clicks
+        s.end_level_db = 20 * math.log10(max(float(np.max(np.abs(tail))), 1e-9))
+        try:
+            s.noise_floor_db, s.noise_gate_db = measure_noise(data, rate)
+        except Exception as ex:
+            print("[5_Star] noise measurement skipped:", ex)
+            s.noise_floor_db = None
+        if s.noise_floor_db is None:
+            s.noise_floor_db = s.rms_db - 40
+
+        mid = (data[:, 0] + data[:, 1]) / 2.0
+        side = (data[:, 0] - data[:, 1]) / 2.0
+        mid_rms = float(np.sqrt(np.mean(mid ** 2)))
+        side_rms = float(np.sqrt(np.mean(side ** 2)))
+        s.stereo_width = side_rms / max(1e-9, mid_rms + side_rms)
+        rl = float(np.sqrt(np.mean(data[:, 0] ** 2)))
+        rr = float(np.sqrt(np.mean(data[:, 1] ** 2)))
+        s.balance = (rr - rl) / max(1e-9, rr + rl)
+
+        try:
+            s.low_energy, s.mid_energy, s.high_energy, s.spectral_centroid = spectral_summary(data, rate)
+            le = low_end_metrics(data, rate)
+            s.sub_frac, s.hum_hz, s.hum_db, s.bass_dev = le["sub_frac"], le["hum_hz"], le["hum_db"], le["bass_dev"]
+        except Exception as ex:
+            print("[5_Star] spectrum measurement skipped:", ex)
+
+        try:
+            ld = measure_loudness(data, rate)
+            s.lufs_i, s.lufs_s_max, s.lufs_m_max, s.lra = ld.lufs_i, ld.lufs_s_max, ld.lufs_m_max, ld.lra
+            s.true_peak_db, s.loud_ok = ld.true_peak_db, ld.measurable
+            s.presence_dev, s.air_dev = spectrum_balance(data, rate)
+            mm = mono_metrics(data, rate)
+            s.corr, s.corr_low, s.loss_db, s.loss_low_db = mm["corr"], mm["corr_low"], mm["loss_db"], mm["loss_low_db"]
+            s.low_share, s.polarity_inverted, s.mono_verdict = mm["low_share"], mm["polarity_inverted"], mm["verdict"]
+        except Exception as ex:                       # never let a metering problem block the enhancer
+            print("[5_Star] health metrics skipped:", ex)
+
+        self.stats = s
+        return s
+
+    def recommend(self, rate):
+        s = self.stats
+        recs = []
+
+        if abs(s.dc_l) > 0.002 or abs(s.dc_r) > 0.002:
+            recs.append(Recommendation(
+                "dc", "Remove DC Offset",
+                f"DC offset detected (L {s.dc_l:+.4f}, R {s.dc_r:+.4f}). "
+                "Centering the waveform recovers headroom.",
+                fx_dc, {}, priority=1, weight=9.0))
+
+        if s.polarity_inverted:
+            recs.append(Recommendation(
+                "polarity", "Fix Inverted Channel Polarity",
+                f"Left and right are in anti-phase (correlation {s.corr:+.2f}); the mono sum cancels "
+                f"{abs(s.loss_db):.0f} dB. Flipping the right channel restores the mix.",
+                lambda x, r: fx_fix_polarity(x), {"flip": "right channel"},
+                priority=1.5, weight=10.0))
+
+        if s.clip_severity != "None":
+            recs.append(Recommendation(
+                "declip", "Declip (cubic-spline peak reconstruction)",
+                f"{s.clipping_regions} flat-topped region(s) at {s.clip_level_db:.1f} dBFS "
+                f"({s.clip_ratio:.2f}% of samples, {s.clip_severity.lower()}). Rebuilding the lost peaks from the "
+                "surrounding waveform, then restoring \u22121 dB of headroom.",
+                lambda x, r: fx_declip(x, r, 48, -1.0), {"max_run_samples": 48, "headroom_db": -1.0},
+                priority=2, weight=10.0))
+
+        gap = s.rms_db - s.noise_floor_db
+        if s.noise_gate_db is not None and s.noise_floor_db > -55 and gap >= 20 and s.rms_db > -50:
+            thr_db = s.noise_gate_db
+            recs.append(Recommendation(
+                "denoise", "Noise Reduction (spectral gate)",
+                f"The quietest passages sit at {s.noise_floor_db:.1f} dBFS, {gap:.0f} dB below the average level \u2014 "
+                "audible background noise. A soft gate set just above it lowers that noise by 10 dB or more.",
+                lambda x, r: fx_noise_reduce(x, r, thr_db, 0.3),
+                {"threshold_db": round(thr_db, 1), "smooth": 0.3},
+                priority=3, weight=8.0))
+
+        if s.hum_hz > 0:
+            f0 = s.hum_hz
+            recs.append(Recommendation(
+                "notch", f"Notch Filter {f0:g} Hz (mains hum)",
+                f"A narrow {f0:g} Hz line (and its {2 * f0:g} Hz harmonic) stands {s.hum_db:.0f} dB above the "
+                "surrounding spectrum \u2014 mains hum. Notching both removes it without touching the music.",
+                lambda x, r: fx_notch(fx_notch(x, r, f0, 30.0), r, 2 * f0, 30.0),
+                {"freq_1": f0, "freq_2": 2 * f0, "q": 30.0},
+                priority=4, weight=6.0))
+
+        if s.sub_frac > 0.004:
+            recs.append(Recommendation(
+                "highpass", "High-Pass 40 Hz",
+                f"{s.sub_frac * 100:.1f}% of the energy sits below 25 Hz (rumble / subsonic). "
+                "A 40 Hz high-pass removes it without affecting music.",
+                lambda x, r: fx_filter(x, r, "high", 40.0),
+                {"cutoff_hz": 40.0},
+                priority=5, weight=6.0))
+
+        if s.high_energy > 0.40:
+            recs.append(Recommendation(
+                "treble_tame", "Treble Trim \u22122 dB (de-ess)",
+                f"High-band energy is {s.high_energy*100:.0f}%. Taming sibilance.",
+                lambda x, r: fx_bass_treble(x, r, 0.0, -2.0),
+                {"bass_db": 0.0, "treble_db": -2.0},
+                priority=6, weight=5.0))
+
+        if s.presence_dev <= -6.0:
+            g_db = round(min(4.0, (-s.presence_dev - 3.0) * 0.6), 1)
+            recs.append(Recommendation(
+                "presence", f"Presence Boost +{g_db:g} dB @ 3 kHz",
+                f"The 2.4\u20133.8 kHz region sits {abs(s.presence_dev):.1f} dB below a typical music spectrum "
+                "(voices and lead instruments sound distant). A narrow peaking boost lifts only that band, "
+                "unlike a broadband treble shelf.",
+                lambda x, r: fx_presence(x, r, g_db, 3000.0, 0.9),
+                {"gain_db": g_db, "freq_hz": 3000.0, "q": 0.9},
+                priority=6.5, weight=6.0))
+        elif s.presence_dev >= 4.0:
+            g_db = round(-min(3.0, (s.presence_dev - 2.5) * 0.6), 1)
+            recs.append(Recommendation(
+                "presence_cut", f"Presence Cut {g_db:g} dB @ 3 kHz (harshness)",
+                f"The 2.4\u20133.8 kHz region is {s.presence_dev:.1f} dB above a typical spectrum \u2014 "
+                "often heard as harsh or fatiguing. A narrow cut tames it.",
+                lambda x, r: fx_presence(x, r, g_db, 3000.0, 0.9),
+                {"gain_db": g_db, "freq_hz": 3000.0, "q": 0.9},
+                priority=6.5, weight=5.0))
+
+        if s.air_dev <= -12.0 and s.rate >= 32000 and s.high_energy < 0.12:
+            recs.append(Recommendation(
+                "exciter", "Harmonic Exciter (presence / air)",
+                f"The 6\u201311 kHz region is {abs(s.air_dev):.0f} dB below a typical spectrum. A saturating exciter "
+                "generates new upper harmonics and blends them in (parallel), adding clarity without EQ-boosting noise.",
+                lambda x, r: fx_exciter(x, r, 0.18, 3.0, 2800.0),
+                {"amount": 0.18, "drive": 3.0, "from_hz": 2800.0},
+                priority=6.8, weight=5.0))
+
+        if s.bass_dev >= 12.0:
+            g_b = max(1.0, min(6.0, round((s.bass_dev - 8.0) * 2) / 2))
+            recs.append(Recommendation(
+                "bass_tame", f"Bass Trim \u2212{g_b:g} dB",
+                f"The 80\u2013200 Hz region sits {s.bass_dev:.1f} dB above a typical music spectrum. "
+                f"Reducing bass {g_b:g} dB tightens the mix.",
+                lambda x, r: fx_bass_treble(x, r, -g_b, 0.0),
+                {"bass_db": -g_b, "treble_db": 0.0},
+                priority=7, weight=5.0))
+
+        if (not s.polarity_inverted and s.low_share > 0.02
+                and (s.corr_low < 0.85 or s.loss_low_db < -0.8)):
+            recs.append(Recommendation(
+                "bass_mono", "Mono Bass Below 120 Hz",
+                f"Low frequencies are not centred (bass correlation {s.corr_low:+.2f}, "
+                f"{s.loss_low_db:+.1f} dB lost in mono). Wide bass cancels on phones, club systems and vinyl.",
+                lambda x, r: fx_bass_mono(x, r, 120.0), {"cutoff_hz": 120.0},
+                priority=8.4, weight=6.0))
+
+        if not s.polarity_inverted and s.loss_db < -4.0:
+            recs.append(Recommendation(
+                "side_reduce", "Mono-Safe Stereo (reduce side level)",
+                f"Folding to mono loses {abs(s.loss_db):.1f} dB (correlation {s.corr:+.2f}) \u2014 "
+                "phase-heavy width that thins out on mono speakers. Reducing the side signal makes it mono-safe.",
+                lambda x, r: fx_side_reduce(x, side_factor_for_loss(x, -2.5)), {"target_mono_loss_db": -2.5},
+                priority=8.6, weight=5.0))
+
+        w_now = s.stereo_width
+        k_need = 0.2195 * (1.0 - w_now) / w_now if w_now > 1e-6 else 99.0     # side gain that reaches width ~0.18
+        if w_now < 0.15 and k_need <= 4.0:
+            k_w = round(max(1.15, k_need), 2)
+            recs.append(Recommendation(
+                "widen", "Widen Stereo Image",
+                f"Narrow stereo image (width {w_now:.2f}). Raising the side signal x{k_w:g} brings it to about 0.18. "
+                "(A true-mono file has no side signal, so it cannot be widened this way and is left alone.)",
+                lambda x, r: _widen_stereo(x, k_w),
+                {"width_factor": k_w},
+                priority=8, weight=4.0))
+
+        if abs(s.balance) > 0.10:
+            gain_l = 10 ** (-s.balance / 20.0)
+            gain_r = 10 ** (s.balance / 20.0)
+            recs.append(Recommendation(
+                "balance", "Correct L/R Balance",
+                f"Channel imbalance {s.balance*100:+.0f}%. Balancing to centre.",
+                lambda x, r: _balance_lr(x, gain_l, gain_r),
+                {"gain_l": round(gain_l, 3), "gain_r": round(gain_r, 3)},
+                priority=9, weight=7.0))
+
+        if s.loud_ok:
+            tg = self.targets
+            needed = self.loudness_needed()
+            lr = Recommendation(
+                "loudness", "Loudness Normalize (LUFS) + True-Peak Limit",
+                self.loudness_reason(),
+                lambda x, r: fx_loudness_normalize(x, r, tg["target_lufs"], tg["ceiling_dbtp"]),
+                tg, priority=12.5, weight=9.0 if needed else 3.0)
+            lr.enabled.set(bool(needed))
+            recs.append(lr)
+        elif s.peak_db > -0.1:
+            recs.append(Recommendation(
+                "normalize_down", "Limiter to \u22121 dBFS",
+                f"Peak at {s.peak_db:.1f} dBFS. Limiting prevents post-export clip.",
+                lambda x, r: fx_limiter(x, r, -1.0, 5.0),
+                {"ceiling_db": -1.0, "lookahead_ms": 5.0},
+                priority=10, weight=9.0))
+
+        if s.crest_db > 18 and s.peak_db > -12:
+            recs.append(Recommendation(
+                "compress", "Gentle Compressor (2:1)",
+                f"Crest factor {s.crest_db:.1f} dB is high; smoothing dynamics.",
+                lambda x, r: fx_compress(x, r, -18.0, 2.0, 2.0),
+                {"threshold_db": -18.0, "ratio": 2.0, "makeup_db": 2.0},
+                priority=11, weight=6.0))
+
+        if s.crest_db < 8 and s.rms_db > -18:
+            recs.append(Recommendation(
+                "expand", "Light Expander (1.2:1)",
+                f"Crest factor {s.crest_db:.1f} dB is low; restoring micro-dynamics.",
+                lambda x, r: _expander(x, r, -12.0, 1.2),
+                {"threshold_db": -12.0, "ratio": 1.2},
+                priority=12, weight=4.0))
+
+        if s.duration > 1.0 and s.end_level_db > -50.0:
+            recs.append(Recommendation(
+                "fade_end", "Fade Out Last 200 ms",
+                f"The file ends abruptly at {s.end_level_db:.0f} dBFS, which can click. "
+                "A short fade-out to silence removes it.",
+                lambda x, r: _fade_end(x, r, 0.2),
+                {"seconds": 0.2},
+                priority=13, weight=2.0))
+
+        if s.silence_ratio > 20.0:
+            recs.append(Recommendation(
+                "trim_silence", "Trim Lead/Tail Silence",
+                f"{s.silence_ratio:.0f}% of samples are near-silent. Trimming head/tail.",
+                lambda x, r: _trim_edges(x, 0.001),
+                {"threshold": 0.001},
+                priority=14, weight=5.0))
+
+        recs.sort(key=lambda r: (-r.weight, r.priority))
+        return recs
+
+
+# =====================================================================
+#  AUTO 5_STAR ENHANCE DIALOG  (recommendations at top, footer always visible)
+# =====================================================================
+class LargeCheck(tk.Canvas):
+    def __init__(self, master, var, on_change, bg_getter, size=None):
+        self.var = var
+        self.on_change = on_change
+        self.bg_getter = bg_getter
+        self.size = size or u(40)
+        super().__init__(master, width=self.size, height=self.size,
+                         bg=bg_getter(), highlightthickness=0, bd=0,
+                         cursor="hand2")
+        self.bind("<ButtonPress-1>", self._toggle)
+        self.draw()
+
+    def _toggle(self, _e):
+        self.var.set(not self.var.get())
+        self.draw()
+        self.on_change()
+
+    def refresh_bg(self):
+        self.configure(bg=self.bg_getter())
+        self.draw()
+
+    def draw(self):
+        self.delete("all")
+        s = self.size
+        on = self.var.get()
+        fill = PAL["check"] if on else "#ffffff"
+        outline = PAL["check"] if on else "#7a7a80"
+        rrect(self, 2, 2, s - 2, s - 2, u(8), fill=fill, outline=outline,
+              width=max(2, u(3)))
+        if on:
+            self.create_line(s * 0.22, s * 0.52,
+                             s * 0.42, s * 0.72,
+                             s * 0.80, s * 0.28,
+                             fill="#ffffff", width=max(4, u(6)),
+                             joinstyle="round", capstyle="round")
+
+
+class Auto5StarDialog(tk.Toplevel):
+    """Auto 5_Star Enhancement panel.
+
+    Layout (top to bottom):
+      header          - title + audio stats
+      recommendations - scrollable list of checkboxes (fills available space)
+      footer          - Select All / None / Invert + Cancel + Run Enhancement
+    The footer is packed with `side="bottom"` before the list grows, so it
+    is always visible regardless of how many recommendations there are.
+    """
+    WIDTH = 2240
+    HEIGHT = 1640
+    MIN_W = 1600
+    MIN_H = 1100
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title("Audio Plus  \u00b7  Auto 5_Star Enhance")
+        self.transient(app)
+        self.configure(bg=PAL["bottom"])
+        self.resizable(True, True)
+        self.minsize(u(self.MIN_W), u(self.MIN_H))
+
+        self._center_on_parent(u(self.WIDTH), u(self.HEIGHT))
+
+        target = self._pick_target()
+        if target is None:
+            self.destroy()
+            messagebox.showinfo("Audio Plus", "Load or select some audio first.")
+            return
+        self.target_track = target
+        self.rate = app.proj.rate
+        self.original = target.data.copy()
+
+        self.analyzer = AudioAnalyzer()
+        self.stats = self.analyzer.analyze(self.original, self.rate)
+        self.recommendations = self.analyzer.recommend(self.rate)
+
+        self.row_frames = []
+        self._tgt_busy = True
+        self._build_ui()
+        self._tgt_busy = False
+        self.grab_set()
+        self.lift()
+        self.focus_force()
+
+    def _center_on_parent(self, w, h):
+        place_window(self, w, h, self.master)
+
+    def _pick_target(self):
+        tracks = self.app.targets()
+        return tracks[0] if tracks else None
+
+    def _row_bg(self, rec):
+        return "#14261f" if rec.enabled.get() else "#10141c"
+
+    def _row_border(self, rec):
+        return "#2f7d5b" if rec.enabled.get() else "#2a3243"
+
+    def _build_ui(self):
+        P = PAL
+
+        # ---- header (top) ----
+        header = tk.Frame(self, bg="#1f2530")
+        header.pack(side="top", fill="x")
+        tk.Label(header, text="Audio Plus  \u00b7  Auto 5_Star Enhance",
+                 bg="#1f2530", fg="#ffd966",
+                 font=fnt(48, True), anchor="w").pack(fill="x", padx=u(24),
+                                                     pady=(u(18), 0))
+        tk.Label(header,
+                 text="Analyze \u2192 review recommendations \u2192 run enhancement chain",
+                 bg="#1f2530", fg="#c7ccd8",
+                 font=fnt(28), anchor="w").pack(fill="x", padx=u(24))
+        tk.Label(header, text=self.stats.summary(), bg="#1f2530", fg="#9fd2ff",
+                 font=fnt(26), anchor="w").pack(fill="x", padx=u(24))
+        tk.Label(header, text=self.stats.loudness_line(), bg="#1f2530", fg="#ffd966",
+                 font=fnt(26, True), anchor="w").pack(fill="x", padx=u(24))
+        tk.Label(header, text=self.stats.health_line(), bg="#1f2530", fg="#9fd2ff",
+                 font=fnt(24), anchor="w").pack(fill="x", padx=u(24), pady=(0, u(16)))
+        self._build_target_bar()
+
+        # ---- footer (bottom, packed BEFORE the list so it is always visible) ----
+        foot = tk.Frame(self, bg=P["bottom"])
+        foot.pack(side="bottom", fill="x", padx=u(18), pady=u(14))
+
+        def all_on():
+            for rec in self.recommendations:
+                rec.enabled.set(True)
+            self._refresh_all_rows()
+
+        def all_off():
+            for rec in self.recommendations:
+                rec.enabled.set(False)
+            self._refresh_all_rows()
+
+        def invert():
+            for rec in self.recommendations:
+                rec.enabled.set(not rec.enabled.get())
+            self._refresh_all_rows()
+
+        ttk.Button(foot, text="Select All",
+                   command=all_on).pack(side="left", padx=u(5))
+        ttk.Button(foot, text="Select None",
+                   command=all_off).pack(side="left", padx=u(5))
+        ttk.Button(foot, text="Invert",
+                   command=invert).pack(side="left", padx=u(5))
+
+        ttk.Button(foot, text="Cancel",
+                   command=self.destroy).pack(side="right", padx=u(5))
+        self.run_btn = ttk.Button(foot, text="\u25b6  Run Enhancement",
+                                  command=self.run)
+        self.run_btn.pack(side="right", padx=u(5))
+        if not self.recommendations:
+            self.run_btn.state(["disabled"])
+
+        # ---- middle: recommendations (top) + info (bottom) inside a frame ----
+        middle = tk.Frame(self, bg=P["bottom"])
+        middle.pack(side="top", fill="both", expand=True,
+                    padx=u(18), pady=u(12))
+        middle.columnconfigure(0, weight=1)
+        middle.rowconfigure(0, weight=1)   # recommendations list grows
+
+        # Recommendations section (takes remaining vertical space)
+        left = tk.LabelFrame(middle, text="Recommended actions",
+                             bg=P["bottom"], font=fnt(30, True),
+                             fg="#e4ebf8")
+        left.grid(row=0, column=0, sticky="nsew")
+
+        canvas = tk.Canvas(left, bg="#10141c", highlightthickness=0)
+        sb = ttk.Scrollbar(left, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side="left", fill="both", expand=True,
+                    padx=u(6), pady=u(6))
+        sb.pack(side="right", fill="y")
+        self.inner = tk.Frame(canvas, bg="#10141c")
+        canvas.create_window((0, 0), window=self.inner, anchor="nw",
+                             tags="inner")
+        self.inner.bind("<Configure>",
+                        lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        # mouse wheel scroll inside the list
+        def _wheel(e):
+            delta = -1 if (getattr(e, "delta", 0) > 0
+                           or getattr(e, "num", 0) == 4) else 1
+            canvas.yview_scroll(delta, "units")
+        canvas.bind_all("<MouseWheel>", _wheel, add="+")
+
+        if not self.recommendations:
+            tk.Label(self.inner,
+                     text="The audio already looks excellent \u2014 nothing to fix.",
+                     bg="#10141c", fg="#2e9d52",
+                     font=fnt(30, True)).pack(anchor="w", padx=u(16),
+                                              pady=u(28))
+        else:
+            for idx, rec in enumerate(self.recommendations):
+                self._add_recommendation_row(self.inner, idx, rec)
+
+        # Info / summary (small block under the list, does not steal room)
+        info = tk.Frame(middle, bg=P["bottom"])
+        info.grid(row=1, column=0, sticky="ew", pady=(u(10), 0))
+        info.columnconfigure(0, weight=1)
+        info.columnconfigure(1, weight=0)
+
+        tk.Label(info,
+                 text=("The analyzer measured loudness (LUFS), true peak, clipping, DC offset, "
+                       "presence/air balance, noise floor, stereo width and mono compatibility. "
+                       "Recommendations are ordered by importance. "
+                       "Uncheck anything you don't want \u2014 checked items turn green. "
+                       "Press  \u25b6  Run Enhancement  to apply the enabled steps and save "
+                       "the enhanced file."),
+                 bg=P["bottom"], fg="#e4ebf8", font=fnt(24),
+                 justify="left", anchor="w", wraplength=u(1400)).grid(
+                     row=0, column=0, sticky="ew")
+
+        self.preview_lbl = tk.Label(info, text="",
+                                    bg="#1d2330", fg="#e4ebf8",
+                                    font=fnt(24), justify="left", anchor="e",
+                                    relief="flat", padx=u(14), pady=u(10))
+        self.preview_lbl.grid(row=0, column=1, sticky="e", padx=(u(16), 0))
+        self._update_preview()
+
+    # ---------------- loudness target (LUFS / true peak) ----------------
+    def _build_target_bar(self):
+        P = PAL
+        bar = tk.Frame(self, bg=P["bottom"])
+        bar.pack(side="top", fill="x", padx=u(18), pady=(u(12), 0))
+        tk.Label(bar, text="Loudness target:", bg=P["bottom"], fg=P["ink"],
+                 font=fnt(28, True)).pack(side="left")
+        self._presets = [f"{n}  ({l:g} LUFS, {tp:g} dBTP)" for n, l, tp in LOUDNESS_TARGETS] + ["Custom"]
+        self.tgt_combo = ttk.Combobox(bar, values=self._presets, state="readonly", width=46)
+        self.tgt_combo.pack(side="left", padx=u(10))
+        self.tgt_combo.current(0)
+        self.lufs_var = tk.StringVar(value=f"{LOUDNESS_TARGETS[0][1]:g}")
+        self.tp_var = tk.StringVar(value=f"{LOUDNESS_TARGETS[0][2]:g}")
+        tk.Label(bar, text="LUFS", bg=P["bottom"], fg=P["ink"], font=fnt(26)).pack(side="left")
+        ttk.Spinbox(bar, from_=-40, to=-5, increment=0.5, width=6, textvariable=self.lufs_var).pack(side="left", padx=(u(6), u(14)))
+        tk.Label(bar, text="True-peak ceiling", bg=P["bottom"], fg=P["ink"], font=fnt(26)).pack(side="left")
+        ttk.Spinbox(bar, from_=-9, to=0, increment=0.1, width=5, textvariable=self.tp_var).pack(side="left", padx=(u(6), u(14)))
+        self.gap_lbl = tk.Label(bar, text="", bg=P["bottom"], fg=P["navy"], font=fnt(26, True))
+        self.gap_lbl.pack(side="left", padx=u(10))
+        self._tgt_busy = False
+        self.tgt_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_preset())
+        self.lufs_var.trace_add("write", lambda *_a: self._on_target_edit())
+        self.tp_var.trace_add("write", lambda *_a: self._on_target_edit())
+        self._update_gap_label()
+
+    def _update_gap_label(self):
+        a = self.analyzer
+        if not self.stats.loud_ok:
+            self.gap_lbl.config(text="")
+            return
+        gap = a.loudness_gap()
+        tp_after = self.stats.true_peak_db + gap
+        txt = f"gain {gap:+.1f} dB"
+        if tp_after > a.targets["ceiling_dbtp"]:
+            txt += f"  \u00b7  limiter will remove {tp_after - a.targets['ceiling_dbtp']:.1f} dB of peaks"
+        self.gap_lbl.config(text=txt)
+
+    def _on_preset(self):
+        i = self.tgt_combo.current()
+        if 0 <= i < len(LOUDNESS_TARGETS):
+            self._tgt_busy = True
+            self.lufs_var.set(f"{LOUDNESS_TARGETS[i][1]:g}")
+            self.tp_var.set(f"{LOUDNESS_TARGETS[i][2]:g}")
+            self._tgt_busy = False
+            self._on_target_edit()
+
+    def _on_target_edit(self):
+        if getattr(self, "_tgt_busy", True):
+            return
+        try:
+            lufs = max(-40.0, min(-5.0, float(self.lufs_var.get())))
+            tp = max(-9.0, min(0.0, float(self.tp_var.get())))
+        except ValueError:
+            return
+        t = self.analyzer.targets
+        t["target_lufs"], t["ceiling_dbtp"] = lufs, tp
+        match = [i for i, (_n, l, p) in enumerate(LOUDNESS_TARGETS) if abs(l - lufs) < 1e-6 and abs(p - tp) < 1e-6]
+        self.tgt_combo.current(match[0] if match else len(self._presets) - 1)
+        for rec in self.recommendations:
+            if rec.key == "loudness":
+                rec.reason = self.analyzer.loudness_reason()
+                rec.enabled.set(self.analyzer.loudness_needed())
+                rec.weight = 9.0 if self.analyzer.loudness_needed() else 3.0
+        self._update_gap_label()
+        if hasattr(self, "inner"):
+            self._rebuild_rows()
+
+    def _rebuild_rows(self):
+        for w in self.inner.winfo_children():
+            w.destroy()
+        self.row_frames = []
+        for idx, rec in enumerate(self.recommendations):
+            self._add_recommendation_row(self.inner, idx, rec)
+        self._update_preview()
+
+    def _add_recommendation_row(self, parent, idx, rec):
+        bg = self._row_bg(rec)
+        border = self._row_border(rec)
+
+        row = tk.Frame(parent, bg=bg, highlightthickness=max(1, u(3)),
+                       highlightbackground=border, highlightcolor=border)
+        row.pack(fill="x", padx=u(10), pady=u(7))
+
+        top = tk.Frame(row, bg=bg)
+        top.pack(fill="x", padx=u(12), pady=(u(10), 0))
+
+        chk = LargeCheck(top, rec.enabled,
+                         on_change=lambda r=rec: self._on_row_toggle(r),
+                         bg_getter=lambda r=rec: self._row_bg(r),
+                         size=u(46))
+        chk.pack(side="left", padx=(0, u(14)))
+
+        title_lbl = tk.Label(top, text=f"{idx + 1}.  {rec.title}",
+                             bg=bg, fg="#e4ebf8",
+                             font=fnt(30, True), anchor="w")
+        title_lbl.pack(side="left", fill="x", expand=True)
+
+        star = "\u2605" if rec.weight >= 8 else ("\u2606" if rec.weight >= 5 else "\u00b7")
+        stars = star * max(1, int(rec.weight / 2.5))
+        star_lbl = tk.Label(top, text=stars, bg=bg, fg="#ffb400",
+                            font=fnt(30, True))
+        star_lbl.pack(side="right")
+
+        reason_lbl = tk.Label(row, text=rec.reason, bg=bg, fg="#c7d2e8",
+                              font=fnt(26), anchor="w", justify="left",
+                              wraplength=u(1500))
+        reason_lbl.pack(fill="x", padx=u(12), pady=(u(4), 0))
+
+        param_lbl = tk.Label(row, text="\u2192 " + rec.describe_params(),
+                             bg=bg, fg="#7db3ff",
+                             font=fnt(26), anchor="w")
+        param_lbl.pack(fill="x", padx=u(12), pady=(0, u(10)))
+
+        self.row_frames.append((row, chk,
+                                [top, title_lbl, star_lbl,
+                                 reason_lbl, param_lbl], rec))
+
+    def _on_row_toggle(self, rec):
+        self._retint_row(rec)
+        self._update_preview()
+
+    def _retint_row(self, rec):
+        bg = self._row_bg(rec)
+        border = self._row_border(rec)
+        for row, chk, children, r in self.row_frames:
+            if r is not rec:
+                continue
+            row.configure(bg=bg, highlightbackground=border,
+                          highlightcolor=border)
+            for w in children:
+                try:
+                    w.configure(bg=bg)
+                except tk.TclError:
+                    pass
+            chk.refresh_bg()
+            break
+
+    def _refresh_all_rows(self):
+        for row, chk, children, rec in self.row_frames:
+            bg = self._row_bg(rec)
+            border = self._row_border(rec)
+            row.configure(bg=bg, highlightbackground=border,
+                          highlightcolor=border)
+            for w in children:
+                try:
+                    w.configure(bg=bg)
+                except tk.TclError:
+                    pass
+            chk.refresh_bg()
+        self._update_preview()
+
+    def _update_preview(self):
+        n = sum(1 for r in self.recommendations if r.enabled.get())
+        total = len(self.recommendations)
+        if total == 0:
+            self.preview_lbl.config(text="No recommendations \u2014 audio is already 5_Star.")
+        else:
+            self.preview_lbl.config(text=f"{n} of {total} step(s) enabled.\n"
+                                         f"Estimated time: {n * 0.6:.1f}s")
+
+    # ---------------- base name for output ----------------
+    def _song_base_name(self):
+        """Return the song's base name (no folder, no extension).
+
+        Priority:
+          1. project file path (if saved)
+          2. source audio file path remembered on the track
+          3. the track's name (fallback)
+        """
+        base = None
+        if self.app.proj.path:
+            base = os.path.splitext(os.path.basename(self.app.proj.path))[0]
+        if not base:
+            src = getattr(self.target_track, "source_path", None)
+            if src:
+                base = os.path.splitext(os.path.basename(src))[0]
+        if not base:
+            base = self.target_track.name or "audio"
+        # sanitize
+        for ch in '<>:"/\\|?*':
+            base = base.replace(ch, "_")
+        return base
+
+    # ---------------- run ----------------
+    def run(self):
+        selected = [r for r in self.recommendations if r.enabled.get()]
+        if not selected:
+            messagebox.showinfo("Audio Plus",
+                                "Tick at least one recommendation first.",
+                                parent=self)
+            return
+        self.run_btn.state(["disabled"])
+        self.config(cursor="watch")
+        self.update_idletasks()
+
+        data = self.original.copy()
+        rate = self.rate
+        report = []
+        saved_to = None
+        try:
+            for rec in sorted(selected, key=lambda r: r.priority):
+                try:
+                    data = rec.effect(data, rate)
+                    if data.ndim != 2 or data.shape[1] != 2:
+                        data = to_stereo(data)
+                    report.append(f"\u2713 {rec.title}")
+                except Exception as ex:
+                    report.append(f"\u2717 {rec.title}: {ex}")
+
+            # The enhanced audio goes on a NEW track directly beneath the source; the source is not touched.
+            self.app.proj.push_undo()
+            src = self.target_track
+            track = src.clone()
+            track.data = to_stereo(data)
+            track.name = f"{src.name} (5_Star)"
+            track.mute = track.solo = False
+            tracks = self.app.proj.tracks
+            pos = tracks.index(src) + 1 if src in tracks else len(tracks)
+            tracks.insert(pos, track)
+            self.app.selected = {pos}
+            report.append("")
+            report.append(f"\u2192 New track \u201c{track.name}\u201d was placed under \u201c{src.name}\u201d. "
+                          "The original track is unchanged (use Mute / Solo to compare them).")
+
+            final_stats = AudioAnalyzer().analyze(track.data, rate)
+            report.append("")
+            for tag, st_ in (("Before", self.stats), ("After ", final_stats)):
+                report.append(f"{tag}: " + st_.summary())
+                report.append("        " + st_.loudness_line())
+                report.append("        " + st_.health_line())
+            tg = self.analyzer.targets
+            report.append(f"Loudness target: {tg['target_lufs']:g} LUFS / {tg['ceiling_dbtp']:g} dBTP "
+                          f"\u2192 reached {final_stats.lufs_i:.1f} LUFS, {final_stats.true_peak_db:+.1f} dBTP")
+
+            out_path = self._choose_output_path()
+            if out_path:
+                try:
+                    save_audio(out_path, track.data, rate)
+                    saved_to = out_path
+                    report.append(f"Saved: {os.path.basename(out_path)}")
+                    sidecar = out_path + ".enhanced.txt"
+                    with open(sidecar, "w", encoding="utf-8") as f:
+                        f.write("Studio Audio Editor - Auto 5_Star Enhance report\n")
+                        f.write(f"Source: {self.app.proj.path or '(unsaved project)'}\n")
+                        f.write(f"Source track: {src.name} (unchanged)\n")
+                        f.write(f"Enhanced track: {track.name}\n")
+                        f.write(f"Rate: {rate} Hz\n")
+                        f.write(f"Before: {self.stats.full_summary()}\n")
+                        f.write(f"After:  {final_stats.full_summary()}\n")
+                        f.write(f"Loudness target: {tg['target_lufs']:g} LUFS / {tg['ceiling_dbtp']:g} dBTP\n\n")
+                        f.write("Recommendations applied:\n")
+                        for rec in sorted(selected, key=lambda r: r.priority):
+                            f.write(f"  - {rec.title}\n")
+                            f.write(f"    {rec.describe_params()}\n")
+                            f.write(f"    {rec.reason}\n")
+                    report.append(f"Report: {os.path.basename(sidecar)}")
+                    push_recent(out_path)
+                    self.app._rebuild_recent_menu()
+                except Exception as ex:
+                    report.append(f"Save failed: {ex}")
+        finally:
+            self.config(cursor="")
+            self.app.after_edit()
+
+        self._show_summary(report, saved_to)
+        self.destroy()
+
+    def _choose_output_path(self):
+        base = self._song_base_name()
+        default_name = f"{base}_Enhanced_5_Star.wav"
+        if self.app.proj.path:
+            folder = os.path.dirname(self.app.proj.path)
+        else:
+            src = getattr(self.target_track, "source_path", None)
+            folder = os.path.dirname(src) if src else os.path.expanduser("~")
+        return filedialog.asksaveasfilename(
+            parent=self, title="Save enhanced audio",
+            initialfile=default_name,
+            initialdir=folder,
+            defaultextension=".wav",
+            filetypes=[("WAV", "*.wav"), ("MP3", "*.mp3"),
+                       ("FLAC", "*.flac"), ("OGG", "*.ogg")])
+
+    def _show_summary(self, report, saved_to):
+        win = tk.Toplevel(self)
+        win.title("Auto 5_Star Enhance \u2014 Complete")
+        win.transient(self)
+        place_window(win, u(900), u(680), self)
+        tk.Label(win, text="\u2605 Enhancement complete",
+                 bg="#1f2530", fg="#ffd966",
+                 font=fnt(38, True)).pack(fill="x", padx=u(14), pady=u(14))
+        txt = tk.Text(win, font=fnt(26), wrap="word", height=16)
+        txt.pack(fill="both", expand=True, padx=u(14), pady=u(10))
+        txt.insert("1.0", "\n".join(report))
+        txt.configure(state="disabled")
+        bar = tk.Frame(win)
+        bar.pack(fill="x", padx=u(14), pady=(0, u(12)))
+        if saved_to and os.path.exists(saved_to):
+            def play_now():
+                try:
+                    data, rate = load_audio(saved_to)
+                    self.app.player.start(data, rate, loop=False)
+                    self.app.play_origin = 0
+                    self.app.play_speed = 1.0
+                except Exception as ex:
+                    messagebox.showerror("Play", str(ex), parent=win)
+            ttk.Button(bar, text="\u25b6 Play Test",
+                       command=play_now).pack(side="left", padx=u(5))
+        ttk.Button(bar, text="Close",
+                   command=win.destroy).pack(side="right", padx=u(5))
+
+
+# =====================================================================
+#  AUDIO HEALTH CHECK  (loudness / clipping / tone / mono compatibility)
+# =====================================================================
+class EqualizerDialog(tk.Toplevel):
+    """Pro-style Music Volume + 10-band Equalizer: live response curve, LED faders, level meters, presets."""
+
+    W, H = 820, 750                                 # narrow and tall: long fader travel
+    BG, PANEL, EDGE = "#0d1119", "#151b29", "#2a3350"
+    CX0, CX1, CY0, CY1 = 40, 640, 22, 190          # response-curve area
+    FP = 234                                        # top of the fader panels
+    TY, BY = 296, 696                               # fader track top / bottom (set again in __init__)
+    COL0, COLW = 40, 60                             # first fader x, spacing
+    VOLP, VOLX, METX = 668, 705, 758                # music-volume panel left, its fader x, first meter x
+    NAMES = ["SUB", "BASS", "LOW", "LOW-MID", "MID", "UP-MID", "PRESENCE", "TREBLE", "BRILL.", "AIR"]
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.eq = app.proj.eq
+        self.title("Equalizer  \u00b7  Music Volume")
+        travel = max(150, min(400, app.winfo_screenheight() - 690))   # fits the screen incl. title/preset/slider rows
+        self.TY, self.BY = 296, 296 + travel
+        self.H = self.BY + 54
+        self.configure(bg=self.BG)
+        self.transient(app)
+        self.resizable(False, False)
+        self.user = _load_user_eq()
+        self._drag = None
+        self._alive = True
+        self._pk = [0.0, 0.0]
+        F = ("Segoe UI", 10, "bold")
+
+        top = tk.Frame(self, bg=self.BG)
+        top.pack(fill="x", padx=14, pady=(10, 4))
+        tk.Label(top, text="STUDIO EQ", bg=self.BG, fg="#35e0ff", font=("Segoe UI", 18, "bold")).pack(side="left")
+        tk.Label(top, text="  10-BAND", bg=self.BG, fg="#6b7a9c",
+                 font=("Segoe UI", 9, "bold")).pack(side="left", pady=(8, 0))
+        self.en_var = tk.BooleanVar(value=self.eq.enabled)
+        tk.Checkbutton(top, text="EQ ON", variable=self.en_var, command=self._flags, bg=self.BG, fg="#7dff9a",
+                       selectcolor="#0d1119", activebackground=self.BG, activeforeground="#7dff9a",
+                       font=F, bd=0, highlightthickness=0).pack(side="right", padx=(10, 0))
+        top2 = tk.Frame(self, bg=self.BG)
+        top2.pack(fill="x", padx=14, pady=(0, 2))
+        tk.Label(top2, text="PRESET", bg=self.BG, fg="#6b7a9c", font=("Segoe UI", 9, "bold")).pack(side="left")
+        self.preset_var = tk.StringVar(value=self.eq.preset)
+        self.menu_btn = tk.OptionMenu(top2, self.preset_var, "")
+        self.menu_btn.config(bg="#243055", fg="white", activebackground="#33447a", activeforeground="white",
+                             font=F, width=11, bd=0, highlightthickness=1, highlightbackground="#35e0ff",
+                             indicatoron=True)
+        self.menu_btn["menu"].config(bg="#1b2238", fg="white", activebackground="#35e0ff",
+                                     activeforeground="#0d1119", font=("Segoe UI", 10))
+        self.menu_btn.pack(side="left", padx=6)
+        self._btn(top2, "Save preset", self._save_preset, "#1f4d7a").pack(side="left", padx=3)
+        self._btn(top2, "Delete", self._del_preset, "#5a2233").pack(side="left", padx=3)
+
+        self.cv = tk.Canvas(self, width=self.W, height=self.H, bg=self.BG, highlightthickness=0, bd=0)
+        self.cv.pack(padx=8)
+        self.cv.bind("<ButtonPress-1>", self._press)
+        self.cv.bind("<B1-Motion>", self._move)
+        self.cv.bind("<ButtonRelease-1>", lambda _e: setattr(self, "_drag", None))
+        self.cv.bind("<Double-Button-1>", self._dbl)
+        self.cv.bind("<MouseWheel>", self._wheel)
+
+        sp = tk.Frame(self, bg=self.PANEL, highlightbackground=self.EDGE, highlightthickness=1)
+        sp.pack(fill="x", padx=18, pady=(2, 6))
+        self.width_var = tk.DoubleVar(value=self.eq.width)
+        self.surr_var = tk.DoubleVar(value=self.eq.surround)
+        self.width_lbl = self._spatial_row(sp, 0, "STEREO WIDTH", self.width_var, 0, 200, "#35e0ff", self._on_width)
+        self.surr_lbl = self._spatial_row(sp, 1, "VIRTUAL SURROUND", self.surr_var, 0, 100, "#c58cff", self._on_surr)
+        self._sync_spatial()
+
+        bar = tk.Frame(self, bg=self.BG)
+        bar.pack(fill="x", padx=14, pady=(2, 10))
+        self.prot_var = tk.BooleanVar(value=self.eq.protect)
+        tk.Checkbutton(bar, text="Prevent clipping (auto headroom)", variable=self.prot_var, command=self._flags,
+                       bg=self.BG, fg="#c8d2ee", selectcolor="#0d1119", activebackground=self.BG,
+                       activeforeground="white", font=("Segoe UI", 10), bd=0, highlightthickness=0).pack(side="left")
+        self._btn(bar, "\u25B6  Play / Stop", self.app.toggle_play, "#1d7a46").pack(side="left", padx=14)
+        self._btn(bar, "Reset to Flat", self._reset, "#3a4468").pack(side="left")
+        self._btn(bar, "Close", self.destroy, "#3a4468").pack(side="right")
+        tk.Label(self, text="Drag the faders or curve dots  \u00b7  double-click = 0 dB  \u00b7  mouse wheel = fine adjust",
+                 bg=self.BG, fg="#5d6b8e", font=("Segoe UI", 9)).pack(pady=(0, 10))
+
+        self._refill()
+        self._draw()
+        self.bind("<Escape>", lambda _e: self.destroy())
+        place_window(self, parent=app)
+        self.after(50, self._tick)
+
+    # ---------- small helpers ----------
+    def _btn(self, parent, text, cmd, bg):
+        return tk.Button(parent, text=text, command=cmd, bg=bg, fg="white", activebackground="#4a5a90",
+                         activeforeground="white", font=("Segoe UI", 10, "bold"), bd=0, padx=12, pady=4,
+                         relief="flat", cursor="hand2")
+
+    def destroy(self):
+        self._alive = False
+        super().destroy()
+
+    @staticmethod
+    def _lerp(c1, c2, t):
+        t = max(0.0, min(1.0, t))
+        a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+        b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+        return "#%02x%02x%02x" % tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+    def _gcol(self, db):
+        if not self.eq.enabled:
+            return "#59627a"
+        if db >= 0:
+            return self._lerp("#ffd23f", "#ff7a1a", db / 6) if db < 6 else self._lerp("#ff7a1a", "#ff2d55", (db - 6) / 6)
+        return self._lerp("#35e0ff", "#2f80ff", -db / 6) if db > -6 else self._lerp("#2f80ff", "#8a5cff", (-db - 6) / 6)
+
+    def _vcol(self, db):
+        if db >= 0:
+            return self._lerp("#3dff8b", "#ffd23f", db / 8) if db < 8 else self._lerp("#ffd23f", "#ff3b3b", (db - 8) / 4)
+        return self._lerp("#3dff8b", "#35a0ff", -db / 12)
+
+    def _fy(self, db):
+        return self.TY + (EQ_RANGE - db) / (2 * EQ_RANGE) * (self.BY - self.TY)
+
+    def _cy(self, db):
+        return self.CY0 + (EQ_RANGE - db) / (2 * EQ_RANGE) * (self.CY1 - self.CY0)
+
+    def _fx(self, f):
+        return self.CX0 + math.log(f / 20.0) / math.log(1000.0) * (self.CX1 - self.CX0)
+
+    def _colx(self, i):
+        return self.COL0 + self.COLW // 2 + i * self.COLW
+
+    # ---------- width / surround sliders ----------
+    def _spatial_row(self, parent, col, title, var, lo, hi, color, cmd):
+        f = tk.Frame(parent, bg=self.PANEL)
+        f.grid(row=col, column=0, padx=16, pady=3, sticky="w")
+        tk.Label(f, text=title, bg=self.PANEL, fg=color, font=("Segoe UI", 9, "bold"), width=17,
+                 anchor="w").pack(side="left")
+        tk.Scale(f, from_=lo, to=hi, resolution=1, orient="horizontal", length=400, variable=var, showvalue=False,
+                 bg="#aab6d8", fg="white", troughcolor="#252f4a", highlightthickness=0, bd=0,
+                 activebackground=color, sliderrelief="raised", sliderlength=26, width=16,
+                 command=cmd).pack(side="left", padx=6)
+        lbl = tk.Label(f, text="", bg=self.PANEL, fg=color, font=("Segoe UI", 10, "bold"), width=6)
+        lbl.pack(side="left")
+        return lbl
+
+    def _sync_spatial(self):
+        self._busy = True
+        self.width_var.set(self.eq.width)
+        self.surr_var.set(self.eq.surround)
+        self.width_lbl.config(text=f"{self.eq.width:.0f}%")
+        self.surr_lbl.config(text=f"{self.eq.surround:.0f}%")
+        self._busy = False
+
+    def _on_width(self, _v=None):
+        if getattr(self, "_busy", False):
+            return
+        self.eq.width = float(self.width_var.get())
+        self.width_lbl.config(text=f"{self.eq.width:.0f}%")
+        self.eq.preset = "Custom"
+        self.preset_var.set("Custom")
+        self._touch()
+
+    def _on_surr(self, _v=None):
+        if getattr(self, "_busy", False):
+            return
+        self.eq.surround = float(self.surr_var.get())
+        self.surr_lbl.config(text=f"{self.eq.surround:.0f}%")
+        self.eq.preset = "Custom"
+        self.preset_var.set("Custom")
+        self._touch()
+
+    # ---------- presets ----------
+    def _names(self):
+        return list(EQ_PRESETS) + list(SURROUND_PRESETS) + sorted(self.user) + ["Custom"]
+
+    def _refill(self):
+        m = self.menu_btn["menu"]
+        m.delete(0, "end")
+        groups = [list(EQ_PRESETS), ["Surround:  " + n for n in SURROUND_PRESETS], sorted(self.user)]
+        for gi, grp in enumerate(groups):
+            if gi and grp:
+                m.add_separator()
+            for n in grp:
+                real = n.replace("Surround:  ", "")
+                m.add_command(label=n, command=lambda r=real: self._pick(r))
+        m.add_separator()
+        m.add_command(label="Custom", command=lambda: self._pick("Custom"))
+        if self.preset_var.get() not in self._names():
+            self.preset_var.set("Custom")
+
+    def _touch(self):
+        self.eq.changed()
+        self.app.proj.dirty = True
+        self._draw()
+
+    def _pick(self, name):
+        self.preset_var.set(name)
+        if name in EQ_PRESETS:
+            self.eq.gains = [float(g) for g in EQ_PRESETS[name]]
+            self.eq.width, self.eq.surround = 100.0, 0.0
+        elif name in SURROUND_PRESETS:
+            g, vol, w, sur = SURROUND_PRESETS[name]
+            self.eq.gains, self.eq.volume_db = [float(x) for x in g], float(vol)
+            self.eq.width, self.eq.surround = float(w), float(sur)
+        elif name in self.user:
+            u_ = self.user[name]
+            self.eq.gains = list(u_[:10])
+            self.eq.volume_db = u_[10]
+            self.eq.width = u_[11] if len(u_) > 11 else 100.0
+            self.eq.surround = u_[12] if len(u_) > 12 else 0.0
+        else:
+            return
+        self._sync_spatial()
+        self.eq.preset = name
+        self.app.status_var.set(f"Equalizer preset: {name}")
+        self._touch()
+
+    def _flags(self):
+        self.eq.enabled = bool(self.en_var.get())
+        self.eq.protect = bool(self.prot_var.get())
+        self._touch()
+
+    def _reset(self):
+        self.eq.gains = [0.0] * 10
+        self.eq.volume_db = 0.0
+        self.eq.width, self.eq.surround = 100.0, 0.0
+        self._sync_spatial()
+        self.eq.preset = "Flat"
+        self.preset_var.set("Flat")
+        self._touch()
+
+    def _save_preset(self):
+        name = simpledialog.askstring("Save preset", "Preset name:", parent=self)
+        if not name or not name.strip():
+            return
+        name = name.strip()
+        if name in EQ_PRESETS or name in SURROUND_PRESETS or name == "Custom":
+            return messagebox.showinfo("Save preset", "That name is built in. Pick another name.", parent=self)
+        self.user[name] = [float(g) for g in self.eq.gains] + [float(self.eq.volume_db),
+                                                                 float(self.eq.width), float(self.eq.surround)]
+        _save_user_eq(self.user)
+        self.eq.preset = name
+        self.preset_var.set(name)
+        self._refill()
+
+    def _del_preset(self):
+        name = self.preset_var.get()
+        if name in self.user:
+            del self.user[name]
+            _save_user_eq(self.user)
+            self.preset_var.set("Custom")
+            self.eq.preset = "Custom"
+            self._refill()
+
+    # ---------- mouse ----------
+    def _hit(self, x, y):
+        for i in range(10):
+            if abs(x - self._colx(i)) <= 30 and self.TY - 14 <= y <= self.BY + 14:
+                return ("band", i, "fader")
+        for i, f in enumerate(EQ_FREQS):
+            if abs(x - self._fx(f)) <= 14 and abs(y - self._cy(self.eq.gains[i])) <= 14:
+                return ("band", i, "dot")
+        if abs(x - self.VOLX) <= 30 and self.TY - 14 <= y <= self.BY + 14:
+            return ("vol", 0, "fader")
+        return None
+
+    def _set_from_y(self, kind, i, y, area):
+        if area == "dot":
+            y0, y1 = self.CY0, self.CY1
+        else:
+            y0, y1 = self.TY, self.BY
+        db = EQ_RANGE - (y - y0) / (y1 - y0) * 2 * EQ_RANGE
+        db = round(max(-EQ_RANGE, min(EQ_RANGE, db)) * 2) / 2
+        if kind == "band":
+            self.eq.gains[i] = db
+            self.eq.preset = "Custom"
+            self.preset_var.set("Custom")
+        else:
+            self.eq.volume_db = db
+        self._touch()
+
+    def _press(self, ev):
+        self._drag = self._hit(ev.x, ev.y)
+        if self._drag:
+            self._set_from_y(self._drag[0], self._drag[1], ev.y, self._drag[2])
+
+    def _move(self, ev):
+        if self._drag:
+            self._set_from_y(self._drag[0], self._drag[1], ev.y, self._drag[2])
+
+    def _dbl(self, ev):
+        h = self._hit(ev.x, ev.y)
+        if h:
+            if h[0] == "band":
+                self.eq.gains[h[1]] = 0.0
+                self.eq.preset = "Custom"
+                self.preset_var.set("Custom")
+            else:
+                self.eq.volume_db = 0.0
+            self._touch()
+
+    def _wheel(self, ev):
+        h = self._hit(ev.x, ev.y)
+        if h:
+            step = 0.5 if ev.delta > 0 else -0.5
+            if h[0] == "band":
+                self.eq.gains[h[1]] = max(-EQ_RANGE, min(EQ_RANGE, self.eq.gains[h[1]] + step))
+                self.eq.preset = "Custom"
+                self.preset_var.set("Custom")
+            else:
+                self.eq.volume_db = max(-EQ_RANGE, min(EQ_RANGE, self.eq.volume_db + step))
+            self._touch()
+
+    # ---------- drawing ----------
+    def _response_db(self, freqs):
+        rate = self.app.proj.rate or 44100
+        s = self.eq.sos(rate)
+        if s is None or not self.eq.enabled:
+            return np.zeros(len(freqs))
+        _w, h = signal.sosfreqz(s, worN=2 * np.pi * freqs / rate)
+        return 20 * np.log10(np.maximum(np.abs(h), 1e-6))
+
+    def _draw(self):
+        c = self.cv
+        c.delete("all")
+        on = self.eq.enabled
+        # ----- curve panel
+        c.create_rectangle(self.CX0 - 12, self.CY0 - 12, self.CX1 + 12, self.CY1 + 30, fill=self.PANEL,
+                           outline=self.EDGE)
+        for db in (-12, -6, 0, 6, 12):
+            y = self._cy(db)
+            c.create_line(self.CX0, y, self.CX1, y, fill="#55658f" if db == 0 else "#33406a",
+                          width=2 if db == 0 else 1)
+            c.create_text(self.CX0 - 16, y, text=f"{db:+d}" if db else "0", fill="#6b7a9c",
+                          font=("Segoe UI", 8), anchor="e")
+        for f, lab in ((20, "20"), (50, "50"), (100, "100"), (200, "200"), (500, "500"), (1000, "1k"),
+                       (2000, "2k"), (5000, "5k"), (10000, "10k"), (20000, "20k")):
+            x = self._fx(f)
+            c.create_line(x, self.CY0, x, self.CY1, fill="#4a5a88" if f in (100, 1000, 10000) else "#33406a",
+                          width=2 if f in (100, 1000, 10000) else 1)
+            c.create_text(x, self.CY1 + 14, text=lab, fill="#6b7a9c", font=("Segoe UI", 8))
+        for dec in (10, 100, 1000, 10000):                      # minor vertical lines (30, 40, 60 ... 9k)
+            for m in (3, 4, 6, 7, 8, 9):
+                fm = dec * m
+                if 20 < fm < 20000:
+                    xm = self._fx(fm)
+                    c.create_line(xm, self.CY0, xm, self.CY1, fill="#232d4a")
+        for i, fb in enumerate(EQ_FREQS):                       # one dotted marker per EQ band
+            xb = self._fx(fb)
+            c.create_line(xb, self.CY0, xb, self.CY1, fill=self._lerp(self.PANEL, self._gcol(self.eq.gains[i]), 0.55),
+                          dash=(3, 5))
+        freqs = np.geomspace(20, 20000, 240)
+        resp = np.clip(self._response_db(freqs), -EQ_RANGE, EQ_RANGE)
+        zero = self._cy(0)
+        pts = []
+        for f, r in zip(freqs, resp):
+            x, y = self._fx(f), self._cy(float(r))
+            c.create_line(x, zero, x, y, fill=self._lerp(self.BG, self._gcol(float(r)), 0.45), width=3)
+            pts += [x, y]
+        c.create_line(*pts, fill=self._gcol(float(np.max(np.abs(resp)))) if on else "#59627a",
+                      width=3, smooth=True)
+        for i, f in enumerate(EQ_FREQS):
+            g = self.eq.gains[i]
+            x, y = self._fx(f), self._cy(g)
+            col = self._gcol(g)
+            c.create_oval(x - 8, y - 8, x + 8, y + 8, fill="", outline=self._lerp(self.BG, col, 0.5), width=2)
+            c.create_oval(x - 5, y - 5, x + 5, y + 5, fill=col, outline="white")
+        # ----- band faders
+        c.create_rectangle(self.COL0 - 8, self.FP, self.CX1 + 12, self.H - 14, fill=self.PANEL, outline=self.EDGE)
+        c.create_text(self.COL0 + 2, self.FP + 12, text="BAND GAIN  (dB)", fill="#6b7a9c", font=("Segoe UI", 8, "bold"),
+                      anchor="w")
+        segh = (self.BY - self.TY) / 24.0
+        for i in range(10):
+            cx, g = self._colx(i), self.eq.gains[i]
+            for k in range(24):
+                cen = 11.5 - k
+                lit = on and ((0 < cen <= g) or (g < 0 and g <= cen < 0))
+                y1 = self.TY + k * segh
+                c.create_rectangle(cx - 13, y1 + 1, cx + 13, y1 + segh - 1,
+                                   fill=self._gcol(cen) if lit else "#1b2236", outline="")
+            c.create_line(cx, self.TY, cx, self.BY, fill="#0a0e16", width=3)
+            y = self._fy(g)
+            c.create_rectangle(cx - 19, y - 8, cx + 19, y + 8, fill="#cfd6e6", outline="#ffffff", width=1)
+            c.create_rectangle(cx - 19, y + 2, cx + 19, y + 8, fill="#9aa5c0", outline="")
+            c.create_line(cx - 15, y, cx + 15, y, fill=self._gcol(g), width=3)
+            c.create_text(cx, self.TY - 14, text=f"{g:+.1f}", fill=self._gcol(g), font=("Segoe UI", 9, "bold"))
+            lab = EQ_LABELS[i] + ("" if EQ_LABELS[i].endswith("k") else " Hz")
+            c.create_text(cx, self.BY + 18, text=lab + ("Hz" if EQ_LABELS[i].endswith("k") else ""), fill="#e6ecff",
+                          font=("Segoe UI", 9, "bold"))
+            c.create_text(cx, self.BY + 34, text=self.NAMES[i], fill="#6b7a9c", font=("Segoe UI", 7, "bold"))
+        zy = self._fy(0)
+        c.create_line(self.COL0, zy, self.CX1, zy, fill="#ffffff", dash=(2, 4))
+        for db in (12, 6, 0, -6, -12):
+            c.create_text(self.COL0 - 2, self._fy(db), text=f"{db:+d}" if db else "0", fill="#4f5c7d",
+                          font=("Segoe UI", 7), anchor="e")
+        # ----- music volume + meters
+        c.create_rectangle(self.VOLP, self.FP, self.W - 8, self.H - 14, fill=self.PANEL, outline=self.EDGE)
+        c.create_text(self.VOLP + 10, self.FP + 12, text="MUSIC VOLUME", fill="#6b7a9c", font=("Segoe UI", 8, "bold"), anchor="w")
+        v = self.eq.volume_db
+        for k in range(24):
+            cen = 11.5 - k
+            lit = (0 < cen <= v) or (v < 0 and v <= cen < 0)
+            y1 = self.TY + k * segh
+            c.create_rectangle(self.VOLX - 13, y1 + 1, self.VOLX + 13, y1 + segh - 1,
+                               fill=self._vcol(cen) if lit else "#1b2236", outline="")
+        c.create_line(self.VOLX, self.TY, self.VOLX, self.BY, fill="#0a0e16", width=3)
+        y = self._fy(v)
+        c.create_rectangle(self.VOLX - 19, y - 8, self.VOLX + 19, y + 8, fill="#cfd6e6", outline="#ffffff")
+        c.create_rectangle(self.VOLX - 19, y + 2, self.VOLX + 19, y + 8, fill="#9aa5c0", outline="")
+        c.create_line(self.VOLX - 15, y, self.VOLX + 15, y, fill=self._vcol(v), width=3)
+        c.create_text(self.VOLX, self.TY - 14, text=f"{v:+.1f}", fill=self._vcol(v), font=("Segoe UI", 9, "bold"))
+        c.create_text(self.VOLX, self.BY + 18, text="LEVEL dB", fill="#e6ecff", font=("Segoe UI", 9, "bold"))
+        for j, lab in enumerate(("L", "R")):
+            c.create_text(self.METX + j * 32, self.BY + 18, text=lab, fill="#e6ecff", font=("Segoe UI", 9, "bold"))
+        c.create_text(self.METX + 16, self.BY + 34, text="OUTPUT", fill="#6b7a9c", font=("Segoe UI", 7, "bold"))
+        self._draw_meters()
+
+    def _draw_meters(self):
+        c = self.cv
+        c.delete("meter")
+        segh = (self.BY - self.TY) / 24.0
+        try:
+            l, r = self.app.player.level()
+        except Exception:
+            l = r = 0.0
+        g = self.eq.gain_lin() if self.eq.enabled else 1.0
+        for j, val in enumerate((l * g, r * g)):
+            self._pk[j] = max(val, self._pk[j] * 0.86)
+            db = 20 * math.log10(max(self._pk[j], 1e-6))
+            x = self.METX + j * 32
+            for k in range(24):
+                low = -k * 2.5 - 2.5
+                col = "#ff3b3b" if k < 2 else ("#ffd23f" if k < 6 else "#3dff8b")
+                lit = db >= low
+                y1 = self.TY + k * segh
+                c.create_rectangle(x - 10, y1 + 1, x + 10, y1 + segh - 1,
+                                   fill=col if lit else "#1b2236", outline="", tags="meter")
+
+    def _tick(self):
+        if not self._alive:
+            return
+        try:
+            self._draw_meters()
+        except tk.TclError:
+            return
+        self.after(50, self._tick)
+
+
+class HealthCheckDialog(tk.Toplevel):
+    COL = {"Good": "#2e9d52", "Caution": "#d98a12", "Poor": "#c83c3c", "Info": "#4a6fb0"}
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        tracks = app.targets()
+        if not tracks:
+            self.destroy()
+            messagebox.showinfo("Audio Health Check", "Load or select some audio first.")
+            return
+        self.title("Audio Health Check")
+        self.transient(app)
+        self.configure(bg=PAL["bottom"])
+        self.config(cursor="watch")
+        self.update_idletasks()
+        mix = _mix_for_key([(t.data, t.offset) for t in tracks])
+        rate = app.proj.rate
+        self.rate = rate
+        try:
+            self.stats = AudioAnalyzer().analyze(mix, rate)
+        finally:
+            self.config(cursor="")
+        self.n_tracks = len(tracks)
+        place_window(self, u(1560), u(1290), app)
+        self._build()
+        self.bind("<Escape>", lambda _e: self.destroy())
+
+    # ---- status helpers ----
+    def _loud_status(self):
+        s = self.stats
+        if not s.loud_ok:
+            return "Info"
+        if s.true_peak_db > -0.3:
+            return "Poor"
+        if -17.0 <= s.lufs_i <= -11.0 and s.true_peak_db <= -0.9:
+            return "Good"
+        return "Caution"
+
+    def _tone_status(self):
+        s = self.stats
+        d = s.presence_dev
+        if d <= -9.0 or d >= 7.0:
+            return "Poor"
+        if not (-6.0 < d < 4.0):
+            return "Caution"
+        if s.air_dev <= -15.0 and s.rate >= 32000 and s.high_energy < 0.12:
+            return "Caution"
+        return "Good"
+
+    def _card(self, parent, row, col, title, status, lines, advice):
+        P = PAL
+        f = tk.Frame(parent, bg="#ffffff", highlightthickness=max(1, u(3)),
+                     highlightbackground=self.COL[status])
+        f.grid(row=row, column=col, sticky="nsew", padx=u(8), pady=u(8))
+        top = tk.Frame(f, bg="#ffffff")
+        top.pack(fill="x", padx=u(14), pady=(u(10), u(4)))
+        tk.Label(top, text=title, bg="#ffffff", fg=P["ink"], font=fnt(32, True)).pack(side="left")
+        tk.Label(top, text=f"  {status.upper()}  ", bg=self.COL[status], fg="#ffffff",
+                 font=fnt(24, True)).pack(side="right")
+        for k, v in lines:
+            r = tk.Frame(f, bg="#ffffff")
+            r.pack(fill="x", padx=u(16), pady=u(1))
+            tk.Label(r, text=k, bg="#ffffff", fg="#5d6988", font=fnt(26), width=24, anchor="w").pack(side="left")
+            tk.Label(r, text=v, bg="#ffffff", fg=P["ink"], font=fnt(26, True), anchor="w").pack(side="left")
+        tk.Label(f, text=advice, bg="#ffffff", fg="#3a3a44", font=fnt(24), justify="left", anchor="w",
+                 wraplength=u(660)).pack(fill="x", padx=u(16), pady=(u(8), u(12)))
+
+    def _build(self):
+        P, s = PAL, self.stats
+        head = tk.Frame(self, bg="#1f2530")
+        head.pack(side="top", fill="x")
+        tk.Label(head, text="Audio Health Check", bg="#1f2530", fg="#ffd966", font=fnt(44, True),
+                 anchor="w").pack(fill="x", padx=u(24), pady=(u(14), 0))
+        tk.Label(head, text=f"{self.n_tracks} track(s)  \u00b7  {s.duration:.1f} s  \u00b7  {self.rate} Hz  \u00b7  "
+                            "LUFS (ITU-R BS.1770 / EBU R128)  \u00b7  true peak (4x oversampled)",
+                 bg="#1f2530", fg="#9fd2ff", font=fnt(24), anchor="w").pack(fill="x", padx=u(24), pady=(0, u(14)))
+
+        foot = tk.Frame(self, bg=P["bottom"])
+        foot.pack(side="bottom", fill="x", padx=u(18), pady=u(12))
+        ttk.Button(foot, text="\u2605  Fix with Auto 5_Star Enhance...", command=self._to_5star).pack(side="left", padx=u(5))
+        ttk.Button(foot, text="Close", command=self.destroy).pack(side="right", padx=u(5))
+
+        grid = tk.Frame(self, bg=P["bottom"])
+        grid.pack(side="top", fill="both", expand=True, padx=u(12), pady=u(6))
+        grid.columnconfigure(0, weight=1)
+        grid.columnconfigure(1, weight=1)
+
+        f = lambda v, fmt="{:.1f}": fmt.format(v)
+        loud = [("Integrated loudness", f"{s.lufs_i:.1f} LUFS" if s.loud_ok else "n/a (too short)"),
+                ("Short-term max (3 s)", f"{s.lufs_s_max:.1f} LUFS" if s.loud_ok else "n/a"),
+                ("Momentary max (0.4 s)", f"{s.lufs_m_max:.1f} LUFS" if s.loud_ok else "n/a"),
+                ("Loudness range (LRA)", f"{s.lra:.1f} LU"),
+                ("Sample peak", f"{s.peak_db:+.1f} dBFS"),
+                ("True peak", f"{s.true_peak_db:+.1f} dBTP")]
+        adv = ("Streaming services normalise to about \u221214 LUFS; a true peak above \u22121 dBTP can distort "
+               "after lossy encoding.")
+        if s.loud_ok and s.true_peak_db > -1.0:
+            adv = "True peak is above \u22121 dBTP \u2014 inter-sample overs likely after MP3/AAC encoding. " + adv
+        self._card(grid, 0, 0, "Loudness", self._loud_status(), loud, adv)
+
+        csev = {"None": "Good", "Mild": "Caution", "Moderate": "Poor", "Severe": "Poor"}[s.clip_severity]
+        clip = [("Severity", s.clip_severity), ("Clipped regions", str(s.clipping_regions)),
+                ("Samples affected", f"{s.clip_ratio:.3f} %"), ("Clip level", f"{s.clip_level_db:+.1f} dBFS")]
+        cadv = ("No flat-topped peaks found." if s.clip_severity == "None" else
+                "Flat-topped waveform peaks cause harsh distortion. Effect \u2192 Declip rebuilds them from the "
+                "surrounding waveform; Analyze \u2192 Find Clipping labels every region.")
+        self._card(grid, 0, 1, "Clipping", csev, clip, cadv)
+
+        tone = [("Presence 2.4\u20133.8 kHz", f"{s.presence_dev:+.1f} dB vs typical"),
+                ("Air 6\u201311 kHz", f"{s.air_dev:+.1f} dB vs typical"),
+                ("Spectral centroid", f"{s.spectral_centroid:.0f} Hz"),
+                ("High-band energy", f"{s.high_energy * 100:.0f} %")]
+        tadv = ("Balanced presence region." if self._tone_status() == "Good" else
+                ("Presence is fine, but the top end (6–11 kHz) is far below a typical spectrum. A harmonic "
+                 "exciter adds clarity and air without boosting hiss." if -6.0 < s.presence_dev < 4.0 else
+                ("Presence is low \u2014 vocals/leads sound distant. A narrow 3 kHz boost plus a harmonic exciter "
+                 "fixes it without lifting hiss." if s.presence_dev < 0 else
+                 "Presence is high \u2014 sound may be harsh. A narrow 3 kHz cut helps.")))
+        self._card(grid, 1, 0, "Tone / Presence", self._tone_status(), tone, tadv)
+
+        mono = [("L/R correlation", f"{s.corr:+.2f}"), ("Mono-sum level change", f"{s.loss_db:+.1f} dB"),
+                ("Bass (<150 Hz) correlation", f"{s.corr_low:+.2f}"), ("Bass lost in mono", f"{s.loss_low_db:+.1f} dB"),
+                ("Polarity inverted", "YES" if s.polarity_inverted else "no")]
+        madv = ("Mono-compatible." if s.mono_verdict == "Good" else
+                ("Channels are in anti-phase \u2014 the mix vanishes in mono. Effect \u2192 Fix Inverted Polarity."
+                 if s.polarity_inverted else
+                 "Parts of the mix cancel when summed to mono (phones, club PA, smart speakers). "
+                 "Effect \u2192 Bass to Mono / Mono-Safe Stereo help."))
+        self._card(grid, 1, 1, "Mono compatibility", s.mono_verdict, mono, madv)
+
+        # normalisation preview table
+        tab = tk.Frame(self, bg=P["bottom"])
+        tab.pack(side="bottom", fill="x", padx=u(20), pady=(0, u(4)))
+        grid.pack_forget()
+        grid.pack(side="top", fill="both", expand=True, padx=u(12), pady=u(6))
+        tk.Label(tab, text="Gain needed to reach each loudness target", bg=P["bottom"], fg=P["ink"],
+                 font=fnt(28, True)).pack(anchor="w")
+        if s.loud_ok:
+            for name, tgt, tp in LOUDNESS_TARGETS:
+                gain = tgt - s.lufs_i
+                lim = s.true_peak_db + gain > tp
+                txt = (f"  {name:<40} {tgt:>6g} LUFS   {gain:+6.1f} dB"
+                       + ("   (true-peak limiter needed)" if lim else ""))
+                tk.Label(tab, text=txt, bg=P["bottom"], fg="#b04a1a" if lim else P["ink"],
+                         font=("Consolas", -int(u(24))) if sys.platform == "win32" else ("DejaVu Sans Mono", -int(u(24))),
+                         anchor="w").pack(anchor="w")
+
+    def _to_5star(self):
+        app = self.app
+        self.destroy()
+        app.open_auto_5star()
+
+
+# =====================================================================
+#  LABELS
+# =====================================================================
+class Label:
+    def __init__(self, pos, name=""):
+        self.pos = int(pos)
+        self.name = name
+
+    def clone(self):
+        return Label(self.pos, self.name)
+
+
+# =====================================================================
+#  PROJECT MODEL
+# =====================================================================
+class Track:
+    def __init__(self, name="Track", data=None, offset=0):
+        self.name = name
+        self.data = to_stereo(data) if data is not None else np.zeros((0, 2), np.float32)
+        self.offset = int(offset)
+        self.gain, self.pan = 1.0, 0.0
+        self.gain_l = self.gain_r = 1.0      # left / right channel faders
+        self.mute = self.solo = False
+        self.source_path = None      # remembered source file (for output naming)
+        self.env = []                # volume envelope: [(local_sample, gain 0..1), ...] sorted by sample
+
+    @property
+    def end(self):
+        return self.offset + len(self.data)
+
+    def clone(self):
+        t = Track(self.name, None, self.offset)
+        t.data, t.gain, t.pan, t.mute, t.solo = self.data, self.gain, self.pan, self.mute, self.solo
+        t.gain_l, t.gain_r = self.gain_l, self.gain_r
+        t.source_path = self.source_path
+        t.env = list(self.env)
+        return t
+
+    def local(self, s, e):
+        return max(0, int(s) - self.offset), min(len(self.data), int(e) - self.offset)
+
+    def copy_range(self, s, e):
+        a, b = self.local(s, e)
+        return self.data[a:b].copy() if b > a else np.zeros((0, 2), np.float32)
+
+    def env_gain(self, lo, hi):
+        """Per-sample envelope gain for local samples [lo, hi) (all ones when there is no envelope)."""
+        lo, hi = int(lo), int(hi)
+        n = max(0, hi - lo)
+        if not self.env or n == 0:
+            return np.ones(n, np.float32)
+        xs = np.array([p[0] for p in self.env], np.float64)
+        gs = np.array([p[1] for p in self.env], np.float64)
+        return np.interp(np.arange(lo, hi, dtype=np.float64), xs, gs).astype(np.float32)
+
+    def _env_slice(self, a, b):
+        """Envelope restricted to local samples [a, b), re-based to start at 0 (edge values interpolated)."""
+        if not self.env or b <= a:
+            return []
+        g0 = float(self.env_gain(a, a + 1)[0])
+        g1 = float(self.env_gain(b - 1, b)[0])
+        pts = [(0, g0)] + [(x - a, g) for x, g in self.env if a < x < b - 1]
+        if b - 1 - a > 0:
+            pts.append((b - 1 - a, g1))
+        return pts
+
+    def apply(self, s, e, fn):
+        a, b = self.local(s, e)
+        if b <= a:
+            return
+        self.data = np.concatenate([self.data[:a], to_stereo(fn(self.data[a:b])), self.data[b:]])
+
+    def silence(self, s, e):
+        a, b = self.local(s, e)
+        if b > a:
+            d = self.data.copy()
+            d[a:b] = 0
+            self.data = d
+
+    def delete(self, s, e):
+        a, b = self.local(s, e)
+        before = max(0, min(int(e), self.offset) - int(s))
+        if b > a:
+            if self.env:
+                n = b - a
+                self.env = [(x, g) if x < a else (x - n, g) for x, g in self.env if not (a <= x < b)]
+            self.data = np.concatenate([self.data[:a], self.data[b:]])
+        self.offset = max(0, self.offset - before)
+
+    def trim(self, s, e):
+        a, b = self.local(s, e)
+        if b <= a:
+            self.data = np.zeros((0, 2), np.float32)
+            self.env = []
+        else:
+            self.env = self._env_slice(a, b)
+            self.data = self.data[a:b].copy()
+            self.offset += a
+
+    def insert(self, at, clip):
+        clip = to_stereo(clip)
+        at = int(at)
+        if len(self.data) == 0:
+            self.offset, self.data = at, clip
+            self.env = []
+        elif at <= self.offset:
+            gap = np.zeros((self.offset - at, 2), np.float32)
+            shift = len(clip) + (self.offset - at)
+            self.env = [(x + shift, g) for x, g in self.env]
+            self.data = np.concatenate([clip, gap, self.data])
+            self.offset = at
+        elif at >= self.end:
+            gap = np.zeros((at - self.end, 2), np.float32)
+            self.data = np.concatenate([self.data, gap, clip])
+        else:
+            i = at - self.offset
+            self.env = [(x, g) if x < i else (x + len(clip), g) for x, g in self.env]
+            self.data = np.concatenate([self.data[:i], clip, self.data[i:]])
+
+    def split(self, at):
+        at = int(at)
+        if not (self.offset < at < self.end):
+            return None
+        i = at - self.offset
+        new = Track(self.name + " (split)", self.data[i:].copy(), at)
+        new.gain, new.pan, new.mute, new.solo = self.gain, self.pan, self.mute, self.solo
+        new.gain_l, new.gain_r = self.gain_l, self.gain_r
+        new.source_path = self.source_path
+        new.env = self._env_slice(i, len(self.data))
+        self.env = self._env_slice(0, i)
+        self.data = self.data[:i].copy()
+        return new
+
+
+class Project:
+    def __init__(self):
+        self.rate = DEFAULT_RATE
+        self.tracks = []
+        self.labels = []
+        self.clip = []
+        self.dirty = False
+        self.path = None
+        self._undo, self._redo = [], []
+        self.eq = MasterEQ()
+
+    def _snap(self):
+        return [t.clone() for t in self.tracks], [lb.clone() for lb in self.labels]
+
+    def push_undo(self):
+        self._undo.append(self._snap())
+        del self._undo[:-MAX_UNDO]
+        self._redo.clear()
+        self.dirty = True
+
+    def undo(self):
+        if not self._undo:
+            return False
+        self._redo.append(self._snap())
+        self.tracks, self.labels = self._undo.pop()
+        self.dirty = True
+        return True
+
+    def redo(self):
+        if not self._redo:
+            return False
+        self._undo.append(self._snap())
+        self.tracks, self.labels = self._redo.pop()
+        self.dirty = True
+        return True
+
+    def new_track(self, name=None, data=None, offset=0):
+        t = Track(name or f"Track {len(self.tracks) + 1}", data, offset)
+        self.tracks.append(t)
+        return t
+
+    def length(self):
+        return max((t.end for t in self.tracks), default=0)
+
+    def import_file(self, path, offset=0):
+        data, sr = load_audio(path)
+        if not self.tracks:
+            self.rate = sr
+        data = resample(data, sr, self.rate)
+        name = os.path.splitext(os.path.basename(path))[0]
+        t = self.new_track(name, data, offset)
+        t.source_path = os.path.abspath(path)
+        return t
+
+    def mixdown(self, s=0, e=None, master=False):
+        e = self.length() if e is None else int(e)
+        s = int(s)
+        out = np.zeros((max(0, e - s), 2), np.float32)
+        any_solo = any(t.solo for t in self.tracks)
+        for t in self.tracks:
+            if t.mute or (any_solo and not t.solo):
+                continue
+            a, b = max(s, t.offset), min(e, t.end)
+            if b <= a:
+                continue
+            seg = t.data[a - t.offset:b - t.offset]
+            if t.env:
+                seg = seg * t.env_gain(a - t.offset, b - t.offset)[:, None]
+            lg = t.gain * min(1.0, 1.0 - t.pan) * t.gain_l
+            rg = t.gain * min(1.0, 1.0 + t.pan) * t.gain_r
+            out[a - s:b - s, 0] += seg[:, 0] * lg
+            out[a - s:b - s, 1] += seg[:, 1] * rg
+        out = np.clip(out, -1.0, 1.0, out=out)
+        if master:
+            out = self.eq.process(out, self.rate)
+        return out
+
+    def save(self, path):
+        meta = {"rate": self.rate,
+                "tracks": [{"name": t.name, "offset": t.offset, "gain": t.gain,
+                            "pan": t.pan, "mute": t.mute, "solo": t.solo, "gain_l": t.gain_l, "gain_r": t.gain_r,
+                            "source_path": t.source_path,
+                            "env": [[int(x), float(g)] for x, g in t.env]} for t in self.tracks],
+                "labels": [{"pos": lb.pos, "name": lb.name} for lb in self.labels],
+                "master_eq": self.eq.to_dict()}
+        arrays = {f"t{i}": t.data for i, t in enumerate(self.tracks)}
+        with open(path, "wb") as f:
+            np.savez_compressed(f, meta=np.array(json.dumps(meta)), **arrays)
+        self.path, self.dirty = path, False
+
+    def load(self, path):
+        z = np.load(path, allow_pickle=False)
+        meta = json.loads(str(z["meta"]))
+        self.rate = int(meta["rate"])
+        self.tracks = []
+        for i, m in enumerate(meta["tracks"]):
+            t = Track(m["name"], z[f"t{i}"], m["offset"])
+            t.gain, t.pan, t.mute, t.solo = m["gain"], m["pan"], m["mute"], m["solo"]
+            t.gain_l, t.gain_r = m.get("gain_l", 1.0), m.get("gain_r", 1.0)
+            t.source_path = m.get("source_path")
+            t.env = [(int(x), float(g)) for x, g in m.get("env", [])]
+            self.tracks.append(t)
+        self.labels = [Label(lb["pos"], lb["name"]) for lb in meta.get("labels", [])]
+        self.eq.from_dict(meta.get("master_eq", {}))
+        self._undo.clear(); self._redo.clear()
+        self.path, self.dirty = path, False
+
+
+# =====================================================================
+#  MASTER EQUALIZER + MUSIC VOLUME  (10-band, presets, saved with project)
+# =====================================================================
+EQ_FREQS = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
+EQ_LABELS = ["31", "62", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"]
+EQ_RANGE = 12.0
+EQ_PRESETS = {
+    "Flat":          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    "Pop":           [-1, -1, 0, 2, 4, 4, 2, 0, -1, -2],
+    "Rock":          [5, 4, 3, 1, -1, -1, 1, 3, 4, 5],
+    "Jazz":          [4, 3, 1, 2, -2, -2, 0, 1, 3, 4],
+    "Classical":     [0, 0, 0, 0, 0, 0, -3, -3, -3, -4],
+    "Hall":          [-3, -2, 0, 1, 2, 3, 3, 3, 2, 1],
+    "Club":          [0, 0, 4, 3, 3, 3, 2, 0, 0, 0],
+    "Dance":         [6, 5, 2, 0, 0, -3, -4, -4, 0, 0],
+    "Hip-Hop":       [6, 5, 2, 3, -1, -1, 2, 0, 2, 3],
+    "Electronic":    [5, 4, 1, 0, -2, 2, 1, 1, 4, 5],
+    "Acoustic":      [4, 4, 3, 1, 2, 2, 3, 3, 3, 2],
+    "Vocal / Speech": [-3, -3, -2, 1, 4, 4, 3, 1, 0, -2],
+    "Live":          [-3, 0, 2, 3, 3, 3, 2, 1, 1, 1],
+    "Party":         [5, 4, 4, 0, 0, 0, 0, 0, 4, 5],
+    "Soft":          [3, 2, 1, 1, 0, -1, -3, -4, -4, -5],
+    "Loudness":      [6, 4, 0, 0, -1, 0, -1, -4, 4, 2],
+    "Bass Boost":    [7, 6, 5, 3, 1, 0, 0, 0, 0, 0],
+    "Bass Reduce":   [-7, -6, -5, -3, -1, 0, 0, 0, 0, 0],
+    "Treble Boost":  [0, 0, 0, 0, 0, 1, 3, 5, 6, 7],
+    "Treble Reduce": [0, 0, 0, 0, 0, -1, -3, -5, -6, -7],
+    "Small Speakers": [-6, -5, -3, 0, 2, 3, 3, 2, 1, 0],
+}
+# name: (10 band gains, music volume dB, stereo width %, virtual surround %)
+SURROUND_PRESETS = {
+    "Cinema":            ([4, 4, 2, 0, -1, 0, 1, 2, 3, 3], 0.0, 140, 50),
+    "Theater":           ([5, 4, 2, 0, -1, 1, 2, 3, 2, 1], 0.0, 160, 70),
+    "Concert Hall":      ([-1, 0, 1, 1, 2, 2, 2, 2, 2, 1], 0.0, 130, 60),
+    "Night Mode":        ([-6, -5, -3, -1, 1, 2, 2, 1, 0, -1], -3.0, 100, 0),
+    "Dialogue Clarity":  ([-4, -3, -2, 0, 2, 4, 4, 2, 0, -2], 0.0, 100, 0),
+    "Gaming":            ([2, 2, 0, -1, 0, 1, 3, 4, 3, 2], 0.0, 150, 55),
+    "Music Surround":    ([1, 1, 0, 0, 0, 0, 1, 1, 2, 2], 0.0, 150, 45),
+    "Headphone Surround": ([0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 0.0, 120, 80),
+}
+EQ_USER_PATH = os.path.join(RECENT_DIR, "eq_presets.json")
+
+
+def _load_user_eq():
+    try:
+        with open(EQ_USER_PATH, "r", encoding="utf-8") as f:
+            d = json.load(f)
+            return {k: [float(x) for x in v["gains"]] + [float(v.get("volume", 0.0)),
+                                                         float(v.get("width", 100.0)),
+                                                         float(v.get("surround", 0.0))]
+                    for k, v in d.items() if len(v.get("gains", [])) == 10}
+    except Exception:
+        return {}
+
+
+def _save_user_eq(presets):
+    try:
+        os.makedirs(RECENT_DIR, exist_ok=True)
+        with open(EQ_USER_PATH, "w", encoding="utf-8") as f:
+            json.dump({k: {"gains": v[:10], "volume": v[10] if len(v) > 10 else 0.0,
+                           "width": v[11] if len(v) > 11 else 100.0,
+                           "surround": v[12] if len(v) > 12 else 0.0}
+                       for k, v in presets.items()}, f, indent=1)
+    except Exception:
+        pass
+
+
+class MasterEQ:
+    """10-band peaking equalizer + music volume (dB). Works live in playback and offline on export."""
+
+    def __init__(self):
+        self.gains = [0.0] * 10
+        self.volume_db = 0.0
+        self.enabled = True
+        self.protect = True          # auto headroom so boosts do not clip
+        self.preset = "Flat"
+        self.width = 100.0           # stereo width %, 100 = unchanged
+        self.surround = 0.0          # virtual surround %, 0 = off
+        self._st = {}
+        self._ver = 0
+        self._cache = None
+        self._rt_rate = 44100
+        self._rt_ver = -1
+        self._sos = None
+        self._zi = None
+
+    def changed(self):
+        self._ver += 1
+
+    def neutral(self):
+        return (not self.enabled) or (all(abs(g) < 0.05 for g in self.gains) and abs(self.volume_db) < 0.05
+                                      and abs(self.width - 100.0) < 0.5 and self.surround < 0.5)
+
+    def gain_lin(self):
+        if not self.enabled:
+            return 1.0
+        head = (-max(0.0, max(self.gains)) - 0.04 * self.surround
+                - 0.03 * max(0.0, self.width - 100.0)) if self.protect else 0.0
+        return 10 ** ((self.volume_db + head) / 20.0)
+
+    def sos(self, rate):
+        key = (rate, self._ver)
+        if self._cache and self._cache[0] == key:
+            return self._cache[1]
+        rows = []
+        if self.enabled:
+            for f, g in zip(EQ_FREQS, self.gains):
+                if abs(g) < 0.05 or f >= rate * 0.45:
+                    continue
+                A = 10 ** (g / 40.0)
+                w0 = 2 * math.pi * f / rate
+                alpha = math.sin(w0) / (2 * 1.41)
+                cw = math.cos(w0)
+                b0, b1, b2 = 1 + alpha * A, -2 * cw, 1 - alpha * A
+                a0, a1, a2 = 1 + alpha / A, -2 * cw, 1 - alpha / A
+                rows.append([b0 / a0, b1 / a0, b2 / a0, 1.0, a1 / a0, a2 / a0])
+        s = np.array(rows, dtype=np.float64) if rows else None
+        self._cache = (key, s)
+        return s
+
+    def process(self, x, rate):
+        """Offline: whole buffer (N,2)."""
+        if self.neutral() or len(x) == 0:
+            return x
+        s = self.sos(rate)
+        y = signal.sosfilt(s, x.astype(np.float64), axis=0) if s is not None else x.astype(np.float64)
+        y = _spatial_stage(y, rate, self.width / 100.0, self.surround / 100.0, {})
+        y = y * self.gain_lin()
+        return np.clip(y, -1.0, 1.0).astype(np.float32)
+
+    def rt_begin(self, rate):
+        self._rt_rate, self._rt_ver = rate, -1
+        self._zi = None
+        self._st = {}
+
+    def rt(self, chunk):
+        """Realtime: stateful, called from the audio callback."""
+        if self.neutral():
+            return chunk
+        try:
+            if self._rt_ver != self._ver:
+                s = self.sos(self._rt_rate)
+                if s is None:
+                    self._sos, self._zi = None, None
+                elif self._sos is None or self._zi is None or len(s) != len(self._sos):
+                    self._sos, self._zi = s, np.zeros((len(s), 2, 2))
+                else:
+                    self._sos = s
+                self._rt_ver = self._ver
+            y = chunk
+            if self._sos is not None:
+                y, self._zi = signal.sosfilt(self._sos, chunk.astype(np.float64), axis=0, zi=self._zi)
+            y = _spatial_stage(y, self._rt_rate, self.width / 100.0, self.surround / 100.0, self._st)
+            y = y * self.gain_lin()
+            return np.clip(y, -1.0, 1.0).astype(np.float32)
+        except Exception:
+            return chunk
+
+    def to_dict(self):
+        return {"gains": list(self.gains), "volume_db": self.volume_db, "enabled": self.enabled,
+                "protect": self.protect, "preset": self.preset,
+                "width": self.width, "surround": self.surround}
+
+    def from_dict(self, d):
+        try:
+            g = [float(x) for x in d.get("gains", [])]
+            self.gains = g if len(g) == 10 else [0.0] * 10
+            self.volume_db = float(d.get("volume_db", 0.0))
+            self.enabled = bool(d.get("enabled", True))
+            self.protect = bool(d.get("protect", True))
+            self.preset = str(d.get("preset", "Custom"))
+            self.width = float(d.get("width", 100.0))
+            self.surround = float(d.get("surround", 0.0))
+        except Exception:
+            pass
+        self.changed()
+
+
+# =====================================================================
+#  PLAYBACK / RECORDING
+# =====================================================================
+class Player:
+    def __init__(self):
+        self.stream = None
+        self.buf = np.zeros((0, 2), np.float32)
+        self.pos = 0
+        self.loop = False
+        self.playing = False
+        self.volume = 1.0
+        self.rate = 44100
+        self.eq = None
+
+    def start(self, buf, rate, loop=False):
+        if sd is None:
+            raise RuntimeError("Playback needs the 'sounddevice' package:  pip install sounddevice")
+        self.stop()
+        self.buf, self.pos, self.loop, self.playing = buf, 0, loop, True
+        self.rate = rate
+        if self.eq is not None:
+            self.eq.rt_begin(rate)
+        self.stream = sd.OutputStream(samplerate=rate, channels=2, dtype="float32",
+                                      callback=self._cb, finished_callback=self._fin)
+        self.stream.start()
+
+    def _cb(self, out, frames, _ti, _status):
+        n, filled = len(self.buf), 0
+        while filled < frames and n:
+            chunk = self.buf[self.pos:self.pos + frames - filled]
+            if self.eq is not None:
+                chunk = self.eq.rt(chunk)
+            out[filled:filled + len(chunk)] = chunk * self.volume
+            filled += len(chunk)
+            self.pos += len(chunk)
+            if self.pos >= n:
+                if self.loop:
+                    self.pos = 0
+                else:
+                    break
+        if filled < frames:
+            out[filled:] = 0
+            raise sd.CallbackStop
+
+    def _fin(self):
+        self.playing = False
+
+    def level(self):
+        """Peak L/R of what is being heard right now (after the volume knob)."""
+        if not self.playing or self.stream is None or len(self.buf) == 0:
+            return 0.0, 0.0
+        try:
+            lag = int(float(self.stream.latency) * self.rate)     # audio already queued in the device
+        except Exception:
+            lag = 0
+        end = min(len(self.buf), max(0, self.pos - lag))
+        seg = self.buf[max(0, end - int(self.rate * 0.06)):end]    # ~60 ms, longer than the 40 ms UI tick
+        if len(seg) == 0:
+            return 0.0, 0.0
+        pk = np.max(np.abs(seg), axis=0) * self.volume
+        return float(pk[0]), float(pk[1])
+
+    def stop(self):
+        if self.stream is not None:
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception:
+                pass
+            self.stream = None
+        self.playing = False
+
+
+class Recorder:
+    def __init__(self):
+        self.stream = None
+        self.chunks = []
+        self.frames = 0
+        self.level = 0.0
+
+    def start(self, rate):
+        if sd is None:
+            raise RuntimeError("Recording needs the 'sounddevice' package:  pip install sounddevice")
+        self.chunks, self.frames = [], 0
+
+        def cb(data, _f, _t, _s):
+            self.chunks.append(data.copy())
+            self.level = float(np.max(np.abs(data))) if len(data) else 0.0
+            self.frames += len(data)
+
+        self.stream = sd.InputStream(samplerate=rate, channels=1, dtype="float32", callback=cb)
+        self.stream.start()
+
+    def stop(self):
+        if self.stream is not None:
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception:
+                pass
+            self.stream = None
+        data = np.concatenate(self.chunks) if self.chunks else np.zeros((0, 1), np.float32)
+        return to_stereo(data)
+
+
+# =====================================================================
+#  GUI WIDGETS
+# =====================================================================
+def rrect(c, x1, y1, x2, y2, r, **kw):
+    r = max(0, min(r, (x2 - x1) / 2, (y2 - y1) / 2))
+    pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
+           x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+    return c.create_polygon(pts, smooth=True, **kw)
+
+
+_FONTS = {}
+
+
+def measure(font, text):
+    f = _FONTS.get(font)
+    if f is None:
+        f = _FONTS[font] = tkfont.Font(font=font)
+    return f.measure(text)
+
+
+def ellipsize(text, font, maxw):
+    if measure(font, text) <= maxw:
+        return text
+    while text and measure(font, text + "...") > maxw:
+        text = text[:-1]
+    return text + "..."
+
+
+def _lw(s, k=0.05):
+    return max(1, int(round(s * k)))
+
+
+def p_pause(c, cx, cy, s):
+    bw, bh, gap = s * .095, s * .26, s * .12
+    for sx in (-1, 1):
+        x = cx + sx * (gap / 2 + bw / 2)
+        c.create_rectangle(x - bw / 2, cy - bh / 2, x + bw / 2, cy + bh / 2, fill=c.ink(), outline="")
+
+
+def p_play(c, cx, cy, s):
+    col = c.ink("#3f8a5a")
+    w, h = s * .26, s * .32
+    c.create_polygon(cx - w / 2 + s * .02, cy - h / 2, cx - w / 2 + s * .02, cy + h / 2,
+                     cx + w / 2 + s * .02, cy, fill=col, outline=col)
+
+
+def p_stop(c, cx, cy, s):
+    q = s * .2
+    col = c.ink()
+    c.create_rectangle(cx - q / 2, cy - q / 2, cx + q / 2, cy + q / 2, fill=col, outline="")
+
+
+def p_skip_start(c, cx, cy, s):
+    ink, h = c.ink(), s * .25
+    c.create_rectangle(cx - s * .15, cy - h / 2, cx - s * .15 + s * .045, cy + h / 2, fill=ink, outline="")
+    c.create_polygon(cx + s * .14, cy - h / 2, cx + s * .14, cy + h / 2, cx - s * .08, cy, fill=ink, outline=ink)
+
+
+def p_skip_end(c, cx, cy, s):
+    ink, h = c.ink(), s * .25
+    c.create_rectangle(cx + s * .15 - s * .045, cy - h / 2, cx + s * .15, cy + h / 2, fill=ink, outline="")
+    c.create_polygon(cx - s * .14, cy - h / 2, cx - s * .14, cy + h / 2, cx + s * .08, cy, fill=ink, outline=ink)
+
+
+def p_record(c, cx, cy, s):
+    r = s * .17
+    red = c.ink("#b3312c")
+    c.create_oval(cx - r, cy - r, cx + r, cy + r, fill=red, outline=red)
+    t = r * .52
+    c.create_polygon(cx - t, cy - t * .6, cx + t, cy - t * .6, cx, cy + t * .85, fill="#ffffff", outline="")
+
+
+def p_loop(c, cx, cy, s):
+    ink, w, h, lw = c.ink(), s * .26, s * .15, _lw(s, .03)
+    q = s * .05
+    c.create_line(cx - w, cy, cx - w, cy - h, cx + w * .5, cy - h, fill=ink, width=lw, joinstyle="round")
+    c.create_polygon(cx + w * .45, cy - h - q, cx + w * .45, cy - h + q, cx + w * .9, cy - h, fill=ink, outline=ink)
+    c.create_line(cx + w, cy, cx + w, cy + h, cx - w * .5, cy + h, fill=ink, width=lw, joinstyle="round")
+    c.create_polygon(cx - w * .45, cy + h - q, cx - w * .45, cy + h + q, cx - w * .9, cy + h, fill=ink, outline=ink)
+
+
+def p_ibeam(c, cx, cy, s):
+    ink, h, w, lw = c.ink(), s * .34, s * .13, _lw(s, .05)
+    c.create_line(cx, cy - h, cx, cy + h, fill=ink, width=lw)
+    c.create_line(cx - w, cy - h, cx + w, cy - h, fill=ink, width=lw)
+    c.create_line(cx - w, cy + h, cx + w, cy + h, fill=ink, width=lw)
+
+
+def p_envelope(c, cx, cy, s):
+    ink, lw = c.ink(), _lw(s, .06)
+    c.create_line(cx - s * .25, cy + s * .18, cx + s * .25, cy - s * .18, fill=ink, width=lw)
+    for sx in (-1, 1):
+        r = s * .07
+        x, y = cx + sx * s * .25, cy - sx * s * .18
+        c.create_oval(x - r, y - r, x + r, y + r, fill=ink, outline=ink)
+
+
+def p_draw(c, cx, cy, s):
+    ink, lw = c.ink(), _lw(s, .05)
+    c.create_line(cx - s * .22, cy + s * .24, cx + s * .2, cy - s * .2, fill=ink, width=lw * 2)
+    c.create_polygon(cx - s * .3, cy + s * .32, cx - s * .26, cy + s * .18, cx - s * .16, cy + s * .28,
+                     fill=ink, outline=ink)
+
+
+def p_multi(c, cx, cy, s):
+    ink, r, lw = c.ink(), s * .26, _lw(s, .05)
+    for ang in (90, 30, 150):
+        a = math.radians(ang)
+        c.create_line(cx - r * math.cos(a), cy - r * math.sin(a), cx + r * math.cos(a), cy + r * math.sin(a),
+                      fill=ink, width=lw)
+
+
+def _magnifier(c, cx, cy, s):
+    ink, lw = c.ink(), _lw(s, .05)
+    x0, y0, r = cx - s * .05, cy - s * .06, s * .21
+    c.create_oval(x0 - r, y0 - r, x0 + r, y0 + r, outline=ink, width=lw)
+    c.create_line(x0 + r * .72, y0 + r * .72, x0 + r * 1.55, y0 + r * 1.55, fill=ink, width=lw * 2)
+    return x0, y0, r, ink, lw
+
+
+def p_zoom_in(c, cx, cy, s):
+    x0, y0, r, ink, lw = _magnifier(c, cx, cy, s)
+    c.create_line(x0 - r * .5, y0, x0 + r * .5, y0, fill=ink, width=lw)
+    c.create_line(x0, y0 - r * .5, x0, y0 + r * .5, fill=ink, width=lw)
+
+
+def p_zoom_out(c, cx, cy, s):
+    x0, y0, r, ink, lw = _magnifier(c, cx, cy, s)
+    c.create_line(x0 - r * .5, y0, x0 + r * .5, y0, fill=ink, width=lw)
+
+
+def p_zoom_sel(c, cx, cy, s):
+    x0, y0, r, ink, lw = _magnifier(c, cx, cy, s)
+    c.create_line(x0 - r * .6, y0, x0 + r * .6, y0, fill=ink, width=lw)
+    for sx in (-1, 1):
+        c.create_line(x0 + sx * r * .6, y0 - r * .45, x0 + sx * r * .6, y0 + r * .45, fill=ink, width=lw)
+
+
+def p_zoom_fit(c, cx, cy, s):
+    x0, y0, r, ink, lw = _magnifier(c, cx, cy, s)
+    for dx in (-.5, 0, .5):
+        c.create_line(x0 + dx * r, y0 - r * .5, x0 + dx * r, y0 + r * .5, fill=ink, width=lw)
+
+
+def p_zoom_toggle(c, cx, cy, s):
+    x0, y0, r, ink, lw = _magnifier(c, cx, cy, s)
+    c.create_line(x0 - r * .55, y0 - r * .25, x0 - r * .05, y0 - r * .25, fill=ink, width=lw)
+    c.create_line(x0 + r * .05, y0 + r * .25, x0 + r * .55, y0 + r * .25, fill=ink, width=lw)
+
+
+def _bars(c, cx, cy, s, heights, x_from, x_to, ink, lw):
+    n = len(heights)
+    for k, hh in enumerate(heights):
+        x = x_from + (x_to - x_from) * (k / max(1, n - 1))
+        c.create_line(x, cy - hh * s, x, cy + hh * s, fill=ink, width=lw)
+
+
+def p_trim(c, cx, cy, s):
+    ink, lw = c.ink(), _lw(s, .05)
+    _bars(c, cx, cy, s, (.07, .16, .22, .16, .07), cx - s * .17, cx + s * .17, ink, lw)
+    for sx in (-1, 1):
+        c.create_line(cx + sx * s * .3, cy - s * .27, cx + sx * s * .3, cy + s * .27, fill=ink, width=lw * 2)
+
+
+def p_silence(c, cx, cy, s):
+    ink, lw = c.ink(), _lw(s, .05)
+    _bars(c, cx, cy, s, (.07, .16, .22), cx - s * .32, cx - s * .18, ink, lw)
+    _bars(c, cx, cy, s, (.22, .16, .07), cx + s * .18, cx + s * .32, ink, lw)
+    c.create_line(cx - s * .1, cy, cx + s * .1, cy, fill=ink, width=lw)
+
+
+def p_undo(c, cx, cy, s):
+    c.create_text(cx, cy, text="\u21B6", fill=c.ink(), font=("Segoe UI Symbol", -int(s * .72)))
+
+
+def p_redo(c, cx, cy, s):
+    c.create_text(cx, cy, text="\u21B7", fill=c.ink(), font=("Segoe UI Symbol", -int(s * .72)))
+
+
+def p_gear(c, cx, cy, s):
+    c.create_text(cx, cy, text="\u2699", fill=c.ink(), font=("Segoe UI Symbol", -int(s * .78)))
+
+
+def p_mic(c, cx, cy, s):
+    ink, lw = c.ink(), _lw(s, .06)
+    rrect(c, cx - s * .11, cy - s * .34, cx + s * .11, cy + s * .04, s * .11, outline=ink, fill="", width=lw)
+    c.create_arc(cx - s * .21, cy - s * .16, cx + s * .21, cy + s * .2, start=180, extent=180,
+                 style="arc", outline=ink, width=lw)
+    c.create_line(cx, cy + s * .2, cx, cy + s * .32, fill=ink, width=lw)
+    c.create_line(cx - s * .1, cy + s * .32, cx + s * .1, cy + s * .32, fill=ink, width=lw)
+
+
+def p_speaker(c, cx, cy, s):
+    ink, lw = c.ink(), _lw(s, .06)
+    c.create_polygon(cx - s * .3, cy - s * .1, cx - s * .16, cy - s * .1, cx, cy - s * .26, cx, cy + s * .26,
+                     cx - s * .16, cy + s * .1, cx - s * .3, cy + s * .1, outline=ink, fill="", width=lw)
+    for rr in (.16, .3):
+        c.create_arc(cx - s * rr, cy - s * rr, cx + s * rr, cy + s * rr, start=-45, extent=90,
+                     style="arc", outline=ink, width=lw)
+
+
+def p_audio_setup(c, cx, cy, s):
+    p_speaker(c, cx - s * .12, cy, s)
+    c.create_text(cx + s * .42, cy, text="\u25BE", fill=c.ink(), font=("Segoe UI", -int(s * .38), "bold"))
+
+
+def p_share(c, cx, cy, s):
+    ink, lw = c.ink(), _lw(s, .06)
+    c.create_line(cx - s * .3, cy - s * .02, cx - s * .3, cy + s * .3, cx + s * .3, cy + s * .3, cx + s * .3,
+                  cy - s * .02, fill=ink, width=lw, joinstyle="round")
+    c.create_line(cx, cy + s * .14, cx, cy - s * .34, fill=ink, width=lw)
+    c.create_line(cx - s * .14, cy - s * .2, cx, cy - s * .34, cx + s * .14, cy - s * .2, fill=ink, width=lw)
+
+
+def p_plug(c, cx, cy, s):
+    ink, lw = c.ink(), _lw(s, .06)
+    c.create_line(cx - s * .04, cy - s * .1, cx + s * .2, cy - s * .34, fill=ink, width=lw)
+    c.create_line(cx + s * .08, cy + s * .02, cx + s * .32, cy - s * .22, fill=ink, width=lw)
+    c.create_polygon(cx - s * .3, cy + s * .02, cx - s * .04, cy - s * .24, cx + s * .22, cy + s * .02,
+                     cx - s * .04, cy + s * .28, outline=ink, fill="", width=lw)
+    c.create_line(cx - s * .2, cy + s * .22, cx - s * .34, cy + s * .36, fill=ink, width=lw)
+
+
+def p_play_speed(c, cx, cy, s):
+    col = c.ink("#3f8a5a")
+    w, h = s * .3, s * .38
+    c.create_polygon(cx - w / 2, cy - h / 2, cx - w / 2, cy + h / 2, cx + w / 2, cy, fill=col, outline=col)
+
+
+def p_eq(c, cx, cy, s):
+    ink, lw = c.ink(), _lw(s, .05)
+    for k, kn in enumerate((-.12, .14, -.02, .1)):
+        x = cx + (k - 1.5) * s * .2
+        c.create_line(x, cy - s * .3, x, cy + s * .3, fill=ink, width=lw)
+        c.create_rectangle(x - s * .075, cy + kn * s - s * .04, x + s * .075, cy + kn * s + s * .04,
+                           fill=ink, outline="")
+
+
+def p_5star(c, cx, cy, s):
+    ink = c.ink("#ffb400")
+    pts = []
+    for k in range(10):
+        r = s * (.30 if k % 2 == 0 else .14)
+        a = -math.pi / 2 + k * math.pi / 5
+        pts.extend([cx + r * math.cos(a), cy + r * math.sin(a)])
+    c.create_polygon(pts, fill=ink, outline=ink)
+
+
+# ---------------------------------------------------------------- widgets
+# =====================================================================
+#  STUDIO BLUE SKIN - anti-aliased images drawn with numpy (no extra packages)
+# =====================================================================
+from collections import OrderedDict
+
+_SKIN = OrderedDict()
+
+
+def _rgb(c):
+    c = c.lstrip("#")
+    return np.array([int(c[i:i + 2], 16) for i in (0, 2, 4)], np.float32)
+
+
+def _png(rgba):
+    h, w, _ = rgba.shape
+    raw = np.concatenate([np.zeros((h, 1), np.uint8), rgba.reshape(h, w * 4)], axis=1).tobytes()
+
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 4)) + chunk(b"IEND", b""))
+
+
+def _cached(key, make):
+    img = _SKIN.get(key)
+    if img is None:
+        img = make()
+        _SKIN[key] = img
+        while len(_SKIN) > 700:
+            _SKIN.popitem(last=False)
+    else:
+        _SKIN.move_to_end(key)
+    return img
+
+
+def _photo(rgba):
+    return tk.PhotoImage(data=base64.b64encode(_png(rgba)).decode("ascii"))
+
+
+def _sdf(w, h, r, inset=0.0, dy=0.0):
+    """Signed distance to a rounded rectangle (negative inside)."""
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    xx += 0.5
+    yy += 0.5
+    hw, hh = w / 2.0 - inset, h / 2.0 - inset
+    r = max(0.5, min(r, hw, hh))
+    qx = np.abs(xx - w / 2.0) - (hw - r)
+    qy = np.abs(yy - h / 2.0 - dy) - (hh - r)
+    return np.hypot(np.maximum(qx, 0), np.maximum(qy, 0)) + np.minimum(np.maximum(qx, qy), 0) - r
+
+
+def skin_img(w, h, r, top, bot, border=None, gloss=0.0, shadow=0, bw=1.3):
+    """Rounded rectangle / circle with vertical gradient, optional border, gloss and soft shadow."""
+    w, h, shadow = max(2, int(w)), max(2, int(h)), int(shadow)
+    key = ("s", w, h, round(float(r), 1), top, bot, border, gloss, shadow, bw)
+
+    def make():
+        pad = shadow
+        d = _sdf(w, h, r, inset=pad)
+        a_shape = np.clip(0.5 - d, 0, 1)
+        yy = np.arange(h, dtype=np.float32)[:, None] + 0.5
+        t = np.clip((yy - pad) / max(1.0, h - 2 * pad), 0, 1)
+        col = _rgb(top)[None, None, :] * (1 - t[..., None]) + _rgb(bot)[None, None, :] * t[..., None]
+        col = np.broadcast_to(col, (h, w, 3)).copy()
+        if gloss:
+            g = (np.clip(1.0 - t * 2.0, 0, 1) ** 1.4) * gloss
+            col += (255.0 - col) * g[..., None]
+        if border:
+            inner = np.clip(0.5 - (d + bw), 0, 1)
+            ring = np.clip(a_shape - inner, 0, 1)
+            rgb = (col * inner[..., None] + _rgb(border)[None, None, :] * ring[..., None])
+            rgb = rgb / np.maximum(a_shape[..., None], 1e-3)
+        else:
+            rgb = col
+        alpha = a_shape
+        if shadow:
+            ds = _sdf(w, h, r, inset=pad, dy=shadow * 0.35)
+            a_sh = np.exp(-(np.maximum(ds, 0) ** 2) / (2 * (shadow * 0.5) ** 2)) * 0.30
+            out_a = alpha + a_sh * (1 - alpha)
+            rgb = ((rgb * alpha[..., None]
+                    + np.array([16, 30, 70], np.float32) * (a_sh * (1 - alpha))[..., None])
+                   / np.maximum(out_a[..., None], 1e-3))
+            alpha = out_a
+        rgba = np.dstack([np.clip(rgb, 0, 255), np.clip(alpha * 255, 0, 255)]).astype(np.uint8)
+        return _photo(rgba)
+    return _cached(key, make)
+
+
+def metal_img(w, h, sel=False):
+    """Brushed silver panel (soft diagonal sheen + fine horizontal brushing)."""
+    w, h = max(2, int(w)), max(2, int(h))
+    key = ("m", w, h, bool(sel))
+
+    def make():
+        top, bot = ("#1f2b3b", "#182230") if sel else ("#1c2331", "#161c28")
+        t = np.linspace(0, 1, h, dtype=np.float32)[:, None, None]
+        x = np.linspace(0, 1, w, dtype=np.float32)[None, :, None]
+        col = _rgb(top)[None, None, :] * (1 - t) + _rgb(bot)[None, None, :] * t
+        sheen = 0.5 + 0.5 * np.sin((x * 1.5 + t * 0.4) * np.pi * 2)
+        rows = np.random.default_rng(11).normal(0, 1.3, (h, 1, 1)).astype(np.float32)
+        img = np.clip(col + sheen * 2.0 - 1.0 + rows * 0.3, 0, 255)
+        rgba = np.concatenate([img, np.full((h, w, 1), 255, np.float32)], axis=2).astype(np.uint8)
+        return _photo(rgba)
+    return _cached(key, make)
+
+
+def knob_img(d, hot=False):
+    return skin_img(d, d, d / 2.0, "#99f6e4" if hot else "#5eead4", "#0f766e" if not hot else "#14b8a6",
+                    border="#0b4f49", gloss=0.30, shadow=max(2, d // 9))
+
+
+def _mix(c1, c2, t):
+    a, b = _rgb(c1), _rgb(c2)
+    m = a * (1 - t) + b * t
+    return "#%02x%02x%02x" % tuple(int(v) for v in m)
+
+
+def meter_color(f):
+    """0..1 along the meter -> blue, cyan, green, yellow, orange, red."""
+    stops = [(0.00, (28, 84, 255)), (0.20, (0, 165, 255)), (0.40, (0, 210, 145)),
+             (0.60, (115, 220, 40)), (0.76, (255, 208, 0)), (0.89, (255, 128, 0)), (1.00, (255, 46, 46))]
+    f = min(1.0, max(0.0, f))
+    for (a, ca), (b, cb) in zip(stops, stops[1:]):
+        if f <= b:
+            k = (f - a) / (b - a)
+            return "#%02x%02x%02x" % tuple(int(ca[i] + (cb[i] - ca[i]) * k) for i in range(3))
+    return "#e13232"
+
+
+def p_audio(c, cx, cy, s):
+    """Magnifier with a check mark: Media Check, Repair & Search."""
+    ink, lw = c.ink(), _lw(s, .06)
+    r = s * .26
+    c.create_oval(cx - s * .08 - r, cy - s * .08 - r, cx - s * .08 + r, cy - s * .08 + r, outline=ink, width=lw)
+    c.create_line(cx + s * .12, cy + s * .12, cx + s * .34, cy + s * .34, fill=ink, width=lw, capstyle="round")
+    c.create_line(cx - s * .2, cy - s * .06, cx - s * .1, cy + s * .04, cx + s * .06, cy - s * .16,
+                  fill=ink, width=lw, joinstyle="round", capstyle="round")
+
+
+class BrandMark(tk.Canvas):
+    """Logo block at the left of the header: waveform tile + product name."""
+
+    def __init__(self, master):
+        self.tile = u(104)
+        w, h = u(640), u(120)
+        super().__init__(master, width=w, height=h, bg=PAL["toolbar"], highlightthickness=0, bd=0)
+        t = self.tile
+        y0 = (h - t) // 2
+        self.create_image(u(14), y0, anchor="nw", image=skin_img(t, t, u(26), "#34d9c4", "#0a6a60", border="#0a5d55"))
+        heights = (.22, .46, .70, .38, .58, .30, .16)
+        bw = t * .075
+        gap = t * .115
+        x = u(14) + t / 2 - (len(heights) - 1) * gap / 2
+        for hh in heights:
+            self.create_line(x, y0 + t / 2 - t * hh / 2, x, y0 + t / 2 + t * hh / 2,
+                             fill="#ffffff", width=max(2, bw), capstyle="round")
+            x += gap
+        tx = u(14) + t + u(22)
+        self.create_text(tx, h / 2 - u(15), text="Studio Audio Editor", anchor="w", fill="#ffffff", font=fnt(40, True))
+        self.create_text(tx, h / 2 + u(25), text="Create  \u00b7  Edit  \u00b7  Enhance  \u00b7  Enjoy", anchor="w",
+                         fill="#7d8aa8", font=fnt(22))
+
+
+class PillGroup(tk.Canvas):
+    """A rounded 'pill' container: put widgets into `.inner`."""
+
+    def __init__(self, master, bg=None, pad=None, radius=None):
+        self.padp = pad if pad is not None else u(6)
+        self.rad = radius if radius is not None else u(16)
+        super().__init__(master, bg=bg or PAL["toolbar"], highlightthickness=0, bd=0)
+        self.inner = tk.Frame(self, bg=PAL["pill"])
+        self.create_window(self.padp, self.padp, window=self.inner, anchor="nw", tags="win")
+        self._wh = None
+        self.inner.bind("<Configure>", self._sync)
+
+    def _sync(self, _e=None):
+        w = self.inner.winfo_reqwidth() + 2 * self.padp
+        h = self.inner.winfo_reqheight() + 2 * self.padp
+        if (w, h) == self._wh:
+            return
+        self._wh = (w, h)
+        self.configure(width=w, height=h)
+        img = skin_img(w, h, self.rad, PAL["pill"], PAL["pill"], border=PAL["pill_edge"], bw=max(1.2, u(1.6)))
+        self.delete("bg")
+        self.create_image(0, 0, image=img, anchor="nw", tags="bg")
+        self.tag_lower("bg")
+
+
+
+
+class IconButton(tk.Canvas):
+    """styles: navy (glossy blue circle) | round (silver circle) | pill (silver rounded) | tool (flat)"""
+
+    def __init__(self, master, w, h, painter, command=None, text=None, layout="icon",
+                 dim_face=False, bg=None, style="tool"):
+        super().__init__(master, width=w, height=h, bg=bg or PAL["pill"], highlightthickness=0, bd=0)
+        self.w, self.h, self.painter, self.command = w, h, painter, command
+        self.text, self.layout, self.dim_face, self.style = text, layout, dim_face, style
+        self.enabled, self.active, self.alert = True, False, False
+        self._hover = self._down = False
+        self.bind("<Enter>", lambda e: self._set_state(hover=True))
+        self.bind("<Leave>", lambda e: self._set_state(hover=False, down=False))
+        self.bind("<ButtonPress-1>", lambda e: self._set_state(down=True))
+        self.bind("<ButtonRelease-1>", self._release)
+        self.draw()
+
+    def ink(self, col=None):
+        if not self.enabled:
+            return PAL["icon_off"]
+        if self.style in ("navy", "navysq"):
+            return "#ffffff"
+        return col or PAL["icon"]
+
+    def _set_state(self, hover=None, down=None):
+        if hover is not None:
+            self._hover = hover
+        if down is not None:
+            self._down = down
+        self.draw()
+
+    def _release(self, ev):
+        was = self._down
+        self._set_state(down=False)
+        if was and self.enabled and 0 <= ev.x <= self.w and 0 <= ev.y <= self.h and self.command:
+            self.command()
+
+    def set(self, enabled=None, active=None):
+        changed = False
+        if enabled is not None and enabled != self.enabled:
+            self.enabled, changed = enabled, True
+        if active is not None and active != self.active:
+            self.active, changed = active, True
+        if changed:
+            self.draw()
+
+    def _face(self):
+        w, h, st = self.w, self.h, self.style
+        down, hov, on, act = self._down and self.enabled, self._hover and self.enabled, self.enabled, self.active
+        if st in ("navysq", "navy"):
+            sh = max(3, u(5)) if st == "navy" else max(2, u(3))
+            if not on:
+                c = ("#2a3246", "#222a3b", "#1b2130")
+            elif self.alert and st == "navy":        # the record button: coral red
+                if act:
+                    c = ("#ff9aa8", "#f43f5e", "#be123c")
+                elif down:
+                    c = ("#be123c", "#9f1239", "#6b0f27")
+                elif hov:
+                    c = ("#fda4af", "#f43f5e", "#be123c")
+                else:
+                    c = ("#fb7185", "#e11d48", "#9f1239")
+            elif act:
+                c = ("#99f6e4", "#2dd4bf", "#0f766e")
+            elif down:
+                c = ("#0f8f82", "#0a5d55", "#073d38")
+            elif hov:
+                c = ("#5eead4", "#14b8a6", "#0d7f74")
+            else:
+                c = ("#34d9c4", "#0f9d8f", "#0a6a60")
+            rad = min(w, h) / 2.0 if st == "navy" else u(13)
+            return skin_img(w, h, rad, c[0], c[1], border=c[2], gloss=0.25, shadow=sh)
+        if st == "round":
+            if not on:
+                c = ("#1b2030", "#171c28", "#232a3a")
+            elif act:
+                c = ("#134e4a", "#115e59", "#2dd4bf")
+            elif down:
+                c = ("#171c28", "#1d2433", "#2f3a50")
+            elif hov:
+                c = ("#364160", "#2b3550", "#4a5878")
+            else:
+                c = ("#2c354c", "#242c40", "#3b4660")
+            return skin_img(w, h, min(w, h) / 2.0, c[0], c[1], border=c[2], shadow=max(2, u(3)))
+        if st == "pill":
+            if not on:
+                c = ("#1a1f2c", "#171b27", "#232a3a")
+            elif act:
+                c = ("#134e4a", "#115e59", "#2dd4bf")
+            elif down:
+                c = ("#141922", "#1a2030", "#2f3a50")
+            elif hov:
+                c = ("#364160", "#2b3550", "#4a5878")
+            else:
+                c = ("#2c354c", "#242c40", "#3b4660")
+            return skin_img(w, h, u(14), c[0], c[1], border=c[2])
+        # tool: flat until hovered / active
+        if not on:
+            return skin_img(w, h, u(8), "#1a1f2b", "#1a1f2b") if self.dim_face else None
+        if act:
+            c = ("#134e4a", "#115e59", "#2dd4bf")
+        elif down:
+            c = ("#171c28", "#1d2433", "#3a4560")
+        elif hov:
+            c = ("#2c354c", "#242c40", "#3b4660")
+        else:
+            return None
+        return skin_img(w, h, u(8), c[0], c[1], border=c[2])
+
+    def draw(self):
+        self.delete("all")
+        img = self._face()
+        if img is not None:
+            self.create_image(0, 0, image=img, anchor="nw")
+        if self.layout == "stacked":
+            self.painter(self, self.w / 2, self.h * .36, self.h * .46)
+            self.create_text(self.w / 2, self.h * .8, text=self.text, fill=self.ink(), font=fnt(27))
+        elif self.layout == "inline":
+            self.painter(self, self.h * .52, self.h / 2, self.h * .66)
+            self.create_text(self.h * 1.02, self.h / 2, text=self.text, anchor="w", fill=self.ink(), font=fnt(28))
+        else:
+            k = {"navy": 1.45, "round": 1.2, "navysq": 1.25}.get(self.style, 1.0)
+            self.painter(self, self.w / 2, self.h / 2, min(self.w, self.h) * k)
+
+
+class Gripper(tk.Canvas):
+    def __init__(self, master, h=None, bg=None):
+        h, w = h or u(34), u(14)
+        super().__init__(master, width=w, height=h, bg=bg or PAL["toolbar"], highlightthickness=0)
+        r = max(1, u(2))
+        for col in (0, 1):
+            for row in range(3):
+                x, y = w / 2 + (col - .5) * u(6), h / 2 + (row - 1) * u(7)
+                self.create_oval(x - r, y - r, x + r, y + r, fill=PAL["grip"], outline="")
+
+
+class CheckBox(tk.Canvas):
+    """Toggle switch (replaces the tick box; same variable, same behaviour)."""
+
+    def __init__(self, master, text, var, command=None):
+        self.var, self.command, self.text = var, command, text
+        self.sw_w, self.sw_h = u(64), u(32)
+        font = fnt(26)
+        super().__init__(master, width=self.sw_w + u(14) + measure(font, text) + u(8), height=self.sw_h + u(10),
+                         bg=PAL["bottom"], highlightthickness=0, cursor="arrow")
+        self.bind("<ButtonPress-1>", self._toggle)
+        self.draw()
+
+    def _toggle(self, _e):
+        self.var.set(not self.var.get())
+        self.draw()
+        if self.command:
+            self.command()
+
+    def draw(self):
+        self.delete("all")
+        on = bool(self.var.get())
+        w, h = self.sw_w, self.sw_h
+        top, bot, bd = ("#2dd4bf", "#0f9d8f", "#0a5d55") if on else ("#2a3246", "#222a3b", "#3b4660")
+        self.create_image(1, 4, image=skin_img(w, h, h / 2.0, top, bot, border=bd), anchor="nw")
+        kd = h - u(8)
+        kx = (w - kd - u(4)) if on else u(4)
+        self.create_image(kx, 4 + (h - kd) / 2.0, anchor="nw",
+                          image=skin_img(kd, kd, kd / 2.0, "#f1f5f9", "#cbd5e1", border="#64748b", shadow=max(2, u(2))))
+        self.create_text(w + u(14), 4 + h / 2.0 - 1, text=self.text, anchor="w", fill=PAL["ink"], font=fnt(26))
+
+
+class LevelMeter(tk.Canvas):
+    LABELS = (-54, -48, -42, -36, -30, -24, -18, -12, 0)
+
+    def __init__(self, master, w, h, knob_db=-6.0, on_knob=None):
+        super().__init__(master, width=w, height=h, bg=PAL["pill"], highlightthickness=0)
+        self.w, self.h = w, h
+        self.lv = [0.0, 0.0]
+        self.knob_db, self.on_knob = knob_db, on_knob
+        self.x54, self.step = u(52), u(43)
+        self._built = False
+        if on_knob:
+            self.bind("<ButtonPress-1>", self._drag)
+            self.bind("<B1-Motion>", self._drag)
+        self.draw()
+
+    def x(self, db):
+        return self.x54 + (db + 54) / 6.0 * self.step
+
+    def _drag(self, ev):
+        db = min(-3.0, max(-54.0, -54 + (ev.x - self.x54) / self.step * 6.0))
+        self.knob_db = db
+        if self.on_knob:
+            self.on_knob(db)
+        self.draw()
+
+    def set_levels(self, l, r):
+        new = [max(l, self.lv[0] * .82), max(r, self.lv[1] * .82)]
+        if new != self.lv:
+            self.lv = new
+            self.draw()
+
+    @staticmethod
+    def _dim(col):
+        a, b = _rgb(col), _rgb("#3a4560")
+        m = a * 0.20 + b * 0.80          # unlit = visible dark slot, lit segments stay bright full colour
+        return "#%02x%02x%02x" % tuple(int(v) for v in m)
+
+    def _build(self):
+        h, mid = self.h, self.h / 2
+        rrect(self, self.x54 - u(6), 1, self.x(0) + u(24), h - 1, u(9), fill="", outline=PAL["meter_edge"],
+              width=max(1, u(2)))
+        self.create_text(u(8), h * .30, text="L", anchor="w", fill=PAL["icon"], font=fnt(21))
+        self.create_text(u(8), h * .72, text="R", anchor="w", fill=PAL["icon"], font=fnt(21))
+        x0, x1 = self.x54, self.x(0)
+        seg, gap, bt = max(3, u(7)), max(1, u(2)), u(14)
+        n = max(8, int((x1 - x0) / (seg + gap)))
+        self.segs = [[], []]
+        self._lit = [[False] * n, [False] * n]
+        for k in (0, 1):
+            y = u(2) if k == 0 else h - u(2) - bt
+            for i in range(n):
+                xs = x0 + i * (seg + gap)
+                col = meter_color((xs - x0) / max(1.0, x1 - x0))
+                rid = self.create_rectangle(xs, y, xs + seg, y + bt, fill=self._dim(col), outline="")
+                self.segs[k].append((rid, col, xs + seg / 2.0))
+        for db in self.LABELS:
+            x = self.x(db)
+            self.create_text(x, mid, text=str(db), fill=PAL["icon"], font=fnt(15))
+        self._knob = None
+        self._built = True
+
+    def draw(self):
+        if not self._built:
+            self._build()
+        for k, lvl in enumerate(self.lv):
+            lit_x = self.x(max(-54.0, 20 * math.log10(lvl))) if lvl > 1e-5 else -1
+            for i, (rid, col, xe) in enumerate(self.segs[k]):
+                on = xe <= lit_x
+                if on != self._lit[k][i]:
+                    self._lit[k][i] = on
+                    self.itemconfig(rid, fill=col if on else self._dim(col))
+        if self.knob_db is not None:
+            x, r, mid = self.x(self.knob_db), u(11), self.h / 2
+            if self._knob is None:
+                self._knob = self.create_oval(x - r, mid - r, x + r, mid + r, fill="#ffffff", outline=PAL["navy"],
+                                              width=max(2, u(2)))
+            else:
+                self.coords(self._knob, x - r, mid - r, x + r, mid + r)
+            self.tag_raise(self._knob)
+
+
+class ThinScroll(tk.Canvas):
+    def __init__(self, master, orient, command, thickness):
+        self.horiz = orient == "h"
+        super().__init__(master, bg=PAL["status"], highlightthickness=0, bd=0,
+                         height=thickness if self.horiz else 1, width=1 if self.horiz else thickness)
+        self.command = command
+        self.first, self.last = 0.0, 1.0
+        self._drag = None
+        self.bind("<Configure>", lambda _e: self._draw())
+        self.bind("<ButtonPress-1>", self._press)
+        self.bind("<B1-Motion>", self._move)
+        self.bind("<ButtonRelease-1>", lambda _e: setattr(self, "_drag", None))
+
+    def set(self, first, last):
+        self.first, self.last = float(first), float(last)
+        self._draw()
+
+    def _len(self):
+        return self.winfo_width() if self.horiz else self.winfo_height()
+
+    def _span(self):
+        n = max(1, self._len())
+        a, b = self.first * n, self.last * n
+        if b - a < u(30):
+            b = a + u(30)
+        return a, min(b, n)
+
+    def _draw(self):
+        self.delete("all")
+        if self._len() <= 2:
+            return
+        a, b = self._span()
+        th = max(2, u(4))
+        if self.horiz:
+            cy = self.winfo_height() / 2
+            self.create_line(a + th / 2, cy, b - th / 2, cy, fill=PAL["thumb"], width=th * 1.6, capstyle="round")
+        else:
+            cx = self.winfo_width() / 2
+            self.create_line(cx, a + th / 2, cx, b - th / 2, fill=PAL["thumb"], width=th * 1.6, capstyle="round")
+
+    def _press(self, ev):
+        pos = ev.x if self.horiz else ev.y
+        a, b = self._span()
+        if a <= pos <= b:
+            self._drag = (pos, self.first)
+        else:
+            self.command("scroll", 1 if pos > b else -1, "pages")
+
+    def _move(self, ev):
+        if self._drag:
+            pos = ev.x if self.horiz else ev.y
+            self.command("moveto", max(0.0, self._drag[1] + (pos - self._drag[0]) / max(1, self._len())))
+
+
+class ParamDialog(tk.Toplevel):
+    def __init__(self, parent, title, fields):
+        super().__init__(parent)
+        self.title(title)
+        self.transient(parent)
+        self.resizable(False, False)
+        self.result = None
+        self.vars = {}
+        for r, (key, label, default) in enumerate(fields):
+            ttk.Label(self, text=label).grid(row=r, column=0, sticky="w", padx=10, pady=5)
+            if isinstance(default, (list, tuple)):
+                v = tk.StringVar(value=default[0])
+                w = ttk.Combobox(self, textvariable=v, values=list(default), state="readonly", width=14)
+            else:
+                v = tk.StringVar(value=str(default))
+                w = ttk.Entry(self, textvariable=v, width=16)
+            w.grid(row=r, column=1, padx=10, pady=5)
+            self.vars[key] = (v, default)
+        bar = ttk.Frame(self)
+        bar.grid(row=len(fields), column=0, columnspan=2, pady=8)
+        ttk.Button(bar, text="OK", command=self._ok).pack(side="left", padx=6)
+        ttk.Button(bar, text="Cancel", command=self.destroy).pack(side="left", padx=6)
+        self.bind("<Return>", lambda _e: self._ok())
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.grab_set()
+        self.wait_window(self)
+
+    def _ok(self):
+        out = {}
+        try:
+            for k, (v, d) in self.vars.items():
+                if isinstance(d, (list, tuple)):
+                    out[k] = v.get()
+                elif isinstance(d, int):
+                    out[k] = int(float(v.get()))
+                elif isinstance(d, float):
+                    out[k] = float(v.get())
+                else:
+                    out[k] = v.get()
+        except ValueError:
+            messagebox.showerror("Invalid value", "Please enter numbers only.", parent=self)
+            return
+        self.result = out
+        self.destroy()
+
+
+DRUM_TRACK_RE = re.compile(r"drum|perc|kick|snare|hi-?hat|cymbal", re.I)
+
+
+class KeyChangerDialog(tk.Toplevel):
+    """Key Changer: shows the song's key, lets you step the new key up/down, then re-pitches the song.
+
+        Song key  [ A minor ]  [Detect]        <- detected automatically (you can type to correct it)
+        New key   [ B minor ]  [^][v]          <- Up/Down buttons or arrow keys, or type a key name
+        [ Apply Key Change ]                   <- Ctrl+Enter;  Ctrl+Z undoes it
+    """
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title("Key Changer")
+        self.transient(app)
+        self.resizable(False, False)
+        self.configure(bg=PAL["bottom"])
+        self.cur = None                    # (tonic, mode) of the loaded song
+        self.shift = 0                     # semitones to apply (-12..+12)
+        self.busy = False
+        self.song_var = tk.StringVar()
+        self.new_var = tk.StringVar()
+        self.shift_var = tk.StringVar()
+        self.info_var = tk.StringVar(value="Detecting key...")
+        self.status_var = tk.StringVar(value="")
+        self.sel_var = tk.BooleanVar(value=False)
+        self.drum_var = tk.BooleanVar(value=True)
+        self._build()
+        self.bind("<Escape>", lambda _e: self.close())
+        self.bind("<Up>", lambda _e: self._step(+1))
+        self.bind("<Down>", lambda _e: self._step(-1))
+        self.bind("<Control-Return>", lambda _e: self.apply())
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self._place()
+        self.after(150, self.detect)
+
+    # ---------------- UI ----------------
+    def _build(self):
+        pad = u(12)
+        f = ttk.Frame(self, padding=pad)
+        f.grid(sticky="nsew")
+        big = fnt(22, True)
+        self.head_var = tk.StringVar(value="Key of the loaded song")
+        ttk.Label(f, textvariable=self.head_var, font=fnt(13, True)).grid(row=0, column=0, columnspan=3, sticky="w")
+        self.song_entry = ttk.Entry(f, textvariable=self.song_var, width=13, font=big, justify="center")
+        self.song_entry.grid(row=1, column=0, columnspan=2, sticky="we", pady=(u(4), 0))
+        ttk.Button(f, text="Detect", command=self.detect, width=8).grid(row=1, column=2, padx=(u(8), 0))
+        ttk.Label(f, textvariable=self.info_var, foreground="#666").grid(row=2, column=0, columnspan=3, sticky="w", pady=(u(2), u(10)))
+        ttk.Label(f, text="Change the key to", font=fnt(13, True)).grid(row=3, column=0, columnspan=3, sticky="w")
+        self.new_entry = ttk.Entry(f, textvariable=self.new_var, width=13, font=big, justify="center")
+        self.new_entry.grid(row=4, column=0, columnspan=2, sticky="we", pady=(u(4), 0))
+        arrows = ttk.Frame(f)
+        arrows.grid(row=4, column=2, padx=(u(8), 0))
+        ttk.Button(arrows, text="\u25b2", width=4, command=lambda: self._step(+1)).pack()
+        ttk.Button(arrows, text="\u25bc", width=4, command=lambda: self._step(-1)).pack()
+        ttk.Label(f, textvariable=self.shift_var, font=fnt(13, True)).grid(row=5, column=0, columnspan=3, sticky="w", pady=(u(2), u(10)))
+        self.sel_chk = ttk.Checkbutton(f, text="Only the selected region / tracks", variable=self.sel_var)
+        self.sel_chk.grid(row=6, column=0, columnspan=3, sticky="w")
+        ttk.Checkbutton(f, text="Leave drum / percussion tracks unchanged", variable=self.drum_var).grid(
+            row=7, column=0, columnspan=3, sticky="w")
+        self.prog = ttk.Progressbar(f, maximum=1.0, length=u(300))
+        self.prog.grid(row=8, column=0, columnspan=3, sticky="we", pady=(u(10), 0))
+        ttk.Label(f, textvariable=self.status_var, foreground="#444", wraplength=u(330), justify="left").grid(
+            row=9, column=0, columnspan=3, sticky="w")
+        bar = ttk.Frame(f)
+        bar.grid(row=10, column=0, columnspan=3, pady=(u(10), 0))
+        self.apply_btn = ttk.Button(bar, text="Apply Key Change", command=self.apply)
+        self.apply_btn.pack(side="left", padx=4)
+        ttk.Button(bar, text="Reset", command=self.reset).pack(side="left", padx=4)
+        ttk.Button(bar, text="Close", command=self.close).pack(side="left", padx=4)
+        self.song_entry.bind("<Return>", lambda _e: self._typed_song())
+        self.new_entry.bind("<Return>", lambda _e: self._typed_new())
+        self.new_entry.bind("<FocusOut>", lambda _e: self._typed_new())
+        self.song_entry.bind("<FocusOut>", lambda _e: self._typed_song())
+
+    def _place(self):
+        place_window(self, parent=self.app)
+
+    def close(self):
+        self.destroy()
+
+    # ---------------- state ----------------
+    def _refresh(self):
+        if self.cur is None:
+            self.new_var.set("")
+            self.shift_var.set("")
+            self.apply_btn.state(["disabled"])
+            return
+        tonic, mode = self.cur
+        self.new_var.set(key_label((tonic + self.shift) % 12, mode))
+        if self.shift == 0:
+            self.shift_var.set("No change")
+        else:
+            self.shift_var.set(f"{self.shift:+d} semitone{'s' if abs(self.shift) != 1 else ''} "
+                               f"({'up' if self.shift > 0 else 'down'})")
+        self.apply_btn.state(["disabled" if (self.shift == 0 or self.busy) else "!disabled"])
+
+    def _step(self, d):
+        if self.cur is None or self.busy:
+            return
+        self.shift = max(-12, min(12, self.shift + d))
+        self._refresh()
+
+    def reset(self):
+        self.shift = 0
+        self._refresh()
+
+    def _typed_song(self):
+        k = parse_key(self.song_var.get())
+        if k is None:
+            if self.cur:
+                self.song_var.set(key_label(*self.cur))
+            return
+        mode = k[1] or (self.cur[1] if self.cur else "major")
+        self.cur = (k[0], mode)
+        self.song_var.set(key_label(*self.cur))
+        self._refresh()
+
+    def _typed_new(self):
+        if self.cur is None or self.busy:
+            return
+        k = parse_key(self.new_var.get())
+        if k is None:
+            self._refresh()
+            return
+        d = (k[0] - self.cur[0] + 6) % 12 - 6          # nearest direction, -6..+5
+        self.shift = d
+        self._refresh()
+        if k[1] and k[1] != self.cur[1]:
+            self.status_var.set("Major \u2194 minor can't be changed by transposing - used the note only.")
+
+    # ---------------- detect ----------------
+    def detect(self):
+        app = self.app
+        if self.busy or not app.proj.tracks:
+            return
+        self.config(cursor="watch")
+        self.info_var.set("Detecting key...")
+        self.update_idletasks()
+        try:
+            idx = sorted(i for i in app.selected if i < len(app.proj.tracks))
+            if idx:                      # same source as the toolbar's key box: the selected track(s)
+                mix = _mix_for_key([(app.proj.tracks[i].data, app.proj.tracks[i].offset) for i in idx])
+                self.head_var.set("Key of the selected track" + ("s" if len(idx) > 1 else ""))
+                self.sel_var.set(True)
+            else:
+                mix = app.proj.mixdown()
+                self.head_var.set("Key of the loaded song")
+                self.sel_var.set(False)
+            if len(mix) < app.proj.rate * 3:
+                raise ValueError("Audio is too short to detect a key.")
+            k = detect_song_key(mix, app.proj.rate)
+        except Exception as ex:
+            self.info_var.set(f"Could not detect the key ({ex}). Type it in the box above.")
+            self.cur = self.cur or (0, "major")
+            self.song_var.set(key_label(*self.cur))
+        else:
+            if k["confidence"] == "None":
+                self.cur = self.cur or (0, "major")
+                self.song_var.set(key_label(*self.cur))
+                self.info_var.set("No clear key found (noise or drums only). Type the key in the box above.")
+                self.shift = 0
+                self.config(cursor="")
+                self._refresh()
+                return
+            self.cur = (k["tonic"], k["mode"])
+            self.song_var.set(k["label"])
+            extra = f"  \u00b7  also possible: {k['alt']}" if k["confidence"] != "High" else ""
+            self.info_var.set(f"Confidence: {k['confidence']}  \u00b7  relative key: {k['relative']}{extra}")
+            self.shift = 0
+        finally:
+            self.config(cursor="")
+        self._refresh()
+
+    # ---------------- apply ----------------
+    def apply(self):
+        global PV_PROGRESS
+        app = self.app
+        if self.busy or self.cur is None or self.shift == 0 or not app.proj.tracks:
+            return
+        semis = self.shift
+        has_sel = app._has_sel()
+        only_sel = bool(self.sel_var.get()) and (has_sel or bool(app.selected))
+        tracks = app.targets() if only_sel else list(app.proj.tracks)
+        skipped = [t for t in tracks if self.drum_var.get() and DRUM_TRACK_RE.search(t.name or "")]
+        tracks = [t for t in tracks if t not in skipped]
+        if not tracks:
+            return messagebox.showinfo("Key Changer", "Nothing to change: every track is a drum track.", parent=self)
+        app.stop()
+        rate = app.proj.rate
+        spans = []
+        for t in tracks:
+            s, e = app.sel if (only_sel and has_sel) else (t.offset, t.end)
+            a, b = t.local(s, e)
+            spans.append((t, s, e, max(0, b - a)))
+        total = max(1, sum(sp[3] for sp in spans))
+        old_label = key_label(*self.cur)
+        new_label = key_label((self.cur[0] + semis) % 12, self.cur[1])
+        app.proj.push_undo()
+        self.busy = True
+        self.apply_btn.state(["disabled"])
+        self.config(cursor="watch")
+        app.config(cursor="watch")
+        done = 0
+        ok = True
+        try:
+            for t, s, e, n in spans:
+                base = done
+
+                def hook(fr, base=base, n=n):
+                    self.prog["value"] = (base + fr * n) / total
+                    self.status_var.set(f"Changing key: {t.name}  ({int(100 * (base + fr * n) / total)}%)")
+                    self.update_idletasks()
+                PV_PROGRESS = hook
+                t.apply(s, e, lambda x: fx_pitch_shift(x, rate, semis))
+                done += n
+        except Exception as ex:
+            ok = False
+            app.proj.undo()
+            messagebox.showerror("Key change failed", str(ex), parent=self)
+        finally:
+            PV_PROGRESS = None
+            self.busy = False
+            self.config(cursor="")
+            app.config(cursor="")
+        app.after_edit()
+        self.prog["value"] = 0
+        if ok:
+            note = f"  ({len(skipped)} drum track{'s' if len(skipped) != 1 else ''} left unchanged)" if skipped else ""
+            self.status_var.set(f"Done: {old_label} \u2192 {new_label} ({semis:+d}).{note}  Ctrl+Z to undo.")
+            app.status_var.set(f"Key changed {old_label} \u2192 {new_label}")
+            if only_sel:
+                self.shift = 0
+                self.detect()
+            else:
+                self.cur = ((self.cur[0] + semis) % 12, self.cur[1])
+                self.song_var.set(key_label(*self.cur))
+                self.shift = 0
+                self.info_var.set("Key changed. Detect again to double-check.")
+        self._refresh()
+
+
+GRID_CHOICES = ("Bar", "1/2", "1/4", "1/8", "1/16", "1/32", "1/64",
+                "Seconds", "Deciseconds", "Centiseconds", "Milliseconds")
+MINOR_DIV = {2: 4, 15: 3, 30: 3, 60: 6, 120: 4, 0.2: 4, 0.02: 4, 0.002: 4}
+RULER_STEPS = [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600,
+               900, 1800, 3600]
+
+
+# =====================================================================
+#  APP
+# =====================================================================
+class App(tk.Tk):
+    def __init__(self, files=()):
+        super().__init__()
+        self.withdraw()                      # stay hidden until fully built (the splash is showing)
+        init_metrics(self.winfo_screenwidth())
+        self.title(f"Studio Audio Editor  \u00b7  build {editor_build_id()}")
+        print("Studio Audio Editor loaded from:", os.path.abspath(__file__), flush=True)
+        self.configure(bg=PAL["desk"])
+        self.minsize(u(1500), u(800))
+        self.proj = Project()
+        self.player, self.recorder = Player(), Recorder()
+        self.player.eq = self.proj.eq
+        self.px_per_sec = 100.0
+        self.view_start = 0
+        self.cursor = 0
+        self.sel = None
+        self.selected = set()
+        self.recording = False
+        self.paused = False
+        self.record_origin = 0
+        self.play_origin = 0
+        self.play_speed = 1.0
+        self._drag0 = 0
+        self._slider = None
+        self._lane_geo, self.tool_mode, self._gesture = {}, "select", None
+        self._play_ctx, self._remix_job = None, None      # for live mute / solo / fader changes
+        self._hits = []
+        self._last_zoom = None
+        self._last_effect = None
+        self.loop_var = tk.BooleanVar(value=False)
+        self.status_var = tk.StringVar(value="Stopped.")
+        self.time_var = tk.StringVar(value=fmt_hms(0))
+        self.sel_a_var = tk.StringVar(value=fmt_hmsms(0))
+        self.sel_b_var = tk.StringVar(value=fmt_hmsms(0))
+        self.tempo_var = tk.IntVar(value=120)
+        self.ts_num_var = tk.IntVar(value=4)
+        self.ts_den_var = tk.StringVar(value="4")
+        self.snap_var = tk.BooleanVar(value=True)
+        self.grid_var = tk.StringVar(value="1/8")
+        self.show_bars_var = tk.BooleanVar(value=True)        # draw bar / beat lines on the timeline
+        self._grid_pending = False
+        for _v in (self.tempo_var, self.ts_num_var, self.ts_den_var, self.grid_var, self.show_bars_var):
+            _v.trace_add("write", self._grid_changed)
+        self.speed_var = tk.DoubleVar(value=1.0)
+        self.out_dev = tk.IntVar(value=-1)
+        self.in_dev = tk.IntVar(value=-1)
+        _splash("Applying the studio theme...", 0.70)
+        self._style()
+        _splash("Building menus...", 0.76)
+        self._build_menu()
+        _splash("Building toolbars...", 0.84)
+        self._build_toolbar()
+        _splash("Building status bar...", 0.90)
+        self._build_bottom()
+        _splash("Preparing the timeline...", 0.95)
+        self._build_canvas()
+        self._bind_keys()
+        self.protocol("WM_DELETE_WINDOW", self.quit_app)
+        try:
+            self.state("zoomed")
+        except tk.TclError:
+            self._center_window(int(self.winfo_screenwidth() * .92), int(self.winfo_screenheight() * .88))
+        self.update_idletasks()
+        self.deiconify()
+        _splash_close()
+        if sd is None:
+            self.status_var.set("sounddevice not installed - editing works, playback/record disabled")
+        self.after(150, lambda: self._import(list(files)))
+        self.after(40, self._tick)
+
+    def _center_window(self, w, h):
+        self.update_idletasks()
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        w, h = min(w, sw), min(h, sh)
+        self.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+
+    def _style(self):
+        st = ttk.Style(self)
+        try:
+            st.theme_use("clam")
+        except tk.TclError:
+            pass
+        P = PAL
+        ink, bg, edge = P["ink"], P["bottom"], "#3a4560"
+        fld = "#0d1118"
+        st.configure(".", background=bg, foreground=ink, bordercolor=edge, lightcolor="#2a3348",
+                     darkcolor="#0d1118", troughcolor="#0d1118", focuscolor=bg, fieldbackground=fld,
+                     selectbackground=P["navy"], selectforeground="#ffffff", insertcolor=ink)
+        for w_ in ("TFrame", "TLabelframe", "TNotebook"):
+            st.configure(w_, background=bg)
+        st.configure("TLabel", background=bg, foreground=ink)
+        st.configure("TLabelframe.Label", background=bg, foreground=ink)
+        for w_ in ("TCheckbutton", "TRadiobutton"):
+            st.configure(w_, background=bg, foreground=ink, indicatorcolor=fld)
+            st.map(w_, indicatorcolor=[("selected", P["navy"]), ("pressed", "#1d2433")],
+                   background=[("active", bg)])
+        st.configure("TButton", background="#262e41", foreground=ink, bordercolor=edge, padding=(10, 4))
+        st.map("TButton", background=[("pressed", "#171c28"), ("active", "#313b54"), ("disabled", "#1a1f2c")],
+               foreground=[("disabled", "#586380")])
+        for w_ in ("TEntry", "TSpinbox", "TCombobox"):
+            st.configure(w_, fieldbackground=fld, bordercolor=edge, arrowcolor=P["navy"], padding=3,
+                         background="#262e41", foreground=ink)
+        st.map("TCombobox", fieldbackground=[("readonly", fld)], foreground=[("readonly", ink)],
+               selectbackground=[("readonly", fld)], selectforeground=[("readonly", ink)])
+        st.configure("Horizontal.TScale", background=P["navy"], troughcolor="#0d1118", bordercolor=edge,
+                     lightcolor=P["navy"], darkcolor=P["navy"])
+        st.configure("Horizontal.TProgressbar", background=P["navy"], troughcolor="#0d1118", bordercolor=edge,
+                     lightcolor="#5eead4", darkcolor=P["navy"])
+        st.configure("TScrollbar", background="#2a3348", troughcolor="#10141c", arrowcolor=P["navy"],
+                     bordercolor=edge)
+        self.option_add("*TCombobox*Listbox.font", fnt(26))
+        self.option_add("*TCombobox*Listbox.background", fld)
+        self.option_add("*TCombobox*Listbox.foreground", ink)
+        self.option_add("*TCombobox*Listbox.selectBackground", P["navy"])
+        self.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
+        self.option_add("*Menu.background", "#1a202c")
+        self.option_add("*Menu.foreground", ink)
+        self.option_add("*Menu.activeBackground", P["navy"])
+        self.option_add("*Menu.activeForeground", "#ffffff")
+        self.option_add("*Menu.disabledForeground", "#586380")
+        self.after(250, self._style_titlebar)
+
+    def _style_titlebar(self):
+        """Windows 11: navy title bar with white text (silently ignored elsewhere)."""
+        try:
+            import ctypes
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+
+            def put(attr, rgb):
+                val = ctypes.c_int(rgb[2] << 16 | rgb[1] << 8 | rgb[0])
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(val), ctypes.sizeof(val))
+            put(35, (0x14, 0x18, 0x21))      # caption colour
+            put(36, (255, 255, 255))         # caption text
+            put(34, (0x2e, 0x39, 0x4f))      # window border
+        except Exception:
+            pass
+
+    # -------------------- recent files --------------------
+    def _rebuild_recent_menu(self):
+        m = self._recent_menu
+        m.delete(0, "end")
+        items = [p for p in _load_recent() if os.path.exists(p)]
+        if not items:
+            m.add_command(label="(no recent files)", state="disabled")
+            return
+        for p in items:
+            label = os.path.basename(p)
+            folder = os.path.dirname(p)
+            if len(folder) > 50:
+                folder = "..." + folder[-47:]
+            m.add_command(
+                label=f"{label}    \u2014  {folder}",
+                command=lambda path=p: self.open_recent(path))
+        m.add_separator()
+        m.add_command(label="Clear recent files", command=self._clear_recent)
+
+    def _clear_recent(self):
+        _save_recent([])
+        self._rebuild_recent_menu()
+
+    def open_recent(self, path):
+        if not os.path.exists(path):
+            messagebox.showerror("File not found",
+                                 f"This file no longer exists:\n{path}")
+            self._rebuild_recent_menu()
+            return
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".npz":
+            if not self._confirm_discard():
+                return
+            try:
+                p = Project()
+                p.load(path)
+            except Exception as ex:
+                return messagebox.showerror("Open failed", str(ex))
+            self.stop()
+            self.proj, self.sel, self.selected, self.cursor = p, None, set(), 0
+            self._close_eq()
+            self.zoom_fit()
+        else:
+            self._import([path])
+
+    # -------------------- menu --------------------
+    def _build_menu(self):
+        m = tk.Menu(self)
+        self.config(menu=m)
+
+        def menu(label, items):
+            sub = tk.Menu(m, tearoff=0)
+            for it in items:
+                if it is None:
+                    sub.add_separator()
+                elif it[0] == "sub":
+                    sub.add_cascade(label=it[1], menu=it[2])
+                elif it[0] == "check":
+                    sub.add_checkbutton(label=it[1], variable=it[2],
+                                        command=it[3], accelerator=it[4])
+                else:
+                    sub.add_command(label=it[0], command=it[1],
+                                    accelerator=it[2] if len(it) > 2 else "")
+            m.add_cascade(label=label, menu=sub)
+            return sub
+
+        def make_sub(parent, items):
+            """Build a cascading sub-menu. items: (label, command[, accelerator]) or None for a separator."""
+            sub = tk.Menu(parent, tearoff=0)
+            for it in items:
+                if it is None:
+                    sub.add_separator()
+                else:
+                    sub.add_command(label=it[0], command=it[1],
+                                    accelerator=it[2] if len(it) > 2 else "")
+            return sub
+
+        self._recent_menu = tk.Menu(m, tearoff=0)
+        self._rebuild_recent_menu()
+
+        menu("File", [
+            ("New", self.new_project, "Ctrl+N"),
+            ("Open...", self.open_project, "Ctrl+O"),
+            ("sub", "Recent Files", self._recent_menu),
+            None,
+            ("Save Project", self.save_project, "Ctrl+S"),
+            ("Save Project As...", lambda: self.save_project(True)),
+            None,
+            ("Import Audio...", self.import_dialog, "Ctrl+Shift+I"),
+            ("Export Audio...", self.export_dialog, "Ctrl+Shift+E"),
+            ("Export Selected Audio...", lambda: self.export_dialog(True)),
+            ("Export Multiple...", self.export_multiple),
+            None,
+            ("Exit", self.quit_app, "Ctrl+Q")])
+
+        menu("Edit", [
+            ("Undo", self.undo, "Ctrl+Z"), ("Redo", self.redo, "Ctrl+Y"), None,
+            ("Cut", self.edit_cut, "Ctrl+X"), ("Copy", self.edit_copy, "Ctrl+C"),
+            ("Paste", self.edit_paste, "Ctrl+V"), ("Delete", self.edit_delete, "Del"), None,
+            ("Silence Audio", self.edit_silence, "Ctrl+L"), ("Trim Audio", self.edit_trim, "Ctrl+T"),
+            None, ("Split", self.edit_split, "Ctrl+I"),
+            ("Split New", self.edit_split_new, "Ctrl+Alt+I"),
+            ("Join", self.edit_join, "Ctrl+J"),
+            None, ("Repeat Last Effect", self.repeat_last_effect, "Ctrl+R")])
+
+        menu("Select", [
+            ("All", self.select_all, "Ctrl+A"), ("None", self.select_none, "Ctrl+Shift+A"), None,
+            ("Cursor to Start", lambda: self.set_cursor(0), "Home"),
+            ("Cursor to End", lambda: self.set_cursor(self.proj.length()), "End"),
+            None, ("Select Start to Cursor", self.select_start_to_cursor),
+            ("Select Cursor to End", self.select_cursor_to_end),
+            ("Select Region...", self.select_region)])
+
+        menu("View", [
+            ("Zoom In", lambda: self.zoom(2.0), "Ctrl+1"), ("Zoom Out", lambda: self.zoom(0.5), "Ctrl+3"), None,
+            ("Fit to Selection", self.zoom_sel), ("Fit to Width", self.zoom_fit, "Ctrl+Shift+F"),
+            ("Zoom Toggle", self.zoom_toggle, "Shift+Z"), None,
+            ("check", "Show Bar and Beat Lines", self.show_bars_var, self.redraw, "")])
+
+        menu("Transport", [
+            ("Play/Stop", self.toggle_play, "Space"), ("Play Selection", lambda: self.play(True), "Shift+Space"),
+            ("Pause", self.pause, "P"), ("Stop", self.stop, "S"), None,
+            ("Record", self.toggle_record, "R"), None,
+            ("check", "Loop Playback", self.loop_var, self._loop_changed, "Shift+L"), None,
+            ("Skip to Start", lambda: self.set_cursor(0), "Home"),
+            ("Skip to End", lambda: self.set_cursor(self.proj.length()), "End")])
+
+        mix_m = make_sub(m, [
+            ("Mix and Render", self.mix_and_render),
+            ("Mix and Render to New Track", self.mix_and_render_new)])
+        set_m = make_sub(m, [
+            ("Rename Track...", self.rename_track), ("Track Gain...", self.track_gain),
+            ("Track Pan...", self.track_pan), ("Time Shift...", self.track_shift)])
+        arr_m = make_sub(m, [
+            ("Move Track Up", lambda: self.move_track(-1)),
+            ("Move Track Down", lambda: self.move_track(1))])
+        lab_m = make_sub(m, [
+            ("Add Label at Selection", self.add_label, "Ctrl+B"),
+            ("Add Label at Playback Position", self.add_label_playback, "Ctrl+M"),
+            None, ("Edit Labels...", self.edit_labels)])
+
+        menu("Tracks", [
+            ("Add New Track", self.add_track), ("Remove Tracks", self.remove_tracks),
+            ("Duplicate Tracks", self.duplicate_tracks), None,
+            ("sub", "Mix and Render", mix_m),
+            ("sub", "Track Settings", set_m),
+            ("sub", "Arrange", arr_m),
+            ("sub", "Labels", lab_m)])
+
+        menu("Generate", [
+            ("Silence...", self.gen_silence), ("Tone...", self.gen_tone), ("Noise...", self.gen_noise),
+            ("Click Track...", self.gen_click), None, ("Chirp...", self.gen_chirp)])
+
+        eff = tk.Menu(m, tearoff=0)
+        self.menu_effect = eff          # also used by the toolbar button and the track right-click popup
+
+        def category(label, items):
+            eff.add_cascade(label=label, menu=make_sub(eff, items))
+
+        category("Volume & Fades", [
+            ("Amplify...", self.fx_amplify),
+            ("Normalize...", self.fx_normalize),
+            ("Loudness Normalize (LUFS)...", self.fx_loudness),
+            None,
+            ("Fade In", lambda: self.run_effect(fx_fade)),
+            ("Fade Out", lambda: self.run_effect(lambda x: fx_fade(x, False))),
+            ("Studio Fade Out", self.fx_studio_fade)])
+
+        category("Pitch & Speed", [
+            ("Key Changer...", self.open_key_changer, "Ctrl+K"),
+            None,
+            ("Change Pitch...", self.fx_pitch),
+            ("Change Speed...", self.fx_speed),
+            ("Change Tempo...", self.fx_tempo)])
+
+        category("EQ & Filters", [
+            ("Bass and Treble...", self.fx_bass_treble),
+            ("Presence / Air EQ...", self.fx_presence),
+            None,
+            ("Low-Pass Filter...", self.fx_lowpass),
+            ("High-Pass Filter...", self.fx_highpass),
+            ("Notch Filter...", self.fx_notch)])
+
+        category("Noise & Repair", [
+            ("Noise Reduction...", self.fx_noise_reduce),
+            ("Noise Gate...", self.fx_noise_gate),
+            None,
+            ("Click Removal...", self.fx_click_removal),
+            ("Clip Fix...", self.fx_clip_fix),
+            ("Declip (restore clipped peaks)", self.fx_declip),
+            None,
+            ("Remove DC Offset", lambda: self.run_effect(fx_dc))])
+
+        category("Dynamics", [
+            ("Compressor...", self.fx_compress),
+            ("Limiter...", self.fx_limiter),
+            ("True-Peak Limiter...", self.fx_tp_limiter)])
+
+        category("Echo & Space", [
+            ("Delay...", self.fx_delay),
+            ("Echo...", self.fx_echo),
+            ("Reverb...", self.fx_reverb)])
+
+        category("Creative & Modulation", [
+            ("Distortion...", self.fx_distortion),
+            ("Phaser...", self.fx_phaser),
+            ("Tremolo...", self.fx_tremolo),
+            ("Wahwah...", self.fx_wahwah),
+            ("Harmonic Exciter...", self.fx_exciter)])
+
+        category("Stereo & Phase", [
+            ("Stereo Widener...", self.fx_stereo_width),
+            ("Virtual Surround...", self.fx_virtual_surround),
+            None,
+            ("Bass to Mono...", self.fx_bass_mono),
+            ("Mono-Safe Stereo (reduce side)...", self.fx_side_reduce),
+            None,
+            ("Fix Inverted Polarity (right channel)", lambda: self.run_effect(fx_fix_polarity)),
+            ("Invert", lambda: self.run_effect(fx_invert))])
+
+        category("Clip Tools", [
+            ("Crossfade Clips...", self.fx_crossfade_clips),
+            ("Reverse", lambda: self.run_effect(fx_reverse))])
+
+        eff.add_separator()
+        eff.add_command(label="Repeat Last Effect", command=self.repeat_last_effect, accelerator="Ctrl+R")
+        eff.add_separator()
+        eff.add_command(label="Equalizer  \u00b7  Music Volume...", command=self.open_equalizer, accelerator="Ctrl+E")
+        eff.add_command(label="Audio Plus  \u00b7  Auto 5_Star Enhance...", command=self.open_auto_5star)
+        m.add_cascade(label="Effect", menu=eff)
+
+        menu("Analyze", [
+            ("Audio Health Check  (LUFS \u00b7 Clipping \u00b7 Mono \u00b7 Presence)...", self.open_health_check),
+            ("Plot Spectrum...", self.plot_spectrum),
+            ("Find Clipping...", self.find_clipping),
+            ("Silence Finder...", self.silence_finder),
+            ("Contrast...", self.contrast),
+            ("Beat Finder...", self.beat_finder)])
+
+        m.add_command(label="Equalizer...", command=self.open_equalizer)
+        m.add_command(label="Auto 5_Star Enhance...", command=self.open_auto_5star)
+
+        menu("Tools", [("Reset Zoom", self.zoom_fit), ("Spectrogram...", self.show_spectrogram),
+                       None,
+                       ("Media Check, Repair & Search...", self.open_audio_check)])
+        menu("Help", [("Keyboard Shortcuts", self.show_help)])
+
+        self.menu_track = tk.Menu(self, tearoff=0)
+        for lab, cmd in (("Rename...", self.rename_track), ("Gain...", self.track_gain),
+                         ("Pan...", self.track_pan), ("Time Shift...", self.track_shift),
+                         ("Duplicate", self.duplicate_tracks), ("Remove", self.remove_tracks)):
+            self.menu_track.add_command(label=lab, command=cmd)
+
+    # -------------------- Media Check, Repair & Search --------------------
+    def open_audio_check(self):
+        """Open Media Check, Repair & Search (Media_Check_and_Replace.py) in its own
+        window inside this program. Only one copy is opened at a time."""
+        win = getattr(self, "_audio_win", None)
+        try:
+            if win is not None and win.winfo_exists():
+                win.deiconify()
+                win.lift()
+                win.focus_force()
+                return
+        except tk.TclError:
+            pass
+        try:
+            import Media_Check_and_Replace as mcr
+        except Exception as ex:
+            return messagebox.showerror(
+                "Media Check, Repair & Search",
+                "Could not load Media_Check_and_Replace.py.\n"
+                "Keep it in the same folder as strudi_audio_editor.py.\n\n" + str(ex))
+        win = tk.Toplevel(self)
+        self._audio_win = win
+        try:
+            mcr.App(win)
+        except Exception as ex:
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+            self._audio_win = None
+            messagebox.showerror("Media Check, Repair & Search", str(ex))
+
+    # -------------------- toolbar --------------------
+    def _build_toolbar(self):
+        P = PAL
+        self.btn = {}
+        # ============ header: brand | transport (centred) | meters + key ============
+        hdr = tk.Frame(self, bg=P["toolbar"])
+        hdr.pack(side="top", fill="x")
+        hdr.columnconfigure(0, weight=1)
+        hdr.columnconfigure(3, weight=1)
+        BrandMark(hdr).grid(row=0, column=0, sticky="w", padx=(u(8), 0), pady=u(8))
+
+        tp = PillGroup(hdr, pad=u(6), radius=u(26))
+        tp.grid(row=0, column=1, padx=(u(10), 0), pady=u(10))
+        tk.Label(tp.inner, textvariable=self.time_var, bg=PAL["time_bg"], fg=PAL["digits"],
+                 font=fnt(46), padx=u(18), pady=u(6)).pack()
+        mid = PillGroup(hdr, pad=u(8), radius=u(34))
+        mid.grid(row=0, column=2, padx=u(20), pady=u(10))
+        g = mid.inner
+        bs = u(103)
+        spec = (("start", p_skip_start, lambda: self.set_cursor(0), "round"),
+                ("pause", p_pause, self.pause, "round"),
+                ("play", p_play, self.play, "navy"),
+                ("record", p_record, self.toggle_record, "navy"),
+                ("stop", p_stop, self.stop, "round"),
+                ("end", p_skip_end, lambda: self.set_cursor(self.proj.length()), "round"),
+                ("loop", p_loop, self._toggle_loop, "round"))
+        for key, painter, cmd, style in spec:
+            sz = int(bs * .96) if style == "navy" else int(bs * .74)
+            b_ = IconButton(g, sz, sz, painter, cmd, style=style)
+            b_.pack(side="left", padx=u(5))
+            self.btn[key] = b_
+        self.btn["record"].alert = True
+        self.btn["record"].draw()
+
+        right = tk.Frame(hdr, bg=P["toolbar"])
+        right.grid(row=0, column=3, sticky="e", padx=(0, u(12)))
+        # key readout: key of the selected track(s)
+        self.key_var = tk.StringVar(value="No selection")
+        self.key_sub_var = tk.StringVar(value="select a track on the left")
+        self._key_sig, self._key_cache, self._key_q = None, {}, queue.Queue()
+        kb = PillGroup(right, pad=u(5), radius=u(20))
+        kb.pack(side="right", padx=(u(10), 0), pady=u(8))
+        box = kb.inner
+        box.configure(cursor="hand2")
+        cap = tk.Label(box, text="KEY OF SELECTED TRACK", bg=P["pill"], fg="#7d8aa8", font=fnt(12, True))
+        cap.pack(padx=u(14), pady=(u(5), 0))
+        self._key_lbl = tk.Label(box, textvariable=self.key_var, bg=P["pill"], fg="#6b7690",
+                                 font=fnt(30, True), width=12)
+        self._key_lbl.pack(padx=u(10))
+        sub = tk.Label(box, textvariable=self.key_sub_var, bg=P["pill"], fg="#7d8aa8", font=fnt(12))
+        sub.pack(pady=(0, u(6)))
+        for w_ in (box, cap, self._key_lbl, sub):
+            w_.bind("<Button-1>", lambda _e: self.open_key_changer())
+        mp = PillGroup(right)
+        mp.pack(side="right")
+        g = mp.inner
+        self.meter_in = LevelMeter(g, u(500), u(56), knob_db=-7.0)
+        self.meter_out = LevelMeter(g, u(500), u(56), knob_db=-3.0, on_knob=self._set_volume)
+        for r, (icon, meter) in enumerate(((p_mic, self.meter_in), (p_speaker, self.meter_out))):
+            IconButton(g, u(46), u(48), icon, None).grid(row=r, column=0, padx=(0, u(6)), pady=u(1))
+            meter.grid(row=r, column=1, pady=u(1))
+
+        # ============ ribbon: tools | zoom | edit ........ labelled actions ============
+        rib = tk.Frame(self, bg=P["bottom"])
+        rib.pack(side="top", fill="x")
+        tk.Frame(rib, bg=P["sep"], height=max(1, u(2))).pack(side="top", fill="x")
+        row = tk.Frame(rib, bg=P["bottom"])
+        row.pack(side="top", fill="x", padx=u(10), pady=(u(8), u(8)))
+
+        def group(side="left"):
+            pg = PillGroup(row, bg=P["bottom"], pad=u(5), radius=u(16))
+            pg.pack(side=side, padx=(0, u(10)))
+            return pg.inner
+
+        ts = (u(56), u(56))
+        g = group()
+        for key, painter, mode in (("tool_sel", p_ibeam, "select"), ("tool_env", p_envelope, "Envelope"),
+                                   ("tool_draw", p_draw, "Draw"), ("tool_multi", p_multi, "Multi")):
+            self.btn[key] = IconButton(g, *ts, painter, lambda m=mode: self._tool(m))
+            self.btn[key].pack(side="left", padx=u(1))
+        self.btn["tool_sel"].set(active=True)
+
+        g = group()
+        for key, painter, cmd in (("zin", p_zoom_in, lambda: self.zoom(2.0)), ("zout", p_zoom_out, lambda: self.zoom(0.5)),
+                                  ("zsel", p_zoom_sel, self.zoom_sel), ("zfit", p_zoom_fit, self.zoom_fit),
+                                  ("ztog", p_zoom_toggle, self.zoom_toggle)):
+            self.btn[key] = IconButton(g, *ts, painter, cmd)
+            self.btn[key].pack(side="left", padx=u(1))
+
+        g = group()
+        for key, painter, cmd in (("trim", p_trim, self.edit_trim), ("silence", p_silence, self.edit_silence),
+                                  ("undo", p_undo, self.undo), ("redo", p_redo, self.redo)):
+            self.btn[key] = IconButton(g, *ts, painter, cmd, dim_face=True)
+            self.btn[key].pack(side="left", padx=u(1))
+
+        # labelled action chips, right aligned
+        chips = (("media", p_audio, "Media Check", self.open_audio_check),
+                 ("eq", p_eq, "Equalizer", self.open_equalizer),
+                 ("5star", p_5star, "Auto 5_Star Enhance", self.open_auto_5star),
+                 ("effects", p_plug, "Effects", self._effects_popup),
+                 ("setup", p_audio_setup, "Devices", self.audio_setup),
+                 ("share", p_share, "Export", lambda: self.export_dialog()))
+        g = group(side="right")
+        for key, painter, text, cmd in chips:
+            wch = measure(fnt(27), text) + u(112)
+            self.btn[key] = IconButton(g, wch, u(56), painter, cmd, text=text, layout="inline", style="pill")
+            self.btn[key].pack(side="right", padx=u(3))
+
+    def _build_bottom(self):
+        P = PAL
+        status = tk.Frame(self, bg=P["status"])
+        status.pack(side="bottom", fill="x")
+        tk.Frame(status, bg="#2a3243", height=max(1, u(2))).pack(fill="x")
+        srow = tk.Frame(status, bg=P["status"], height=u(44))
+        srow.pack(fill="x")
+        srow.pack_propagate(False)
+        cell = tk.Frame(srow, bg=P["status"], width=u(335))
+        cell.pack(side="left", fill="y")
+        cell.pack_propagate(False)
+        tk.Label(cell, textvariable=self.status_var, anchor="w", bg=P["status"], fg="#c7d2e8",
+                 font=fnt(25)).pack(fill="both", padx=u(14))
+        tk.Frame(srow, bg="#2a3243", width=max(1, u(2))).pack(side="left", fill="y")
+
+        bt = tk.Frame(self, bg=P["bottom"])
+        bt.pack(side="bottom", fill="x")
+        tk.Frame(bt, bg="#2a3243", height=max(1, u(2))).pack(fill="x")
+        inner = tk.Frame(bt, bg=P["bottom"])
+        inner.pack(side="left", padx=(u(8), 0), pady=(u(10), u(12)))
+        bgc = P["bottom"]
+
+        def grip(pad=(u(6), u(8))):
+            Gripper(inner, bg=bgc).pack(side="left", padx=pad)
+
+        def sep():
+            tk.Frame(inner, bg=P["sep"], width=max(1, u(2))).pack(side="left", fill="y", padx=u(14))
+
+        def col():
+            f = tk.Frame(inner, bg=bgc)
+            f.pack(side="left")
+            return f
+
+        lab = lambda p, t: tk.Label(p, text=t, bg=bgc, fg=P["ink"], font=fnt(25))
+        grip()
+        g = col()
+        lab(g, "Tempo").pack(anchor="w")
+        ttk.Spinbox(g, from_=1, to=999, textvariable=self.tempo_var, width=5,
+                    font=fnt(26)).pack(anchor="w", pady=u(4))
+        tk.Frame(inner, bg=bgc, width=u(26)).pack(side="left")
+        g = col()
+        lab(g, "Time Signature").pack(anchor="w")
+        r = tk.Frame(g, bg=bgc)
+        r.pack(anchor="w", pady=u(4))
+        ttk.Spinbox(r, from_=1, to=64, textvariable=self.ts_num_var, width=3,
+                    font=fnt(26)).pack(side="left")
+        lab(r, " / ").pack(side="left")
+        ttk.Combobox(r, textvariable=self.ts_den_var, values=("2", "4", "8", "16"), width=3,
+                     state="readonly", font=fnt(26)).pack(side="left")
+        sep()
+        grip(pad=(0, u(8)))
+        g = col()
+        CheckBox(g, "Snap", self.snap_var).pack(anchor="w")
+        ttk.Combobox(g, textvariable=self.grid_var, values=GRID_CHOICES, width=14,
+                     state="readonly", font=fnt(26)).pack(anchor="w", pady=u(4))
+        sep()
+        grip(pad=(0, u(8)))
+        g = col()
+        lab(g, "Selection").grid(row=0, column=0, sticky="e", padx=(0, u(12)))
+        gear = IconButton(g, u(48), u(44), p_gear, self.edit_selection_times, bg=bgc)
+        gear.grid(row=1, column=0, sticky="e", padx=(0, u(12)), pady=(u(6), 0))
+        for rr, var in enumerate((self.sel_a_var, self.sel_b_var)):
+            f = tk.Frame(g, bg=P["time_bg"], highlightthickness=max(1, u(2)),
+                         highlightbackground="#2e394f")
+            f.grid(row=rr, column=1, pady=u(2))
+            tk.Label(f, textvariable=var, bg=P["time_bg"], fg=P["digits"],
+                     font=fnt(29), padx=u(8)).pack(side="left")
+            tk.Label(f, text="\u25BE", bg=P["time_bg"], fg=P["digits"],
+                     font=fnt(24)).pack(side="left", padx=(0, u(4)))
+            for _w in (f,) + tuple(f.winfo_children()):
+                _w.bind("<Button-1>", lambda _e: self.edit_selection_times())
+        sep()
+        grip(pad=(0, u(8)))
+        g = col()
+        self.btn["speed"] = IconButton(g, u(74), u(66), p_play_speed, self._play_speed, bg=bgc, style="navysq")
+        self.btn["speed"].grid(row=0, column=0, rowspan=2, padx=(0, u(10)))
+        lab(g, "\u2013").grid(row=0, column=1, sticky="w")
+        lab(g, "+").grid(row=0, column=2, sticky="e")
+        ttk.Scale(g, from_=0.25, to=3.0, variable=self.speed_var,
+                  length=u(300)).grid(row=1, column=1, columnspan=2)
+
+    def _build_canvas(self):
+        box = tk.Frame(self, bg=PAL["desk"])
+        box.pack(side="top", fill="both", expand=True)
+        box.columnconfigure(0, weight=1)
+        box.rowconfigure(1, weight=1)
+        sbw = u(26)
+        self.ruler = tk.Canvas(box, height=RULER_H, bg=PAL["ruler"], highlightthickness=0)
+        self.canvas = tk.Canvas(box, bg=PAL["desk"], highlightthickness=0)
+        self.vbar = ThinScroll(box, "v", lambda *a: self.canvas.yview(*a), sbw)
+        self.hbar = ThinScroll(box, "h", self._hscroll, u(30))
+        self.canvas.configure(yscrollcommand=self.vbar.set)
+        self.ruler.grid(row=0, column=0, sticky="ew")
+        tk.Frame(box, bg=PAL["ruler"], width=sbw).grid(row=0, column=1, sticky="ns")
+        self.canvas.grid(row=1, column=0, sticky="nsew")
+        self.vbar.grid(row=1, column=1, sticky="ns")
+        self.hbar.grid(row=2, column=0, sticky="ew")
+        tk.Frame(box, bg=PAL["status"], width=sbw).grid(row=2, column=1, sticky="ns")
+        self.canvas.bind("<Configure>", lambda _e: self.redraw())
+        self.canvas.bind("<ButtonPress-1>", self._on_press)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.canvas.bind("<Double-Button-1>", self._on_double)
+        self.canvas.bind("<Button-3>", self._on_right)
+        self.canvas.bind("<Button-2>", self._on_right)
+        self.canvas.bind("<Motion>", self._on_motion, add="+")
+        self.ruler.bind("<ButtonPress-1>", self._on_press)
+        self.ruler.bind("<B1-Motion>", self._on_drag)
+        for w in (self.canvas, self.ruler):
+            w.bind("<MouseWheel>", self._wheel)
+            w.bind("<Button-4>", self._wheel)
+            w.bind("<Button-5>", self._wheel)
+
+    def _bind_keys(self):
+        def key(seq, fn, typing_ok=False):
+            def handler(_e):
+                w = self.focus_get()
+                if not typing_ok and w is not None and w.winfo_class() in (
+                        "Entry", "TEntry", "TSpinbox", "TCombobox", "Spinbox"):
+                    return None
+                fn()
+                return "break"
+
+            self.bind_all(seq, handler)
+
+        key("<space>", self.toggle_play)
+        key("<Shift-space>", lambda: self.play(True))
+        key("<Key-p>", self.pause)
+        key("<Key-s>", self.stop)
+        key("<Key-r>", self.toggle_record)
+        key("<F1>", lambda: self._tool("select"))
+        key("<F2>", lambda: self._tool("Envelope"))
+        key("<F3>", lambda: self._tool("Draw"))
+        key("<F6>", lambda: self._tool("Multi"))
+        key("<Control-z>", self.undo, True)
+        key("<Control-y>", self.redo, True)
+        key("<Control-x>", self.edit_cut)
+        key("<Control-c>", self.edit_copy)
+        key("<Control-v>", self.edit_paste)
+        key("<Delete>", self.edit_delete)
+        key("<Control-a>", self.select_all)
+        key("<Control-Shift-A>", self.select_none)
+        key("<Control-l>", self.edit_silence)
+        key("<Control-t>", self.edit_trim)
+        key("<Control-i>", self.edit_split)
+        key("<Control-j>", self.edit_join)
+        key("<Control-b>", self.add_label)
+        key("<Control-m>", self.add_label_playback)
+        key("<Control-r>", self.repeat_last_effect, True)
+        key("<Control-n>", self.new_project, True)
+        key("<Control-s>", self.save_project, True)
+        key("<Control-o>", self.open_project, True)
+        key("<Control-q>", self.quit_app, True)
+        key("<Control-Shift-E>", self.export_dialog, True)
+        key("<Control-Shift-I>", self.import_dialog, True)
+        key("<Control-Shift-Key-5>", self.open_auto_5star, True)
+        key("<Control-k>", self.open_key_changer, True)
+        key("<Control-e>", self.open_equalizer, True)
+        key("<Control-Key-1>", lambda: self.zoom(2.0), True)
+        key("<Control-Key-3>", lambda: self.zoom(0.5), True)
+        key("<Control-Shift-F>", self.zoom_fit, True)
+        key("<Home>", lambda: self.set_cursor(0))
+        key("<End>", lambda: self.set_cursor(self.proj.length()))
+
+    # -------------------- Auto 5_Star --------------------
+    def open_key_changer(self):
+        if not self.proj.tracks:
+            return messagebox.showinfo("Key Changer", "Load some audio first.")
+        w = getattr(self, "_key_win", None)
+        if w is not None:
+            try:
+                if w.winfo_exists():
+                    w.deiconify()
+                    w.lift()
+                    return
+            except tk.TclError:
+                pass
+        self._key_win = KeyChangerDialog(self)
+
+    def _close_eq(self):
+        w = getattr(self, "_eq_win", None)
+        try:
+            if w is not None and w.winfo_exists():
+                w.destroy()
+        except tk.TclError:
+            pass
+        self.player.eq = self.proj.eq
+
+    def open_equalizer(self):
+        self.player.eq = self.proj.eq
+        w = getattr(self, "_eq_win", None)
+        try:
+            if w is not None and w.winfo_exists():
+                w.deiconify(); w.lift()
+                return
+        except tk.TclError:
+            pass
+        self._eq_win = EqualizerDialog(self)
+
+    def open_auto_5star(self):
+        if not self.proj.tracks:
+            return messagebox.showinfo("Audio Plus", "Load some audio first.")
+        self.stop()
+        Auto5StarDialog(self)
+
+    # -------------------- helpers --------------------
+    def ask(self, title, fields):
+        return ParamDialog(self, title, fields).result
+
+    def targets(self):
+        idx = sorted(i for i in self.selected if i < len(self.proj.tracks))
+        return [self.proj.tracks[i] for i in (idx or range(len(self.proj.tracks)))]
+
+    def lane_w(self):
+        return max(100, self.canvas.winfo_width() - HEAD_W - RIGHT_M)
+
+    def _grid_seconds(self):
+        try:
+            tempo = max(1.0, float(self.tempo_var.get()))
+            num = max(1, int(self.ts_num_var.get()))
+            den = int(self.ts_den_var.get())
+        except (tk.TclError, ValueError):
+            tempo, num, den = 120.0, 4, 4
+        beat = 60.0 / tempo
+        g = self.grid_var.get()
+        fixed = {"Seconds": 1.0, "Deciseconds": .1, "Centiseconds": .01, "Milliseconds": .001}
+        if g in fixed:
+            return fixed[g]
+        if g == "Bar":
+            return beat * num
+        try:
+            return beat * den / int(g.split("/")[1])
+        except (IndexError, ValueError):
+            return 0.0
+
+    def _snap(self, s):
+        if not self.snap_var.get():
+            return s
+        g = self._grid_seconds()
+        if g <= 0:
+            return s
+        r = self.proj.rate
+        return max(0, int(round(round(s / r / g) * g * r)))
+
+    # ---------- bar / beat lines ----------
+    def _grid_changed(self, *_):
+        """Tempo, time signature, snap grid or the View toggle changed: redraw (coalesced)."""
+        if self._grid_pending:
+            return
+        self._grid_pending = True
+
+        def go():
+            self._grid_pending = False
+            try:
+                self.redraw()
+            except (tk.TclError, AttributeError):
+                pass
+        self.after(80, go)
+
+    def _bar_info(self):
+        """(seconds per beat, seconds per bar, beats per bar) - same convention as the snap grid."""
+        try:
+            tempo = max(1.0, float(self.tempo_var.get()))
+            num = max(1, int(self.ts_num_var.get()))
+        except (tk.TclError, ValueError):
+            tempo, num = 120.0, 4
+        beat = 60.0 / tempo
+        return beat, beat * num, num
+
+    def _draw_bars(self, y1, y2, xa, xb, top=False):
+        """Vertical bar lines (strong), beat lines and snap-grid lines (faint) between xa and xb.
+        top=True: only the bar lines, drawn over the waveform so a bar start/end is always visible."""
+        if not self.show_bars_var.get() or xb <= xa:
+            return
+        beat, bar, num = self._bar_info()
+        pps, rate, c = self.px_per_sec, self.proj.rate, self.canvas
+        t0 = self.view_start / rate
+        t_a, t_b = t0 + (xa - HEAD_W) / pps, t0 + (xb - HEAD_W) / pps
+        w2 = max(1, u(2))
+        # sub-divisions of the snap grid (only if finer than a beat and far enough apart)
+        g = self._grid_seconds()
+        if not top and 0 < g < beat - 1e-9 and g * pps >= u(34) and self.snap_var.get():
+            k = max(0, int(math.floor(t_a / g)))
+            while k * g <= t_b:
+                if abs((k * g) / beat - round((k * g) / beat)) > 1e-6:
+                    x = HEAD_W + (k * g - t0) * pps
+                    if xa <= x <= xb:
+                        c.create_line(x, y1, x, y2, fill=PAL["grid_sub"], tags="bars")
+                k += 1
+        # beats
+        if not top and beat * pps >= u(44):
+            k = max(0, int(math.floor(t_a / beat)))
+            while k * beat <= t_b:
+                if k % num:
+                    x = HEAD_W + (k * beat - t0) * pps
+                    if xa <= x <= xb:
+                        c.create_line(x, y1, x, y2, fill=PAL["grid_beat"], tags="bars")
+                k += 1
+        # bars (thinned out when zoomed far out so they never crowd)
+        every = max(1, int(math.ceil(u(46) / max(bar * pps, 1e-9))))
+        k = max(0, int(math.floor(t_a / bar)))
+        k -= k % every
+        while k * bar <= t_b:
+            x = HEAD_W + (k * bar - t0) * pps
+            if xa <= x <= xb:
+                c.create_line(x, y1, x, y2, fill=PAL["grid_bar_top"] if top else PAL["grid_bar"],
+                              width=max(1, u(1)) if top else w2, tags="bars")
+            k += every
+
+    def _draw_ruler_bars(self, r, right, base):
+        """Bar numbers on the ruler: a teal tick and the bar number at the start of every bar."""
+        if not self.show_bars_var.get():
+            return
+        beat, bar, num = self._bar_info()
+        pps, rate = self.px_per_sec, self.proj.rate
+        every = max(1, int(math.ceil(u(70) / max(bar * pps, 1e-9))))
+        t0 = self.view_start / rate
+        tend = t0 + (right - HEAD_W) / pps
+        k = max(0, int(math.floor(t0 / bar)))
+        k -= k % every
+        font = fnt(22, True)
+        while k * bar <= tend:
+            x = HEAD_W + (k * bar - t0) * pps
+            if HEAD_W - 1 <= x <= right + 1:
+                r.create_line(x, base - u(30), x, base, fill=PAL["navy"], width=max(1, u(2)))
+                r.create_text(x + u(6), base - u(14), text=str(k + 1), anchor="w", fill=PAL["navy"], font=font)
+            k += every
+
+    def _x2s(self, x, snap=True):
+        s = max(0, int(self.view_start + (x - HEAD_W) / self.px_per_sec * self.proj.rate))
+        return self._snap(s) if snap else s
+
+    def _s2x(self, s):
+        return HEAD_W + (s - self.view_start) / self.proj.rate * self.px_per_sec
+
+    def _visible_samples(self):
+        return self.lane_w() / self.px_per_sec * self.proj.rate
+
+    def set_cursor(self, s):
+        self.cursor, self.sel = int(max(0, s)), None
+        self.redraw()
+
+    def select_all(self):
+        n = self.proj.length()
+        self.sel = (0, n) if n else None
+        self.redraw()
+
+    def select_none(self):
+        self.sel = None
+        self.redraw()
+
+    def select_start_to_cursor(self):
+        if self.cursor > 0:
+            self.sel = (0, self.cursor)
+            self.redraw()
+
+    def select_cursor_to_end(self):
+        n = self.proj.length()
+        if self.cursor < n:
+            self.sel = (self.cursor, n)
+            self.redraw()
+
+    def select_region(self):
+        p = self.ask("Select region", [("a", "Start (seconds)", 0.0), ("b", "End (seconds)", 1.0)])
+        if p:
+            r = self.proj.rate
+            self.sel = (int(p["a"] * r), int(p["b"] * r))
+            self.redraw()
+
+    def _has_sel(self):
+        return bool(self.sel and self.sel[1] > self.sel[0])
+
+    # ------------------------------------------------------------------
+    #  Tools: Selection (F1) | Envelope (F2) | Draw (F3) | Multi-Tool (F6)
+    # ------------------------------------------------------------------
+    _TOOL_BTN = {"select": "tool_sel", "Envelope": "tool_env", "Draw": "tool_draw", "Multi": "tool_multi"}
+    _TOOL_HINT = {
+        "select": "Selection tool: click to place the cursor, drag to select a range.",
+        "Envelope": "Envelope tool: click a track to add a volume point, drag points up/down/sideways. "
+                    "Drag a point off the track to remove it.",
+        "Draw": "Draw tool: zoom in until single samples are visible, then drag on the waveform to redraw it.",
+        "Multi": "Multi-Tool: near the envelope line = Envelope, on the waveform when zoomed in = Draw, "
+                 "anywhere else = Selection.",
+    }
+    _TOOL_CURSOR = {"select": "", "Envelope": "hand2", "Draw": "pencil", "Multi": ""}
+
+    def _tool(self, name):
+        if name not in self._TOOL_BTN:
+            return
+        self.tool_mode, self._gesture = name, None
+        for mode, key in self._TOOL_BTN.items():
+            if key in self.btn:
+                self.btn[key].set(active=(mode == name))
+        self.status_var.set(self._TOOL_HINT[name])
+        try:
+            self.canvas.configure(cursor=self._TOOL_CURSOR[name])
+        except tk.TclError:
+            pass
+        self.redraw()
+
+    def _lane_hit(self, ev):
+        """(index, track, geometry, canvas_y, sample) when the pointer is over a clip's waveform, else None."""
+        if ev.widget is not self.canvas or ev.x < HEAD_W:
+            return None
+        y = self.canvas.canvasy(ev.y)
+        i = int(y // LANE_H)
+        if not (0 <= i < len(self.proj.tracks)):
+            return None
+        t, geo = self.proj.tracks[i], self._lane_geo.get(i)
+        if geo is None or len(t.data) == 0:
+            return None
+        ch_top, chh = geo
+        if not (ch_top[0] <= y <= ch_top[1] + chh):
+            return None
+        s = self._x2s(ev.x, snap=False)
+        if not (t.offset <= s < t.end):
+            return None
+        return i, t, geo, y, s
+
+    @staticmethod
+    def _wave_y(geo, y):
+        """(channel, centre_y, half_height) of the channel lane that canvas y falls in."""
+        ch_top, chh = geo
+        ch = 0 if y < ch_top[1] else 1
+        return ch, ch_top[ch] + chh / 2.0, max(1.0, chh / 2.0 - 1)
+
+    def _samples_per_px(self):
+        return self.proj.rate / self.px_per_sec
+
+    def _env_hit(self, t, geo, x, y):
+        """Index of the envelope point under the pointer, else None."""
+        ch_top, chh = geo
+        half, r = chh / 2.0 - 1, u(9)
+        for k, (px, g) in enumerate(t.env):
+            if abs(self._s2x(t.offset + px) - x) > r:
+                continue
+            for ch in (0, 1):
+                cy = ch_top[ch] + chh / 2.0
+                if abs(y - (cy - g * half)) <= r or abs(y - (cy + g * half)) <= r:
+                    return k
+        return None
+
+    def _near_env_line(self, t, geo, y, s):
+        ch, cy, half = self._wave_y(geo, y)
+        j = s - t.offset
+        g = float(t.env_gain(j, j + 1)[0])
+        return min(abs(y - (cy - g * half)), abs(y - (cy + g * half))) <= u(9)
+
+    def _near_wave(self, t, geo, y, s):
+        if self._samples_per_px() > 1.5:
+            return False
+        ch, cy, half = self._wave_y(geo, y)
+        j = s - t.offset
+        lo, hi = max(0, j - 1), min(len(t.data), j + 2)
+        if hi <= lo:
+            return False
+        v = np.clip(t.data[lo:hi, ch] * t.env_gain(lo, hi), -1, 1)
+        return bool(np.min(np.abs(y - (cy - v * half))) <= u(10))
+
+    def _pick_tool(self, ev):
+        """The tool that applies to this mouse position (the Multi-Tool chooses by location)."""
+        if self.tool_mode != "Multi":
+            return self.tool_mode
+        h = self._lane_hit(ev)
+        if h is None:
+            return "select"
+        i, t, geo, y, s = h
+        if self._near_wave(t, geo, y, s):
+            return "Draw"
+        if self._env_hit(t, geo, ev.x, y) is not None or self._near_env_line(t, geo, y, s):
+            return "Envelope"
+        return "select"
+
+    def _on_motion(self, ev):
+        if self.tool_mode != "Multi" or self._gesture or self.recording:
+            return
+        try:
+            cur = {"select": "", "Envelope": "hand2", "Draw": "pencil"}[self._pick_tool(ev)]
+            if str(self.canvas.cget("cursor")) != cur:
+                self.canvas.configure(cursor=cur)
+        except Exception:
+            pass
+
+    # ---------------- Envelope tool ----------------
+    @staticmethod
+    def _env_tidy(t):
+        if t.env and all(abs(g - 1.0) < 1e-3 for _x, g in t.env):
+            t.env = []
+
+    def _env_press(self, ev):
+        h = self._lane_hit(ev)
+        if h is None:
+            return False
+        i, t, geo, y, s = h
+        self.selected = {i}
+        k = self._env_hit(t, geo, ev.x, y)
+        self.proj.push_undo()
+        n = len(t.data)
+        if k is None:
+            ch, cy, half = self._wave_y(geo, y)
+            g = min(1.0, max(0.0, abs(y - cy) / half))
+            if not t.env:
+                t.env = [(0, 1.0), (max(1, n - 1), 1.0)]
+            x = int(min(max(0, s - t.offset), n - 1))
+            pts = [p for p in t.env if p[0] != x] + [(x, g)]
+            t.env = sorted(pts)
+        else:
+            x = t.env[k][0]
+        self._gesture = ("env", i, x, False)
+        self.redraw()
+        return True
+
+    def _env_drag(self, ev):
+        _kind, i, px, _off = self._gesture
+        if i >= len(self.proj.tracks):
+            return
+        t, geo = self.proj.tracks[i], self._lane_geo.get(i)
+        if geo is None or not t.env:
+            return
+        ch_top, chh = geo
+        y = self.canvas.canvasy(ev.y)
+        n = len(t.data)
+        lane_top, lane_bot = ch_top[0] - u(4), ch_top[1] + chh + u(4)
+        off = y < lane_top - u(14) or y > lane_bot + u(14)
+        ch, cy, half = self._wave_y(geo, min(max(y, ch_top[0]), ch_top[1] + chh))
+        g = min(1.0, max(0.0, abs(min(max(y, ch_top[0]), ch_top[1] + chh) - cy) / half))
+        last = max(1, n - 1)
+        if px in (0, last):
+            nx = px                                   # end points only move up/down
+        else:
+            nx = int(min(max(1, self._x2s(ev.x, snap=False) - t.offset), last - 1))
+        others = [p for p in t.env if p[0] != px]
+        used = {p[0] for p in others}
+        if nx in used:
+            free = [x for x in (nx + 1, nx - 1, nx + 2, nx - 2) if 0 < x < last and x not in used]
+            nx = free[0] if free else px
+        t.env = sorted(others + [(nx, g)])
+        self._gesture = ("env", i, nx, off and nx not in (0, last))
+        self.redraw()
+
+    def _env_end(self):
+        _kind, i, px, off = self._gesture
+        if i < len(self.proj.tracks):
+            t = self.proj.tracks[i]
+            if off:                                   # dropped outside the track -> delete the point
+                t.env = [p for p in t.env if p[0] != px]
+            self._env_tidy(t)
+        self._live_remix(10)
+        self.redraw()
+
+    # ---------------- Draw tool ----------------
+    def _draw_press(self, ev):
+        h = self._lane_hit(ev)
+        if h is None:
+            return False
+        i, t, geo, y, s = h
+        if self._samples_per_px() > 1.5:
+            self.status_var.set("Draw tool: zoom in until you can see individual samples (Zoom In), then drag.")
+            return True
+        self.selected = {i}
+        self.proj.push_undo()
+        t.data = np.array(t.data, np.float32, copy=True)    # the undo snapshot keeps the original array
+        ch, cy, half = self._wave_y(geo, y)
+        self._gesture = ("draw", i, ch, cy, half, None)
+        self._draw_to(ev)
+        return True
+
+    def _draw_to(self, ev):
+        _k, i, ch, cy, half, last = self._gesture
+        t = self.proj.tracks[i]
+        n = len(t.data)
+        if n == 0:
+            return
+        y = self.canvas.canvasy(ev.y)
+        j = int(round(self.view_start + (ev.x - HEAD_W) / self.px_per_sec * self.proj.rate - t.offset))
+        j = min(max(0, j), n - 1)
+        env_g = float(t.env_gain(j, j + 1)[0]) if t.env else 1.0
+        v = min(1.0, max(-1.0, (cy - y) / half))
+        v = min(1.0, max(-1.0, v / env_g)) if env_g > 1e-3 else 0.0
+        if last is None:
+            t.data[j, ch] = v
+        else:
+            j0, v0 = last
+            lo, hi = (j0, j) if j0 <= j else (j, j0)
+            vals = np.linspace(v0, v, abs(j - j0) + 1) if j0 <= j else np.linspace(v, v0, abs(j - j0) + 1)
+            t.data[lo:hi + 1, ch] = vals.astype(np.float32)
+        self._gesture = ("draw", i, ch, cy, half, (j, v))
+        self.redraw()
+
+    # ---------------- gesture plumbing ----------------
+    def _gesture_drag(self, ev):
+        kind = self._gesture[0]
+        if kind == "env":
+            self._env_drag(ev)
+        elif kind == "draw":
+            self._draw_to(ev)
+
+    def _gesture_end(self):
+        kind = self._gesture[0]
+        try:
+            if kind == "env":
+                self._env_end()
+            elif kind == "draw":
+                self.redraw()
+        finally:
+            self._gesture = None
+
+    def _draw_env(self, t, ch_top, chh, ca, cb):
+        """Envelope lines (+ handles) on a clip; a faint guide appears while an envelope tool is active."""
+        if not t.env and self.tool_mode not in ("Envelope", "Multi"):
+            return
+        c, half = self.canvas, chh / 2.0 - 1
+        col, lw = "#ffd24a", max(1, u(2))
+        if t.env:
+            pts = [(self._s2x(t.offset + x), g) for x, g in t.env]
+            xs, gs = [p[0] for p in pts], [p[1] for p in pts]
+            line = [(ca, float(np.interp(ca, xs, gs)))] + [p for p in pts if ca < p[0] < cb] \
+                   + [(cb, float(np.interp(cb, xs, gs)))]
+        else:
+            line = [(ca, 1.0), (cb, 1.0)]
+        for ch in (0, 1):
+            cy = ch_top[ch] + chh / 2.0
+            for sign in (-1, 1):
+                flat = []
+                for x, g in line:
+                    flat += [x, cy + sign * g * half]
+                if len(flat) >= 4:
+                    kw = {} if t.env else {"dash": (4, 3)}
+                    c.create_line(flat, fill=col, width=lw, **kw)
+                if t.env:
+                    r = u(4)
+                    for x, g in line[1:-1]:
+                        c.create_oval(x - r, cy + sign * g * half - r, x + r, cy + sign * g * half + r,
+                                      fill=col, outline="#14151a")
+
+    # ---------------- Selection time dialog (gear button / time boxes) ----------------
+    @staticmethod
+    def _parse_time(text, default):
+        nums = re.findall(r"\d+(?:\.\d+)?", str(text))
+        if not nums:
+            return default
+        vals = [float(x) for x in nums][-3:]
+        mult = [1.0, 60.0, 3600.0][:len(vals)][::-1]
+        return sum(v * m for v, m in zip(vals, mult))
+
+    def edit_selection_times(self):
+        r, n = self.proj.rate, self.proj.length()
+        if not n:
+            self.status_var.set("Nothing to select yet - open or record some audio first.")
+            return
+        a, b = self.sel if self._has_sel() else (self.cursor, self.cursor)
+        res = ParamDialog(self, "Selection",
+                          [("a", "Start  (h:mm:ss.mmm or seconds)", fmt_hmsms(a / r)),
+                           ("b", "End    (h:mm:ss.mmm or seconds)", fmt_hmsms(b / r))]).result
+        if not res:
+            return
+        sa = self._parse_time(res["a"], a / r)
+        sb = self._parse_time(res["b"], b / r)
+        sa, sb = sorted((max(0.0, sa), max(0.0, sb)))
+        a, b = int(min(sa * r, n)), int(min(sb * r, n))
+        self.cursor = a
+        self.sel = (a, b) if b > a else None
+        self.redraw()
+
+    def _loop_changed(self):
+        self.player.loop = self.loop_var.get()
+        self._refresh_toolbar()
+
+    def _toggle_loop(self):
+        self.loop_var.set(not self.loop_var.get())
+        self._loop_changed()
+
+    def _set_volume(self, db):
+        self.player.volume = 10 ** ((db + 3.0) / 20.0)
+
+    def _effects_popup(self):
+        b = self.btn["effects"]
+        self.menu_effect.tk_popup(b.winfo_rootx(), b.winfo_rooty() + b.winfo_height())
+
+    def audio_setup(self):
+        m = tk.Menu(self, tearoff=0)
+        if sd is None:
+            m.add_command(label="sounddevice is not installed", state="disabled")
+        else:
+            try:
+                devs = sd.query_devices()
+            except Exception as ex:
+                devs = []
+                m.add_command(label=str(ex), state="disabled")
+            m.add_command(label="Playback device", state="disabled")
+            for i, d in enumerate(devs):
+                if d["max_output_channels"] > 0:
+                    m.add_radiobutton(label=d["name"], variable=self.out_dev, value=i,
+                                      command=lambda: self._pick_device(1, self.out_dev.get()))
+            m.add_separator()
+            m.add_command(label="Recording device", state="disabled")
+            for i, d in enumerate(devs):
+                if d["max_input_channels"] > 0:
+                    m.add_radiobutton(label=d["name"], variable=self.in_dev, value=i,
+                                      command=lambda: self._pick_device(0, self.in_dev.get()))
+        b = self.btn["setup"]
+        m.tk_popup(b.winfo_rootx(), b.winfo_rooty() + b.winfo_height())
+
+    def _pick_device(self, which, idx):
+        try:
+            cur = list(sd.default.device)
+            cur[which] = idx
+            sd.default.device = tuple(cur)
+        except Exception as ex:
+            messagebox.showerror("Audio Setup", str(ex))
+
+    def _refresh_toolbar(self):
+        b = self.btn
+        playing = self.player.stream is not None
+        b["stop"].set(enabled=playing or self.recording or self.paused)
+        b["pause"].set(active=self.paused)
+        b["play"].set(active=playing and not self.recording)
+        b["record"].set(active=self.recording)
+        b["loop"].set(active=self.loop_var.get())
+        b["undo"].set(enabled=bool(self.proj._undo))
+        b["redo"].set(enabled=bool(self.proj._redo))
+        b["trim"].set(enabled=self._has_sel())
+        b["silence"].set(enabled=self._has_sel())
+        self._update_key_label()
+
+    # ---- key readout (top-right of the toolbar) ----
+    def _set_key_text(self, big, sub="", dim=False):
+        self.key_var.set(big)
+        self.key_sub_var.set(sub)
+        self._key_lbl.configure(fg="#6b7690" if dim else PAL["navy"])
+
+    def _key_signature(self, tracks):
+        sig = [self.proj.rate]
+        for t in tracks:
+            d = t.data
+            step = max(1, len(d) // 64)
+            sig.append((id(d), len(d), t.offset, round(float(np.abs(d[::step]).sum()), 3)))
+        return tuple(sig)
+
+    def _update_key_label(self):
+        if not hasattr(self, "_key_lbl"):
+            return
+        idx = sorted(i for i in self.selected if i < len(self.proj.tracks))
+        if not idx:
+            self._key_sig = None
+            self._set_key_text("No selection", "select a track on the left", True)
+            return
+        tracks = [self.proj.tracks[i] for i in idx]
+        sig = self._key_signature(tracks)
+        if sig == self._key_sig:
+            return
+        self._key_sig = sig
+        hit = self._key_cache.get(sig)
+        if hit:
+            self._set_key_text(*hit)
+            return
+        self._set_key_text("Detecting...", f"{len(tracks)} track{'s' if len(tracks) != 1 else ''} selected", True)
+        rate = self.proj.rate
+        datas = [(t.data, t.offset) for t in tracks]
+        n_sel = len(tracks)
+
+        def work():
+            try:
+                k = detect_song_key(_mix_for_key(datas), rate)
+                if k["confidence"] == "None":
+                    self._key_q.put((sig, ("No clear key", "noise or percussion only", True)))
+                    return
+                sub = f"{k['confidence']} confidence"
+                if k["confidence"] != "High":
+                    sub += f"  \u00b7  or {k['alt']}"
+                if n_sel > 1:
+                    sub = f"{n_sel} tracks  \u00b7  " + sub
+                res = (k["label"], sub, False)
+            except ValueError:
+                res = ("Too short", "needs 3+ seconds of audio", True)
+            except Exception:
+                res = ("Unknown", "could not detect a key", True)
+            self._key_q.put((sig, res))
+        threading.Thread(target=work, daemon=True).start()
+        self.after(150, self._poll_key)
+
+    def _poll_key(self):
+        try:
+            while True:
+                sig, res = self._key_q.get_nowait()
+                if len(self._key_cache) > 32:
+                    self._key_cache.clear()
+                self._key_cache[sig] = res
+                if sig == self._key_sig:
+                    self._set_key_text(*res)
+        except queue.Empty:
+            pass
+        if self._key_sig is not None and self._key_sig not in self._key_cache:
+            self.after(150, self._poll_key)
+
+    # -------------------- drawing --------------------
+    def redraw(self):
+        c = self.canvas
+        c.delete("all")
+        W = max(c.winfo_width(), HEAD_W + 50)
+        total_h = max(len(self.proj.tracks) * LANE_H, c.winfo_height())
+        self._hits = []
+        self._lane_geo = {}
+        for i, t in enumerate(self.proj.tracks):
+            self._draw_track(i, t, W)
+        c.configure(scrollregion=(0, 0, W, total_h))
+        self._draw_ruler(W)
+        self._update_hbar()
+        self._update_time_displays()
+        self._refresh_toolbar()
+
+    def _update_time_displays(self):
+        r = self.proj.rate
+        if not (self.recording or self.player.stream is not None):
+            self.time_var.set(fmt_hms(self.cursor / r))
+        a, b = self.sel if self._has_sel() else (self.cursor, self.cursor)
+        self.sel_a_var.set(fmt_hmsms(a / r))
+        self.sel_b_var.set(fmt_hmsms(b / r))
+
+    @staticmethod
+    def _fader_frac(g):
+        """0..1 position of a channel fader (-36 dB .. +12 dB; unity sits at 75%)."""
+        if g <= 1e-3:
+            return 0.0
+        return min(1.0, max(0.0, (20 * math.log10(g) + 36.0) / 48.0))
+
+    def _slider_x(self, kind, t, x1, x2):
+        if kind == "gain":
+            db = 20 * math.log10(max(t.gain, 1e-6))
+            frac = (min(36.0, max(-36.0, db)) + 36.0) / 72.0
+        else:
+            frac = (t.pan + 1.0) / 2.0
+        return x1 + frac * (x2 - x1)
+
+    def _accent(self, t, bright=False):
+        """Each track gets its own colour (header strip + waveform)."""
+        try:
+            k = self.proj.tracks.index(t)
+        except ValueError:
+            k = 0
+        col = TRACK_ACCENTS[k % len(TRACK_ACCENTS)]
+        return _mix(col, "#ffffff", .55) if bright else col
+
+    def _draw_track(self, i, t, W):
+        c, P = self.canvas, PAL
+        y0 = i * LANE_H
+        sel = i in self.selected
+        xl, xr = FR_L, W - FR_R
+        yt, yb = y0 + u(2), y0 + LANE_H - u(2)
+        c.create_rectangle(xl, yt, xr, yb, fill=P["black"], outline="")
+        c.create_rectangle(xl + LINE, yt + LINE, xr - LINE, yb - LINE,
+                           fill=P["frame_sel"] if sel else P["frame"], outline="")
+        c.create_rectangle(xl + LINE + BAND, yt + LINE + BAND, xr - LINE - BAND, yb - LINE - BAND,
+                           fill=P["black"], outline="")
+        cx1, cy1, cx2, cy2 = xl + INSET, yt + INSET, xr - INSET, yb - INSET
+        black = P["black"]
+
+        c.create_rectangle(cx1, cy1, HEAD_W, cy2, fill=P["scale_sel"] if sel else P["scale"], outline="")
+        c.create_image(cx1, cy1, image=metal_img(HEADER_W - cx1, cy2 - cy1, sel), anchor="nw")
+        c.create_rectangle(cx1, cy1, cx1 + max(3, u(7)), cy2, fill=self._accent(t), outline="")
+        c.create_line(HEADER_W, cy1, HEADER_W, cy2, fill=black, width=LINE)
+        c.create_line(HEAD_W, cy1, HEAD_W, cy2, fill=black, width=LINE)
+        ink = P["icon"]
+        ry = yt + u(35)
+        xc = u(37)
+        k = u(8)
+        c.create_line(xc - k, ry - k, xc + k, ry + k, fill=ink, width=max(1, u(2)))
+        c.create_line(xc - k, ry + k, xc + k, ry - k, fill=ink, width=max(1, u(2)))
+        self._hits.append((u(22), ry - u(16), u(54), ry + u(16), "close", i, None))
+        caret_x, dots_x = u(252), u(288)
+        name_font = fnt(26)
+        c.create_text(u(60), ry, text=ellipsize(t.name, name_font, caret_x - u(60) - u(18)),
+                      anchor="w", fill=ink, font=name_font)
+        c.create_line(caret_x - u(8), ry + u(4), caret_x, ry - u(4), caret_x + u(8), ry + u(4),
+                      fill=ink, width=max(1, u(2)))
+        for dx in (-u(8), 0, u(8)):
+            c.create_oval(dots_x + dx - u(2.5), ry - u(2.5), dots_x + dx + u(2.5),
+                          ry + u(2.5), fill=ink, outline="")
+        self._hits.append((caret_x - u(16), ry - u(16), HEADER_W, ry + u(16), "menu", i, None))
+        gain_on = (("Mute", t.mute, P["mute"], "mute", u(20), u(162)),
+                   ("Solo", t.solo, P["solo"], "solo", u(167), u(304)))
+        for lab, on, col, kind, bx1, bx2 in gain_on:
+            by1, by2 = yt + u(57), yt + u(92)
+            if on:
+                _t, _b, _bd = _mix(col, "#ffffff", .35), col, _mix(col, "#000000", .35)
+            else:
+                _t, _b, _bd = "#2c354c", "#242c40", "#3b4660"
+            c.create_image(bx1, by1, anchor="nw",
+                           image=skin_img(bx2 - bx1, by2 - by1, u(12), _t, _b, border=_bd))
+            c.create_text((bx1 + bx2) / 2, (by1 + by2) / 2, text=lab, fill="#0b0f16" if on else ink, font=fnt(26))
+            self._hits.append((bx1, by1, bx2, by2, kind, i, None))
+        by1, by2 = yt + u(101), yt + u(143)
+        c.create_image(u(20), by1, anchor="nw",
+                       image=skin_img(u(304) - u(20), by2 - by1, u(12), "#2c354c", "#242c40", border="#3b4660"))
+        _ix, _iy, _q = u(304) - u(32), (by1 + by2) / 2.0, u(8)
+        c.create_line(_ix - _q * .2, _iy - _q * .9, _ix - _q, _iy - _q * .9, _ix - _q, _iy + _q, _ix + _q * .9, _iy + _q,
+                      _ix + _q * .9, _iy + _q * .1, fill=P["navy"], width=max(1, u(2)))
+        c.create_line(_ix - _q * .2, _iy + _q * .3, _ix + _q * 1.0, _iy - _q * 1.0, fill=P["navy"], width=max(1, u(2)))
+        c.create_line(_ix + _q * .2, _iy - _q * 1.0, _ix + _q * 1.0, _iy - _q * 1.0, _ix + _q * 1.0, _iy - _q * .2,
+                      fill=P["navy"], width=max(1, u(2)))
+        c.create_text((u(20) + u(304)) / 2, (by1 + by2) / 2, text="Effects", fill=ink, font=fnt(26))
+        self._hits.append((u(20), by1, u(304), by2, "effects", i, None))
+        sx1, sx2 = u(31), u(294)
+        for kind, y_line, lab_l, lab_r in (("gain", yt + u(177), "\u2013", "+"),
+                                            ("pan", yt + u(236), "L", "R")):
+            c.create_text(sx1 + u(3), y_line - u(23), text=lab_l, anchor="w", fill=ink,
+                          font=fnt(20, True))
+            c.create_text(sx2 - u(3), y_line - u(23), text=lab_r, anchor="e", fill=ink,
+                          font=fnt(20, True))
+            kx, kr = self._slider_x(kind, t, sx1, sx2), u(13)
+            th = max(3, u(5))
+            c.create_line(sx1, y_line, sx2, y_line, fill="#3a4560", width=th, capstyle="round")
+            x_from = (sx1 + sx2) / 2.0 if kind == "pan" else sx1
+            c.create_line(x_from, y_line, kx, y_line, fill=P["navy"], width=th, capstyle="round")
+            c.create_image(kx - kr, y_line - kr, image=knob_img(int(2 * kr)), anchor="nw")
+            self._hits.append((sx1 - u(14), y_line - u(22), sx2 + u(14), y_line + u(22),
+                               kind, i, (sx1, sx2)))
+
+        # two vertical faders: LEFT and RIGHT channel level
+        fy1, fy2 = yt + u(298), cy2 - u(58)
+        if fy2 - fy1 > u(90):
+            uy = fy2 - self._fader_frac(1.0) * (fy2 - fy1)
+            for key, fx, lab, g in (("gain_l", u(98), "L", t.gain_l), ("gain_r", u(222), "R", t.gain_r)):
+                ky = fy2 - self._fader_frac(g) * (fy2 - fy1)
+                tw = max(3, u(6))
+                c.create_line(fx, fy1, fx, ky, fill="#3a4560", width=tw, capstyle="round")
+                c.create_line(fx, ky, fx, fy2, fill=P["navy"], width=tw + u(3), capstyle="round")
+                c.create_line(fx - u(27), uy, fx - u(18), uy, fill="#56627e", width=max(1, u(2)))
+                kw, kh = u(52), u(28)
+                c.create_image(fx - kw / 2, ky - kh / 2, anchor="nw",
+                               image=skin_img(kw, kh, u(8), "#e2e8f0", "#94a3b8", border="#475569",
+                                              gloss=0.30, shadow=max(2, u(3))))
+                c.create_line(fx - kw / 2 + u(10), ky, fx + kw / 2 - u(10), ky, fill="#0f766e", width=max(1, u(2)))
+                txt = "-\u221e dB" if g < 1e-3 else f"{20 * math.log10(g):+.1f} dB"
+                c.create_text(fx, fy1 - u(18), text=txt, fill=ink, font=fnt(19))
+                c.create_text(fx, fy2 + u(26), text=lab, fill=ink, font=fnt(24, True))
+                self._hits.append((fx - u(36), fy1 - u(16), fx + u(36), fy2 + u(16), key, i, (fy1, fy2)))
+
+        ch_total = cy2 - cy1 - HDR_H
+        chh = (ch_total - LINE) / 2.0
+        ch_top = (cy1 + HDR_H, cy1 + HDR_H + chh + LINE)
+        half_h = chh / 2.0 - 1
+        self._lane_geo[i] = (ch_top, chh)
+
+        for ch in (0, 1):
+            ct = ch_top[ch]
+            cyc = ct + chh / 2.0
+            for val, lab in ((1.0, "1.0"), (0.5, "0.5"), (0.0, "0.0"),
+                              (-0.5, "-0.5"), (-1.0, "-1.0")):
+                yy = cyc - val * half_h
+                ty = min(max(yy, ct + u(15)), ct + chh - u(15))
+                c.create_text(HEAD_W - u(14), ty, text=lab, anchor="e", fill=ink,
+                              font=fnt(24, bold=val in (1.0, 0.0, -1.0)))
+                c.create_line(HEAD_W - u(9), yy, HEAD_W, yy, fill=ink)
+
+        c.create_rectangle(HEAD_W, cy1, cx2, cy2, fill=P["empty"], outline="")
+        has_sel = self._has_sel() and (sel or not self.selected)
+        if has_sel:
+            x1, x2 = max(HEAD_W, self._s2x(self.sel[0])), min(cx2, self._s2x(self.sel[1]))
+            if x2 > x1:
+                c.create_rectangle(x1, cy1, x2, cy2, fill=P["empty_sel"], outline="")
+        self._draw_bars(cy1, cy2, HEAD_W, cx2)
+        ca, cb = max(HEAD_W, self._s2x(t.offset)), min(cx2, self._s2x(t.end))
+        if len(t.data) and cb > ca:
+            for ch in (0, 1):
+                c.create_rectangle(ca, ch_top[ch], cb, ch_top[ch] + chh,
+                                   fill=P["clip_bg"], outline="")
+            sel_x = None
+            if has_sel:
+                a, b = max(ca, self._s2x(self.sel[0])), min(cb, self._s2x(self.sel[1]))
+                if b > a:
+                    sel_x = (a, b)
+                    for ch in (0, 1):
+                        c.create_rectangle(a, ch_top[ch], b, ch_top[ch] + chh,
+                                           fill=P["clip_sel"], outline="")
+            self._draw_bars(cy1, cy2, ca, cb)
+            self._draw_wave(t, ch_top, chh, ca, cb, sel_x)
+            self._draw_env(t, ch_top, chh, ca, cb)
+            self._draw_bars(cy1, cy2, ca, cb, top=True)
+            c.create_rectangle(ca, cy1, cb, cy1 + HDR_H, fill=P["clip_hdr"], outline="")
+            c.create_line(ca, cy1, cb, cy1, fill="#14151a", width=LINE)
+            hfont = fnt(26)
+            c.create_text(ca + u(8), cy1 + HDR_H / 2 + 1,
+                          text=ellipsize(t.name, hfont, max(10, cb - ca - u(70))),
+                          anchor="w", fill=ink, font=hfont)
+            for dx in (-u(8), 0, u(8)):
+                if cb - ca > u(60):
+                    c.create_oval(cb - u(26) + dx - u(2.5), cy1 + HDR_H / 2 - u(2.5),
+                                  cb - u(26) + dx + u(2.5), cy1 + HDR_H / 2 + u(2.5),
+                                  fill=ink, outline="")
+            c.create_line(ca, cy1, ca, cy2, fill="#14151a", width=LINE)
+            if self._s2x(t.end) <= cx2:
+                c.create_line(cb, cy1, cb, cy2, fill="#14151a", width=LINE)
+        ydiv = ch_top[0] + chh + LINE / 2.0
+        c.create_line(HEADER_W, ydiv, cx2, ydiv, fill=black, width=LINE)
+        if not self._has_sel():
+            x = self._s2x(self.cursor)
+            if HEAD_W <= x <= cx2:
+                c.create_line(x, cy1, x, cy2, fill=P["cursor"], width=max(1, u(2)))
+
+    def _draw_wave(self, t, ch_top, chh, ca, cb, sel_x):
+        c, rate, P = self.canvas, self.proj.rate, PAL
+        width = int(cb - ca)
+        if width <= 0 or len(t.data) == 0:
+            return
+        spp = rate / self.px_per_sec
+        first = self.view_start - t.offset
+        start_local = first + (ca - HEAD_W) * spp
+        lo = max(0, int(start_local))
+        hi = min(len(t.data), int(start_local + width * spp) + 2)
+        if hi <= lo:
+            return
+        seg = t.data[lo:hi]
+        if t.env:
+            seg = seg * t.env_gain(lo, hi)[:, None]
+        col = P["wave_mute"] if t.mute else self._accent(t)
+        col_sel = P["wave_mute"] if t.mute else self._accent(t, True)
+        half = chh / 2.0 - 1
+        lw = max(1, u(2))
+
+        def parts(xs):
+            if sel_x is None:
+                return [(np.ones(len(xs), bool), col)]
+            a, b = sel_x
+            return [(xs < a, col), ((xs >= a) & (xs <= b), col_sel), (xs > b, col)]
+
+        for ch in (0, 1):
+            cy = ch_top[ch] + chh / 2.0
+            if spp < 1.5:
+                xs = HEAD_W + ((lo + np.arange(len(seg))) - first) / spp
+                ys = cy - np.clip(seg[:, ch], -1, 1) * half
+                for m, colr in parts(xs):
+                    if m.sum() >= 2:
+                        c.create_line(np.column_stack([xs[m], ys[m]]).ravel().tolist(),
+                                      fill=colr, width=lw)
+                continue
+            cols = np.arange(width)
+            idx = ((cols * spp + start_local) - lo).astype(np.int64)
+            ok = (idx >= 0) & (idx < len(seg))
+            idx, xs = idx[ok], ca + cols[ok]
+            if len(idx) < 2:
+                continue
+            mx = np.clip(np.maximum.reduceat(seg[:, ch], idx), -1, 1)
+            mn = np.clip(np.minimum.reduceat(seg[:, ch], idx), -1, 1)
+            top = cy - mx * half
+            bot = np.maximum(cy - mn * half, top + 1)
+            for m, colr in parts(xs):
+                if m.sum() >= 2:
+                    pts = np.concatenate([np.column_stack([xs[m], top[m]]),
+                                          np.column_stack([xs[m], bot[m]])[::-1]])
+                    c.create_polygon(pts.ravel().tolist(), fill=colr, outline=colr)
+
+    def _draw_ruler(self, W):
+        r, rate, P = self.ruler, self.proj.rate, PAL
+        r.delete("all")
+        right = W - RIGHT_M
+        r.create_rectangle(0, 0, W + 100, RULER_H, fill=P["ruler"], outline="")
+        rrect(r, u(26), u(4), u(76), u(52), u(7), fill=P["btn"], outline=P["btn"])
+        r.create_text(u(51), u(28), text="\u2699", fill=P["icon"],
+                      font=("Segoe UI Symbol", -u(34)))
+        pps = self.px_per_sec
+        step = next((s for s in RULER_STEPS if s * pps >= u(170)), RULER_STEPS[-1])
+        nmin = MINOR_DIV.get(step, 5)
+        t0 = self.view_start / rate
+        k = int(math.floor(t0 / step))
+        tend = t0 + (right - HEAD_W) / pps
+        base = RULER_H - LINE
+        font = fnt(24, True)
+        while k * step <= tend + step:
+            t = k * step
+            x = HEAD_W + (t - t0) * pps
+            for j in range(1, nmin):
+                xm = x + j * step / nmin * pps
+                if HEAD_W <= xm <= right:
+                    r.create_line(xm, base - u(9), xm, base, fill=P["ruler_tick"])
+            if t >= -1e-9 and HEAD_W - 1 <= x <= right + 1:
+                r.create_line(x, base - u(20), x, base, fill=P["ruler_tick"],
+                              width=max(1, u(2)))
+                r.create_text(x + u(7), u(20), text=self._ruler_label(t, step),
+                              anchor="w", fill=P["ruler_fg"], font=font)
+            k += 1
+        self._draw_ruler_bars(r, right, base)
+        r.create_line(0, RULER_H - 1, W + 100, RULER_H - 1, fill="#000000", width=LINE)
+        for lb in self.proj.labels:
+            x = self._s2x(lb.pos)
+            if HEAD_W <= x <= right:
+                r.create_polygon(x - u(7), RULER_H - u(17), x + u(7), RULER_H - u(17),
+                                 x, RULER_H - LINE, fill=P["label"], outline="")
+        cx = self._s2x(self.cursor)
+        if HEAD_W <= cx <= right:
+            r.create_polygon(cx - u(8), RULER_H - u(17), cx + u(8), RULER_H - u(17),
+                             cx, RULER_H - LINE, fill=P["play"], outline="")
+
+    @staticmethod
+    def _ruler_label(t, step):
+        if t >= 3600:
+            return f"{int(t // 3600)}:{int(t % 3600 // 60):02d}:{int(round(t % 60)):02d}"
+        if t >= 60 or step >= 60:
+            m, s = int(t // 60), t - 60 * int(t // 60)
+            return f"{m}:{int(round(s)):02d}" if step >= 1 else f"{m}:{s:06.3f}"
+        if step >= 1:
+            return f"{int(round(t))}"
+        dec = 1 if step >= 0.1 else (2 if step >= 0.01 else 3)
+        return f"{t:.{dec}f}"
+
+    def _update_hbar(self):
+        vis = self._visible_samples()
+        total = max(self.proj.length(), self.view_start + vis, 1)
+        self.hbar.set(self.view_start / total, min(1.0, (self.view_start + vis) / total))
+
+    def _hscroll(self, *args):
+        vis = self._visible_samples()
+        total = max(self.proj.length(), vis, 1)
+        if args[0] == "moveto":
+            self.view_start = float(args[1]) * total
+        elif args[0] == "scroll":
+            step = vis * (0.9 if args[2] == "pages" else 0.1)
+            self.view_start += int(args[1]) * step
+        self.view_start = int(max(0, min(self.view_start, max(0, total - vis * 0.1))))
+        self.redraw()
+
+    # -------------------- zoom --------------------
+    def zoom(self, factor, center=None):
+        rate = self.proj.rate
+        c = self.cursor if center is None else center
+        if not (self.view_start <= c <= self.view_start + self._visible_samples()):
+            c = int(self.view_start + self._visible_samples() / 2)
+        old = self.px_per_sec
+        new = min(max(old * factor, 0.5), 20000.0)
+        xc = (c - self.view_start) / rate * old
+        self.px_per_sec = new
+        self.view_start = int(max(0, c - xc / new * rate))
+        self.redraw()
+
+    def zoom_fit(self):
+        n = self.proj.length()
+        w = max(100, self.lane_w() - u(2))
+        if n:
+            self.px_per_sec = max(0.5, w / (n / self.proj.rate))
+        self.view_start = 0
+        self.redraw()
+
+    def zoom_sel(self):
+        if not self._has_sel():
+            return
+        w = max(100, self.lane_w() - u(2))
+        self.px_per_sec = min(20000.0, w / ((self.sel[1] - self.sel[0]) / self.proj.rate))
+        self.view_start = self.sel[0]
+        self.redraw()
+
+    def zoom_toggle(self):
+        if self._last_zoom is None:
+            self._last_zoom = (self.px_per_sec, self.view_start)
+            self.zoom_fit()
+        else:
+            self.px_per_sec, self.view_start = self._last_zoom
+            self._last_zoom = None
+            self.redraw()
+
+    # -------------------- mouse --------------------
+    def _wheel(self, ev):
+        d = 1 if (getattr(ev, "delta", 0) > 0 or getattr(ev, "num", 0) == 4) else -1
+        if ev.state & 0x4:
+            self.zoom(2.0 if d > 0 else 0.5, self._x2s(ev.x, False))
+        elif ev.state & 0x1:
+            self._hscroll("scroll", -d, "units")
+        else:
+            self.canvas.yview_scroll(-d, "units")
+
+    def _on_press(self, ev):
+        if self.recording:
+            return
+        self._slider = None
+        self._gesture = None
+        on_canvas = ev.widget is self.canvas
+        y = self.canvas.canvasy(ev.y) if on_canvas else 0
+        i = int(y // LANE_H) if on_canvas else -1
+        if on_canvas and ev.x < HEADER_W:
+            return self._header_click(i, ev, y)
+        if on_canvas and ev.x < HEAD_W:
+            return
+        if on_canvas:
+            tool = self._pick_tool(ev)
+            if tool == "Envelope" and self._env_press(ev):
+                return
+            if tool == "Draw" and self._draw_press(ev):
+                return
+        s = self._x2s(ev.x)
+        self._drag0, self.cursor, self.sel = s, s, None
+        if 0 <= i < len(self.proj.tracks):
+            if ev.state & 0x4:
+                self.selected ^= {i}
+            else:
+                self.selected = {i}
+        self.redraw()
+
+    def _on_drag(self, ev):
+        if self._slider:
+            kind, i, sx1, sx2 = self._slider
+            if i < len(self.proj.tracks):
+                t = self.proj.tracks[i]
+                if kind in ("gain_l", "gain_r"):          # vertical faders: sx1 = top y, sx2 = bottom y
+                    fr = min(1.0, max(0.0, (sx2 - self.canvas.canvasy(ev.y)) / float(sx2 - sx1)))
+                    db = -36.0 + 48.0 * fr
+                    setattr(t, kind, 0.0 if fr < 0.015 else (1.0 if abs(db) < 1.0 else 10 ** (db / 20.0)))
+                    self._live_remix()
+                    self.redraw()
+                    return
+                frac = min(1.0, max(0.0, (ev.x - sx1) / float(sx2 - sx1)))
+                if kind == "gain":
+                    db = -36.0 + 72.0 * frac
+                    t.gain = 1.0 if abs(db) < 1.2 else 10 ** (db / 20.0)
+                else:
+                    p = -1.0 + 2.0 * frac
+                    t.pan = 0.0 if abs(p) < 0.04 else p
+                self._live_remix()
+                self.redraw()
+            return
+        if self._gesture:
+            return self._gesture_drag(ev)
+        if self.recording or ev.x < 0:
+            return
+        s = self._x2s(ev.x)
+        a, b = sorted((self._drag0, s))
+        self.cursor, self.sel = a, ((a, b) if b > a else None)
+        self.redraw()
+
+    def _on_release(self, _ev):
+        self._slider = None
+        if self._gesture:
+            self._gesture_end()
+
+    def _header_click(self, i, ev, y):
+        if not (0 <= i < len(self.proj.tracks)):
+            return
+        t = self.proj.tracks[i]
+        for x1, y1, x2, y2, kind, ti, extra in self._hits:
+            if ti != i or not (x1 <= ev.x <= x2 and y1 <= y <= y2):
+                continue
+            if kind == "close":
+                self.proj.push_undo()
+                del self.proj.tracks[i]
+                self.selected = {j - (j > i) for j in self.selected if j != i}
+                return self.after_edit()
+            if kind == "menu":
+                self.selected = {i}
+                self.redraw()
+                return self.menu_track.tk_popup(ev.x_root, ev.y_root)
+            if kind == "effects":
+                self.selected = {i}
+                self.redraw()
+                return self.menu_effect.tk_popup(ev.x_root, ev.y_root)
+            if kind in ("mute", "solo"):
+                self.proj.push_undo()
+                setattr(t, kind, not getattr(t, kind))
+                self._live_remix(10)
+                return self.redraw()
+            if kind in ("gain", "pan", "gain_l", "gain_r"):
+                self.proj.push_undo()
+                self._slider = (kind, i, extra[0], extra[1])
+                return self._on_drag(ev)
+        if ev.state & 0x4:
+            self.selected ^= {i}
+        else:
+            self.selected = {i}
+        self.redraw()
+
+    def _on_double(self, ev):
+        y = self.canvas.canvasy(ev.y)
+        ry = y - int(y // LANE_H) * LANE_H
+        if ev.x < HEADER_W and u(14) <= ry <= u(56) and ev.x > u(56):
+            self.rename_track()
+
+    def _on_right(self, ev):
+        y = self.canvas.canvasy(ev.y)
+        i = int(y // LANE_H)
+        if 0 <= i < len(self.proj.tracks):
+            if i not in self.selected:
+                self.selected = {i}
+                self.redraw()
+            self.menu_track.tk_popup(ev.x_root, ev.y_root)
+
+    # -------------------- transport --------------------
+    def _play_range(self, selection_only=False, resume=False):
+        n = self.proj.length()
+        if resume:
+            end = self.sel[1] if self._has_sel() else n
+            return (self.cursor if self.cursor < end else 0), end
+        if self._has_sel():
+            return self.sel
+        s = self.cursor if self.cursor < n else 0
+        return s, n
+
+    def play(self, selection_only=False, speed=1.0, resume=False):
+        if self.recording:
+            return
+        s, e = self._play_range(selection_only, resume)
+        if e <= s:
+            return
+        try:
+            self.player.eq = self.proj.eq
+            buf = self.proj.mixdown(s, e)
+            if abs(speed - 1.0) > 1e-3:
+                buf = self._resample_fast(buf, speed)
+            self.player.start(buf, self.proj.rate, self.loop_var.get())
+        except Exception as ex:
+            messagebox.showerror("Playback", str(ex))
+            return
+        self.play_origin, self.play_speed, self.paused = s, speed, False
+        self._play_ctx = (s, e, speed)
+        self.status_var.set("Playing.")
+        self._refresh_toolbar()
+
+    def _live_remix(self, delay=120):
+        """While audio is playing, re-render the mix so Mute / Solo / gain / pan / fader / envelope changes are
+        heard straight away (playback uses a pre-rendered buffer, so it must be rebuilt). Changes made within
+        `delay` ms of each other share one re-render, so dragging a slider stays smooth."""
+        if self._remix_job is not None or not self._play_ctx:
+            return
+        if self.player.stream is None or not self.player.playing:
+            return
+        self._remix_job = self.after(delay, self._do_remix)
+
+    def _do_remix(self):
+        self._remix_job = None
+        ctx = self._play_ctx
+        if not ctx or self.player.stream is None or not self.player.playing:
+            return
+        s, e, speed = ctx
+        try:
+            buf = self.proj.mixdown(s, e)
+            if abs(speed - 1.0) > 1e-3:
+                buf = self._resample_fast(buf, speed)
+            if len(buf) == len(self.player.buf):          # same length -> swap in place, position is kept
+                self.player.buf = buf
+        except Exception:
+            pass
+
+    @staticmethod
+    def _resample_fast(buf, speed):
+        n = len(buf)
+        m = int(n / speed)
+        out = np.empty((m, 2), np.float32)
+        for a in range(0, m, 1 << 20):
+            b = min(m, a + (1 << 20))
+            pos = np.arange(a, b) * speed
+            i0 = np.minimum(pos.astype(np.int64), n - 1)
+            i1 = np.minimum(i0 + 1, n - 1)
+            f = (pos - i0).astype(np.float32)[:, None]
+            out[a:b] = buf[i0] * (1 - f) + buf[i1] * f
+        return out
+
+    def _play_speed(self):
+        self.play(speed=max(0.25, min(3.0, float(self.speed_var.get()))))
+
+    def toggle_play(self):
+        if self.recording:
+            return self.toggle_record()
+        if self.player.stream is not None or self.paused:
+            self.stop()
+        else:
+            self.play()
+
+    def pause(self):
+        if self.recording:
+            return
+        if self.player.stream is not None:
+            self.cursor = int(self.play_origin + self.player.pos * self.play_speed)
+            self.player.stop()
+            self.paused = True
+            self.status_var.set("Paused.")
+            self.redraw()
+        elif self.paused:
+            self.play(speed=self.play_speed, resume=True)
+
+    def stop(self):
+        if self.recording:
+            return self._stop_record()
+        if self.player.stream is not None:
+            self.cursor = int(self.play_origin + self.player.pos * self.play_speed)
+            self.player.stop()
+        self.paused = False
+        self.status_var.set("Stopped.")
+        self.redraw()
+
+    def toggle_record(self):
+        if self.recording:
+            return self._stop_record()
+        self.stop()
+        try:
+            self.recorder.start(self.proj.rate)
+        except Exception as ex:
+            messagebox.showerror("Record", str(ex))
+            return
+        self.recording, self.record_origin = True, self.cursor
+        self.status_var.set("Recording.")
+        self._refresh_toolbar()
+
+    def _stop_record(self):
+        data = self.recorder.stop()
+        self.recording = False
+        if len(data):
+            self.proj.push_undo()
+            self.proj.new_track(f"Recording {len(self.proj.tracks) + 1}",
+                                data, self.record_origin)
+            self.selected = {len(self.proj.tracks) - 1}
+            self.cursor = self.record_origin + len(data)
+        self.status_var.set("Stopped.")
+        self.redraw()
+
+    def _tick(self):
+        try:
+            r = self.proj.rate
+            if self.recording:
+                self.time_var.set(fmt_hms(self.record_origin / r + self.recorder.frames / r))
+                lv = self.recorder.level
+                self.meter_in.set_levels(lv, lv)
+            else:
+                self.meter_in.set_levels(0.0, 0.0)
+            if self.player.stream is not None:
+                pos = self.play_origin + self.player.pos * self.play_speed
+                self.time_var.set(fmt_hms(pos / r))
+                l, rr = self.player.level()
+                self.meter_out.set_levels(l, rr)
+                if not self.player.playing:
+                    self.cursor = int(pos)
+                    self.player.stop()
+                    self.status_var.set("Stopped.")
+                    self.redraw()
+                else:
+                    x = self._s2x(pos)
+                    if x > self.canvas.winfo_width() - RIGHT_M - u(10) or x < HEAD_W:
+                        self.view_start = int(pos)
+                        self.redraw()
+                        x = self._s2x(pos)
+                    self.canvas.delete("play")
+                    for i in range(len(self.proj.tracks)):
+                        y0 = i * LANE_H + u(2) + INSET
+                        self.canvas.create_line(x, y0, x, y0 + LANE_H - u(4) - 2 * INSET,
+                                                fill=PAL["play"],
+                                                width=max(2, u(3)), tags="play")
+            else:
+                self.meter_out.set_levels(0.0, 0.0)
+        finally:
+            self.after(40, self._tick)
+
+    # -------------------- editing --------------------
+    def after_edit(self):
+        self.selected = {i for i in self.selected if i < len(self.proj.tracks)}
+        self.redraw()
+
+    def undo(self):
+        if self.proj.undo():
+            self.after_edit()
+            self._live_remix(10)
+
+    def redo(self):
+        if self.proj.redo():
+            self.after_edit()
+            self._live_remix(10)
+
+    def edit_copy(self):
+        if self._has_sel():
+            self.proj.clip = [t.copy_range(*self.sel) for t in self.targets()]
+            self.status_var.set("Copied.")
+
+    def edit_cut(self):
+        if self._has_sel():
+            self.edit_copy()
+            self.edit_delete()
+
+    def edit_delete(self):
+        if not self._has_sel():
+            return
+        s, e = self.sel
+        self.proj.push_undo()
+        for t in self.targets():
+            t.delete(s, e)
+        self.cursor, self.sel = s, None
+        self.after_edit()
+
+    def edit_silence(self):
+        if self._has_sel():
+            self.proj.push_undo()
+            for t in self.targets():
+                t.silence(*self.sel)
+            self.after_edit()
+
+    def edit_trim(self):
+        if self._has_sel():
+            self.proj.push_undo()
+            for t in self.targets():
+                t.trim(*self.sel)
+            self.after_edit()
+
+    def edit_split(self):
+        if not self._has_sel():
+            self.cursor = self._snap(self.cursor)
+        s, e = self.sel if self._has_sel() else (self.cursor, self.cursor)
+        self.proj.push_undo()
+        for i in sorted(self.selected or range(len(self.proj.tracks))):
+            if i >= len(self.proj.tracks):
+                continue
+            t = self.proj.tracks[i]
+            for at in (s, e):
+                if t.offset < at < t.end:
+                    new = t.split(at)
+                    if new:
+                        self.proj.tracks.append(new)
+        self.after_edit()
+
+    def edit_split_new(self):
+        if not self._has_sel():
+            return
+        self.proj.push_undo()
+        s, e = self.sel
+        for i in sorted(self.selected or range(len(self.proj.tracks))):
+            if i >= len(self.proj.tracks):
+                continue
+            t = self.proj.tracks[i]
+            clip = t.copy_range(s, e)
+            if len(clip):
+                new = Track(t.name + " (split)", clip, s)
+                self.proj.tracks.append(new)
+        self.after_edit()
+
+    def edit_join(self):
+        self.proj.push_undo()
+        for i in sorted(self.selected or range(len(self.proj.tracks))):
+            if i >= len(self.proj.tracks):
+                continue
+            t = self.proj.tracks[i]
+            if len(t.data) == 0:
+                continue
+            if t.offset > 0:
+                t.offset = 0
+        self.after_edit()
+
+    def edit_paste(self):
+        if not self.proj.clip:
+            return
+        self.proj.push_undo()
+        tg = self.targets() if self.proj.tracks else []
+        while len(tg) < len(self.proj.clip) and not self.proj.tracks:
+            tg.append(self.proj.new_track())
+        for t, clip in zip(tg, self.proj.clip):
+            t.insert(self.cursor, clip)
+        self.cursor += len(self.proj.clip[0])
+        self.sel = None
+        self.after_edit()
+
+    def run_effect(self, fn):
+        if not self.proj.tracks:
+            return
+        self.proj.push_undo()
+        self.config(cursor="watch")
+        self.update_idletasks()
+        try:
+            for t in self.targets():
+                s, e = self.sel if self._has_sel() else (t.offset, t.end)
+                t.apply(s, e, fn)
+        except Exception as ex:
+            self.proj.undo()
+            messagebox.showerror("Effect failed", str(ex))
+        finally:
+            self.config(cursor="")
+        self.after_edit()
+
+    def _fx_dialog(self, title, fields, make):
+        p = self.ask(title, fields)
+        if p is not None:
+            self._last_effect = (title, fields, make)
+            self.run_effect(make(p, self.proj.rate))
+
+    def repeat_last_effect(self):
+        if self._last_effect is None:
+            return messagebox.showinfo("Repeat Last Effect", "No effect has been applied yet.")
+        title, fields, make = self._last_effect
+        self._fx_dialog(title, fields, make)
+
+    def open_health_check(self):
+        HealthCheckDialog(self)
+
+    def fx_declip(self):
+        self.run_effect(lambda x: fx_declip(x, self.proj.rate))
+
+    def fx_presence(self):
+        self._fx_dialog("Presence / Air EQ",
+                        [("db", "Gain (dB, \u22128 to +8)", 2.5), ("hz", "Centre frequency (Hz)", 3000.0)],
+                        lambda p, r: lambda x: fx_presence(x, r, max(-8.0, min(8.0, p["db"])),
+                                                           max(200.0, min(p["hz"], r * 0.45)), 0.9))
+
+    def fx_exciter(self):
+        self._fx_dialog("Harmonic Exciter",
+                        [("amount", "Amount (0 - 0.6)", 0.18), ("hz", "Excite above (Hz)", 2800.0)],
+                        lambda p, r: lambda x: fx_exciter(x, r, max(0.0, min(0.6, p["amount"])), 3.0,
+                                                          max(500.0, min(p["hz"], r * 0.4))))
+
+    def fx_loudness(self):
+        self._fx_dialog("Loudness Normalize (LUFS)",
+                        [("lufs", "Target loudness (LUFS)", -14.0), ("tp", "True-peak ceiling (dBTP)", -1.0)],
+                        lambda p, r: lambda x: fx_loudness_normalize(x, r, max(-40.0, min(-5.0, p["lufs"])),
+                                                                     max(-9.0, min(0.0, p["tp"]))))
+
+    def fx_tp_limiter(self):
+        self._fx_dialog("True-Peak Limiter", [("tp", "Ceiling (dBTP)", -1.0)],
+                        lambda p, r: lambda x: fx_true_peak_limit(x, r, max(-9.0, min(0.0, p["tp"]))))
+
+    def fx_stereo_width(self):
+        self._fx_dialog("Stereo Widener",
+                        [("w", "Width % (0 mono, 100 normal, 200 wide)", 140.0),
+                         ("bass", "Keep bass centred below (Hz, 0 = off)", 120.0)],
+                        lambda p, r: lambda x: fx_stereo_width(x, r, p["w"], p["bass"]))
+
+    def fx_virtual_surround(self):
+        self._fx_dialog("Virtual Surround", [("k", "Strength % (0 - 100)", 60.0)],
+                        lambda p, r: lambda x: fx_virtual_surround(x, r, p["k"]))
+
+    def fx_bass_mono(self):
+        self._fx_dialog("Bass to Mono", [("hz", "Mono below (Hz)", 120.0)],
+                        lambda p, r: lambda x: fx_bass_mono(x, r, max(40.0, min(400.0, p["hz"]))))
+
+    def fx_side_reduce(self):
+        self._fx_dialog("Mono-Safe Stereo", [("k", "Side level (0.3 - 1.0)", 0.8)],
+                        lambda p, r: lambda x: fx_side_reduce(x, max(0.3, min(1.0, p["k"]))))
+
+    def fx_amplify(self):
+        self._fx_dialog("Amplify", [("db", "Amplification (dB)", 6.0)],
+                        lambda p, r: lambda x: fx_amplify(x, p["db"]))
+
+    def fx_normalize(self):
+        self._fx_dialog("Normalize", [("db", "Peak level (dB)", -1.0)],
+                        lambda p, r: lambda x: fx_normalize(x, p["db"]))
+
+    def fx_studio_fade(self):
+        self.run_effect(lambda x: fx_fade(x, False))
+
+    def fx_pitch(self):
+        self._fx_dialog("Change Pitch", [("semi", "Semitones (-12 to +12)", 2.0)],
+                        lambda p, r: lambda x: fx_pitch_shift(x, r, p["semi"]))
+
+    def fx_speed(self):
+        self._fx_dialog("Change Speed", [("f", "Speed factor (2.0 = twice as fast)", 1.25)],
+                        lambda p, r: lambda x: fx_speed(x, max(0.1, min(p["f"], 10.0))))
+
+    def fx_tempo(self):
+        self._fx_dialog("Change Tempo", [("f", "Tempo factor (2.0 = twice as fast)", 1.25)],
+                        lambda p, r: lambda x: fx_tempo(x, r, max(0.1, min(p["f"], 10.0))))
+
+    def fx_bass_treble(self):
+        self._fx_dialog("Bass and Treble",
+                        [("bass", "Bass (dB)", 0.0), ("treble", "Treble (dB)", 0.0)],
+                        lambda p, r: lambda x: fx_bass_treble(x, r, p["bass"], p["treble"]))
+
+    def fx_lowpass(self):
+        self._fx_dialog("Low-pass filter", [("hz", "Cut-off frequency (Hz)", 3000.0)],
+                        lambda p, r: lambda x: fx_filter(x, r, "low", p["hz"]))
+
+    def fx_highpass(self):
+        self._fx_dialog("High-pass filter", [("hz", "Cut-off frequency (Hz)", 100.0)],
+                        lambda p, r: lambda x: fx_filter(x, r, "high", p["hz"]))
+
+    def fx_notch(self):
+        self._fx_dialog("Notch Filter", [("hz", "Frequency (Hz)", 60.0), ("q", "Q factor", 30.0)],
+                        lambda p, r: lambda x: fx_notch(x, r, p["hz"], p["q"]))
+
+    def fx_click_removal(self):
+        self._fx_dialog("Click Removal", [("th", "Threshold (0-1)", 0.5)],
+                        lambda p, r: lambda x: fx_click_removal(x, r, p["th"]))
+
+    def fx_clip_fix(self):
+        self._fx_dialog("Clip Fix", [("th", "Clip threshold (0-1)", 0.95)],
+                        lambda p, r: lambda x: fx_clip_fix(x, r, p["th"]))
+
+    def fx_noise_gate(self):
+        self._fx_dialog("Noise Gate",
+                        [("th", "Threshold (dB)", -40.0), ("att", "Attack (ms)", 10.0),
+                         ("rel", "Release (ms)", 100.0)],
+                        lambda p, r: lambda x: fx_noise_gate(x, r, p["th"], p["att"], p["rel"]))
+
+    def fx_noise_reduce(self):
+        self._fx_dialog("Noise Reduction", [("th", "Threshold (dB)", -40.0)],
+                        lambda p, r: lambda x: fx_noise_reduce(x, r, p["th"]))
+
+    def fx_delay(self):
+        self._fx_dialog("Delay", [("d", "Delay (seconds)", 0.3), ("k", "Decay (0-1)", 0.5),
+                                  ("n", "Repeats", 3)],
+                        lambda p, r: lambda x: fx_echo(x, r, p["d"], min(p["k"], 0.95), max(1, p["n"])))
+
+    def fx_echo(self):
+        self._fx_dialog("Echo", [("d", "Delay (seconds)", 0.3), ("k", "Decay (0-1)", 0.5),
+                                 ("n", "Repeats", 5)],
+                        lambda p, r: lambda x: fx_echo(x, r, p["d"], min(p["k"], 0.95), max(1, p["n"])))
+
+    def fx_reverb(self):
+        self._fx_dialog("Reverb", [("room", "Room size (0-1)", 0.5),
+                                   ("wet", "Wet amount (0-1)", 0.3)],
+                        lambda p, r: lambda x: fx_reverb(x, r, min(max(p["room"], 0), 1),
+                                                         min(max(p["wet"], 0), 1)))
+
+    def fx_compress(self):
+        self._fx_dialog("Compressor",
+                        [("th", "Threshold (dB)", -18.0), ("ra", "Ratio", 3.0),
+                         ("mk", "Make-up gain (dB)", 3.0)],
+                        lambda p, r: lambda x: fx_compress(x, r, p["th"], p["ra"], p["mk"]))
+
+    def fx_limiter(self):
+        self._fx_dialog("Limiter", [("ceil", "Ceiling (dB)", -1.0),
+                                    ("la", "Lookahead (ms)", 5.0)],
+                        lambda p, r: lambda x: fx_limiter(x, r, p["ceil"], p["la"]))
+
+    def fx_distortion(self):
+        self._fx_dialog("Distortion", [("drive", "Drive (dB)", 10.0),
+                                       ("tone", "Tone (Hz)", 3000.0)],
+                        lambda p, r: lambda x: fx_distortion(x, r, p["drive"], p["tone"]))
+
+    def fx_phaser(self):
+        self._fx_dialog("Phaser", [("rate", "Rate (Hz)", 0.5), ("depth", "Depth (0-1)", 0.5),
+                                   ("fb", "Feedback (0-1)", 0.3)],
+                        lambda p, r: lambda x: fx_phaser(x, r, p["rate"], p["depth"], p["fb"]))
+
+    def fx_tremolo(self):
+        self._fx_dialog("Tremolo", [("rate", "Rate (Hz)", 5.0), ("depth", "Depth (0-1)", 0.5)],
+                        lambda p, r: lambda x: fx_tremolo(x, r, p["rate"], p["depth"]))
+
+    def fx_wahwah(self):
+        self._fx_dialog("Wahwah", [("rate", "Rate (Hz)", 1.5), ("depth", "Depth (0-1)", 0.7),
+                                   ("res", "Resonance", 2.0)],
+                        lambda p, r: lambda x: fx_wahwah(x, r, p["rate"], p["depth"], p["res"]))
+
+    def fx_crossfade_clips(self):
+        self._fx_dialog("Crossfade Clips", [("sec", "Fade length (seconds)", 0.1)],
+                        lambda p, r: lambda x: fx_crossfade_clips(x, r, p["sec"]))
+
+    # -------------------- generate --------------------
+    def _gen_into(self, clip):
+        self.proj.push_undo()
+        sel = [self.proj.tracks[i] for i in sorted(self.selected)
+               if i < len(self.proj.tracks)]
+        t = sel[0] if sel else self.proj.new_track()
+        t.insert(self.cursor, clip)
+        self.after_edit()
+
+    def gen_silence(self):
+        p = self.ask("Generate silence", [("s", "Seconds", 1.0)])
+        if p:
+            self._gen_into(np.zeros((int(p["s"] * self.proj.rate), 2), np.float32))
+
+    def gen_tone(self):
+        p = self.ask("Generate tone", [("shape", "Waveform",
+                                        ["sine", "square", "saw", "triangle"]),
+                                       ("f", "Frequency (Hz)", 440.0), ("s", "Seconds", 2.0),
+                                       ("a", "Amplitude (0-1)", 0.5)])
+        if p:
+            self._gen_into(gen_tone(self.proj.rate, p["s"], p["f"], p["shape"],
+                                    min(p["a"], 1.0)))
+
+    def gen_noise(self):
+        p = self.ask("Generate white noise", [("s", "Seconds", 2.0),
+                                              ("a", "Amplitude (0-1)", 0.3)])
+        if p:
+            self._gen_into(gen_noise(self.proj.rate, p["s"], min(p["a"], 1.0)))
+
+    def gen_click(self):
+        p = self.ask("Generate click track",
+                     [("s", "Seconds", 5.0), ("tempo", "Tempo (BPM)", 120),
+                      ("beats", "Beats per bar", 4), ("a", "Amplitude (0-1)", 0.5)])
+        if p:
+            self._gen_into(gen_click_track(self.proj.rate, p["s"], p["tempo"],
+                                           p["beats"], min(p["a"], 1.0)))
+
+    def gen_chirp(self):
+        p = self.ask("Generate chirp",
+                     [("f0", "Start frequency (Hz)", 200.0), ("f1", "End frequency (Hz)", 2000.0),
+                      ("s", "Seconds", 1.0), ("a", "Amplitude (0-1)", 0.5)])
+        if p:
+            t = np.arange(int(self.proj.rate * p["s"])) / self.proj.rate
+            f = np.linspace(p["f0"], p["f1"], len(t))
+            phase = 2 * np.pi * np.cumsum(f) / self.proj.rate
+            self._gen_into(to_stereo(np.sin(phase) * p["a"]))
+
+    # -------------------- tracks --------------------
+    def add_track(self):
+        self.proj.push_undo()
+        self.proj.new_track()
+        self.after_edit()
+
+    def remove_tracks(self):
+        idx = sorted(self.selected)
+        if not idx:
+            return
+        self.proj.push_undo()
+        self.proj.tracks = [t for i, t in enumerate(self.proj.tracks) if i not in idx]
+        self.selected = set()
+        self.after_edit()
+
+    def duplicate_tracks(self):
+        idx = sorted(i for i in self.selected if i < len(self.proj.tracks))
+        if not idx:
+            return
+        self.proj.push_undo()
+        for i in idx:
+            c = self.proj.tracks[i].clone()
+            c.name += " copy"
+            self.proj.tracks.append(c)
+        self.after_edit()
+
+    def move_track(self, delta):
+        idx = sorted(i for i in self.selected if i < len(self.proj.tracks))
+        if not idx:
+            return
+        self.proj.push_undo()
+        i = idx[0]
+        j = i + delta
+        if 0 <= j < len(self.proj.tracks):
+            self.proj.tracks[i], self.proj.tracks[j] = self.proj.tracks[j], self.proj.tracks[i]
+            self.selected = {j}
+        self.after_edit()
+
+    def mix_and_render(self):
+        if not self.proj.tracks:
+            return
+        self.proj.push_undo()
+        mixed = self.proj.mixdown()
+        self.proj.tracks = []
+        self.proj.new_track("Mix", mixed, 0)
+        self.selected = {0}
+        self.after_edit()
+
+    def mix_and_render_new(self):
+        if not self.proj.tracks:
+            return
+        self.proj.push_undo()
+        mixed = self.proj.mixdown()
+        self.proj.new_track("Mix", mixed, 0)
+        self.selected = {len(self.proj.tracks) - 1}
+        self.after_edit()
+
+    def _one(self):
+        idx = sorted(i for i in self.selected if i < len(self.proj.tracks))
+        return self.proj.tracks[idx[0]] if idx else None
+
+    def rename_track(self):
+        t = self._one()
+        if t:
+            name = simpledialog.askstring("Rename track", "Track name:",
+                                          initialvalue=t.name, parent=self)
+            if name:
+                self.proj.push_undo()
+                self._one().name = name
+                self.after_edit()
+
+    def track_gain(self):
+        t = self._one()
+        p = t and self.ask("Track gain",
+                           [("db", "Gain (dB)",
+                             round(20 * math.log10(max(t.gain, 1e-6)), 1))])
+        if p:
+            self.proj.push_undo()
+            for x in self.targets():
+                x.gain = 10 ** (p["db"] / 20)
+            self.after_edit()
+
+    def track_pan(self):
+        t = self._one()
+        p = t and self.ask("Track pan",
+                           [("p", "Pan (-1 = left, 0 = centre, 1 = right)", float(t.pan))])
+        if p:
+            self.proj.push_undo()
+            for x in self.targets():
+                x.pan = max(-1.0, min(1.0, p["p"]))
+            self.after_edit()
+
+    def track_shift(self):
+        t = self._one()
+        p = t and self.ask("Time shift",
+                           [("s", "Move by (seconds, negative = earlier)", 0.0)])
+        if p:
+            self.proj.push_undo()
+            for x in self.targets():
+                x.offset = max(0, x.offset + int(p["s"] * self.proj.rate))
+            self.after_edit()
+
+    # -------------------- labels --------------------
+    def add_label(self):
+        pos = self.sel[0] if self._has_sel() else self.cursor
+        name = simpledialog.askstring("Add Label", "Label name:", parent=self) or ""
+        self.proj.push_undo()
+        self.proj.labels.append(Label(pos, name))
+        self.proj.labels.sort(key=lambda lb: lb.pos)
+        self.after_edit()
+
+    def add_label_playback(self):
+        pos = self.cursor
+        if self.player.stream is not None:
+            pos = int(self.play_origin + self.player.pos * self.play_speed)
+        name = simpledialog.askstring("Add Label", "Label name:", parent=self) or ""
+        self.proj.push_undo()
+        self.proj.labels.append(Label(pos, name))
+        self.proj.labels.sort(key=lambda lb: lb.pos)
+        self.after_edit()
+
+    def edit_labels(self):
+        w = tk.Toplevel(self)
+        w.title("Labels")
+        place_window(w, u(600), u(400), self)
+        lb = tk.Listbox(w, font=fnt(24))
+        lb.pack(fill="both", expand=True)
+        for i, lab in enumerate(self.proj.labels):
+            lb.insert("end", f"{i+1:03d}  {fmt_hmsms(lab.pos / self.proj.rate)}  {lab.name}")
+
+        def delete_sel():
+            sel = lb.curselection()
+            if sel:
+                self.proj.push_undo()
+                del self.proj.labels[sel[0]]
+                self.after_edit()
+                w.destroy()
+
+        bar = tk.Frame(w)
+        bar.pack(fill="x")
+        ttk.Button(bar, text="Delete", command=delete_sel).pack(side="left", padx=6, pady=6)
+        ttk.Button(bar, text="Close", command=w.destroy).pack(side="right", padx=6, pady=6)
+
+    # -------------------- analyze --------------------
+    def plot_spectrum(self):
+        tg = self.targets()
+        if not tg:
+            return
+        t = tg[0]
+        a, b = t.local(*self.sel) if self._has_sel() else (0, min(len(t.data),
+                                                                  self.proj.rate * 10))
+        if b - a < 64:
+            return messagebox.showinfo("Plot Spectrum", "Select a longer region.")
+        mono = t.data[a:b].mean(axis=1)
+        f, Pxx = signal.welch(mono, self.proj.rate, nperseg=min(4096, len(mono)))
+        db = 10 * np.log10(Pxx + 1e-12)
+        w = tk.Toplevel(self)
+        w.title(f"Plot Spectrum - {t.name}")
+        self.after(30, lambda: place_window(w, parent=self))
+        W, H = 900, 400
+        cv = tk.Canvas(w, width=W, height=H, bg="#111", highlightthickness=0)
+        cv.pack()
+        fmax = min(self.proj.rate / 2, 20000)
+        mask = f <= fmax
+        f, db = f[mask], db[mask]
+        if len(f) < 2:
+            return
+        xs = 40 + (f / fmax) * (W - 60)
+        ymin, ymax = db.min(), db.max() + 1e-9
+        ys = H - 30 - (db - ymin) / (ymax - ymin) * (H - 60)
+        pts = np.column_stack([xs, ys]).ravel().tolist()
+        cv.create_line(pts, fill="#3fa9f5", width=1)
+        for k in range(6):
+            fx = 40 + k / 5 * (W - 60)
+            cv.create_text(fx, H - 15, text=f"{fmax * k / 5 / 1000:.1f}k",
+                           fill="#ccc", font=("Segoe UI", 8))
+            cv.create_line(fx, 10, fx, H - 30, fill="#333")
+        cv.create_text(20, 20, text=f"Peak: {db.max():.1f} dB", anchor="w",
+                       fill="#fff", font=("Segoe UI", 9))
+
+    def find_clipping(self):
+        tg = self.targets()
+        if not tg:
+            return
+        t = tg[0]
+        a, b = t.local(*self.sel) if self._has_sel() else (0, len(t.data))
+        seg = t.data[a:b]
+        det = detect_clipping(seg)
+        _lvl, runs = _clip_runs(seg)
+        starts = sorted({r[1] for r in runs})
+        self.proj.push_undo()
+        for st in starts:
+            self.proj.labels.append(Label(t.offset + a + st, "clip"))
+        self.after_edit()
+        messagebox.showinfo("Find Clipping",
+                            f"Found {len(starts)} clipped region(s) (labelled).\n"
+                            f"Severity: {det['severity']} \u00b7 {det['percent']:.3f}% of samples flat at "
+                            f"{det['level_db']:.1f} dBFS.\n\nTip: Effect \u2192 Declip restores them.")
+
+    def silence_finder(self):
+        tg = self.targets()
+        if not tg:
+            return
+        t = tg[0]
+        a, b = t.local(*self.sel) if self._has_sel() else (0, len(t.data))
+        seg = np.max(np.abs(t.data[a:b]), axis=1)
+        thr = 10 ** (-40 / 20.0)
+        silent = seg < thr
+        edges = np.where(np.diff(np.concatenate([[0], silent.astype(int), [0]])))[0]
+        runs = [(edges[k], edges[k + 1]) for k in range(0, len(edges), 2)]
+        w = tk.Toplevel(self)
+        w.title("Silence Finder")
+        self.after(30, lambda: place_window(w, parent=self))
+        lb = tk.Listbox(w, font=fnt(24))
+        lb.pack(fill="both", expand=True)
+        for r in runs:
+            lb.insert("end", f"{fmt_hms((t.offset + a + r[0]) / self.proj.rate)} - "
+                             f"{fmt_hms((t.offset + a + r[1]) / self.proj.rate)}")
+
+        def add_silence_labels():
+            self.proj.push_undo()
+            for r in runs:
+                self.proj.labels.append(Label(t.offset + a + r[0], "silence"))
+            self.after_edit()
+            w.destroy()
+
+        ttk.Button(w, text="Add labels", command=add_silence_labels).pack(pady=6)
+
+    def contrast(self):
+        if not self._has_sel():
+            return messagebox.showinfo("Contrast", "Select a region first.")
+        tg = self.targets()
+        if not tg:
+            return
+        t = tg[0]
+        a, b = t.local(*self.sel)
+        seg = t.data[a:b].mean(axis=1)
+        rms = float(np.sqrt(np.mean(seg ** 2)))
+        pk = float(np.max(np.abs(seg)))
+        messagebox.showinfo("Contrast",
+                            f"RMS: {20*math.log10(max(rms,1e-9)):.1f} dB\n"
+                            f"Peak: {20*math.log10(max(pk,1e-9)):.1f} dB\n"
+                            f"Crest factor: "
+                            f"{20*math.log10(max(pk,1e-9)/max(rms,1e-9)):.1f} dB")
+
+    def beat_finder(self):
+        if not self._has_sel():
+            return messagebox.showinfo("Beat Finder", "Select a region first.")
+        tg = self.targets()
+        if not tg:
+            return
+        t = tg[0]
+        a, b = t.local(*self.sel)
+        seg = np.max(np.abs(t.data[a:b]), axis=1)
+        env = signal.lfilter([0.01], [1, -0.99], seg)
+        thr = np.percentile(env, 95)
+        peaks, _ = signal.find_peaks(env, height=thr,
+                                     distance=int(self.proj.rate * 0.1))
+        self.proj.push_undo()
+        for p in peaks:
+            self.proj.labels.append(Label(t.offset + a + p, "beat"))
+        self.after_edit()
+        messagebox.showinfo("Beat Finder", f"Found {len(peaks)} beats (labeled).")
+
+    # -------------------- files --------------------
+    def _import(self, paths):
+        if not paths:
+            return
+        self.proj.push_undo()
+        first = not self.proj.tracks
+        before = len(self.proj.tracks)
+        self.config(cursor="watch")
+        self.update_idletasks()
+        try:
+            for p in paths:
+                try:
+                    self.proj.import_file(p)
+                except Exception as ex:
+                    messagebox.showerror("Import failed", f"{os.path.basename(p)}\n\n{ex}")
+        finally:
+            self.config(cursor="")
+        self.selected = set(range(before, len(self.proj.tracks)))
+        if first:
+            self.zoom_fit()
+        for p in paths:
+            push_recent(p)
+        self._rebuild_recent_menu()
+        self.after_edit()
+
+    def import_dialog(self):
+        paths = list(filedialog.askopenfilenames(
+            title="Import audio",
+            filetypes=[("Audio", "*.wav *.mp3 *.flac *.ogg *.m4a *.aac *.mp4 *.wma"),
+                       ("All", "*.*")]))
+        self._import(paths)
+
+    def export_dialog(self, selection=False):
+        if not self.proj.tracks:
+            return
+        if selection and not self._has_sel():
+            return messagebox.showinfo("Export selection", "Select a region first.")
+        path = filedialog.asksaveasfilename(
+            title="Export audio", defaultextension=".wav",
+            filetypes=[("WAV", "*.wav"), ("MP3", "*.mp3"), ("FLAC", "*.flac"),
+                       ("OGG", "*.ogg"), ("M4A (ffmpeg)", "*.m4a"),
+                       ("AC-3  (Dolby Digital format)", "*.ac3"),
+                       ("E-AC-3  (Dolby Digital Plus format)", "*.eac3")])
+        if not path:
+            return
+        opts = {}
+        if os.path.splitext(path)[1].lower() in (".ac3", ".eac3"):
+            if not _ffmpeg():
+                return messagebox.showerror("Export", "AC-3 / E-AC-3 export needs ffmpeg installed and on your PATH.\n\n"
+                                                       "Install ffmpeg, restart this program and try again.")
+            dlg = ParamDialog(self, "AC-3 / E-AC-3 export",
+                              [("ch", "Channels", ["Stereo 2.0", "Surround 5.1 (upmixed from stereo)"]),
+                               ("br", "Bitrate", ["448k", "192k", "256k", "384k", "640k"])])
+            if dlg.result is None:
+                return
+            opts = {"bitrate": dlg.result["br"], "surround51": dlg.result["ch"].startswith("Surround")}
+        s, e = self.sel if selection else (0, self.proj.length())
+        try:
+            save_audio(path, self.proj.mixdown(s, e, master=True), self.proj.rate, **opts)
+            self.status_var.set(f"Exported {os.path.basename(path)}")
+            push_recent(path)
+            self._rebuild_recent_menu()
+        except Exception as ex:
+            messagebox.showerror("Export failed", str(ex))
+
+    def export_multiple(self):
+        if not self.proj.tracks:
+            return
+        folder = filedialog.askdirectory(title="Export Multiple - choose folder")
+        if not folder:
+            return
+        fmt = simpledialog.askstring("Export Multiple",
+                                     "Extension (wav/mp3/flac/ogg):", initialvalue="wav")
+        if not fmt:
+            return
+        ext = "." + fmt.lower().lstrip(".")
+        base = os.path.splitext(os.path.basename(self.proj.path or "track"))[0]
+        for i, t in enumerate(self.proj.tracks):
+            if len(t.data) == 0:
+                continue
+            name = f"{base}_{i+1:02d}_{t.name.replace(' ', '_')}{ext}"
+            try:
+                save_audio(os.path.join(folder, name), self.proj.eq.process(t.data, self.proj.rate), self.proj.rate)
+            except Exception as ex:
+                messagebox.showerror("Export Multiple", f"{name}\n\n{ex}")
+        self.status_var.set(f"Exported {len(self.proj.tracks)} tracks to {folder}")
+
+    def _confirm_discard(self):
+        if self.proj.dirty and self.proj.tracks:
+            a = messagebox.askyesnocancel("Unsaved changes", "Save the project first?")
+            if a is None:
+                return False
+            if a:
+                self.save_project()
+        return True
+
+    def new_project(self):
+        if self._confirm_discard():
+            self.stop()
+            self.proj = Project()
+            self._close_eq()
+            self.sel, self.selected, self.cursor, self.view_start = None, set(), 0, 0
+            self.redraw()
+
+    def open_project(self):
+        if not self._confirm_discard():
+            return
+        path = filedialog.askopenfilename(title="Open project",
+                                          filetypes=[("Studio project", "*.npz")])
+        if path:
+            try:
+                p = Project()
+                p.load(path)
+            except Exception as ex:
+                return messagebox.showerror("Open failed", str(ex))
+            self.stop()
+            self.proj, self.sel, self.selected, self.cursor = p, None, set(), 0
+            self._close_eq()
+            push_recent(path)
+            self._rebuild_recent_menu()
+            self.zoom_fit()
+
+    def save_project(self, as_new=False):
+        path = self.proj.path
+        if as_new or not path:
+            path = filedialog.asksaveasfilename(title="Save project",
+                                                defaultextension=".npz",
+                                                filetypes=[("Studio project", "*.npz")])
+        if path:
+            try:
+                self.proj.save(path)
+                self.status_var.set(f"Saved {os.path.basename(path)}")
+                push_recent(path)
+                self._rebuild_recent_menu()
+            except Exception as ex:
+                messagebox.showerror("Save failed", str(ex))
+
+    def quit_app(self):
+        if self._confirm_discard():
+            self.player.stop()
+            if self.recording:
+                self.recorder.stop()
+            self.destroy()
+
+    def show_spectrogram(self):
+        tg = self.targets()
+        if not tg:
+            return
+        t = tg[0]
+        a, b = t.local(*self.sel) if self._has_sel() else (0, len(t.data))
+        b = min(b, a + self.proj.rate * 600)
+        if b - a < 256:
+            return messagebox.showinfo("Spectrogram", "Nothing to analyse here.")
+        w = tk.Toplevel(self)
+        w.title(f"Spectrogram - {t.name}")
+        self.after(30, lambda: place_window(w, parent=self))
+        img = tk.PhotoImage(data=spectrogram_ppm(t.data[a:b], self.proj.rate), format="PPM")
+        cv = tk.Canvas(w, width=img.width() + 70, height=img.height() + 24, bg="#111",
+                       highlightthickness=0)
+        cv.pack()
+        cv.create_image(60, 6, anchor="nw", image=img)
+        cv.image = img
+        nyq = self.proj.rate / 2
+        for k in range(5):
+            y = 6 + k * (img.height() - 1) / 4
+            cv.create_text(54, y, text=f"{nyq * (1 - k / 4) / 1000:.1f}k",
+                           anchor="e", fill="#ccc", font=("Segoe UI", 8))
+        cv.create_text(60, img.height() + 14, anchor="w", fill="#ccc",
+                       font=("Segoe UI", 8),
+                       text=f"0 s  ...  {(b - a) / self.proj.rate:.2f} s")
+
+    def show_help(self):
+        messagebox.showinfo("Keyboard shortcuts", (
+            "Space  play / stop           Shift+Space  play selection\n"
+            "P  pause                     S  stop                R  record\n"
+            "Ctrl+Z / Ctrl+Y  undo / redo\n"
+            "Ctrl+X / C / V  cut / copy / paste\n"
+            "Delete  delete selection     Ctrl+A  select all\n"
+            "Ctrl+L  silence audio        Ctrl+T  trim audio\n"
+            "Ctrl+I  split                Ctrl+J  join\n"
+            "Ctrl+B  add label            Ctrl+M  label at playback\n"
+            "Ctrl+R  repeat last effect   Ctrl+Shift+5  Auto 5_Star Enhance\n"
+            "Ctrl+K  Key Changer (change the song's key)\n"
+            "Analyze > Audio Health Check: LUFS, true peak, clipping, mono, presence\n"
+            "Ctrl+Shift+I  import   Ctrl+Shift+E  export   Ctrl+S  save   Ctrl+O  open\n"
+            "Ctrl+1 / Ctrl+3  zoom in / out        Ctrl+Shift+F  fit to width\n"
+            "Home / End  go to start / end\n\n"
+            "Mouse: click or drag in a track to set cursor / select.\n"
+            "Ctrl+wheel = zoom, Shift+wheel = scroll sideways.\n"
+            "Drag the Gain / Pan sliders in a track's control panel.\n"
+            "Ctrl+click selects several tracks; edits apply to selected tracks\n"
+            "(or all tracks if none is selected)."))
+
+
+def main():
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
+    App(sys.argv[1:]).mainloop()
+
+
+if __name__ == "__main__":
+    main()

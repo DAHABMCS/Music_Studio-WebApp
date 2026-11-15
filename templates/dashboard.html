@@ -1,0 +1,351 @@
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+{% block content %}
+
+<style>
+  /* Full-width backdrop behind the dashboard, so the dashboard itself
+     reads as a centered card/panel instead of stretching edge-to-edge. */
+  body { margin: 0; }
+
+  .dashboard-backdrop {
+    width: 100%;
+    min-height: auto;              /* was 100vh — that's what left the big empty gap below */
+    background: #1c352d;           /* dark, distinct from the panel below */
+    padding: 16px 16px 24px;       /* was 36px top — panel now sits higher */
+    box-sizing: border-box;
+    display: flex;
+    justify-content: center;
+  }
+
+  .dashboard-panel {
+  width: 100%;
+  max-width: 1010px;         /* was 950px: 942 content + 64 padding + a little slack */
+  background: #161b22;
+  border-radius: 18px;
+  padding: 15px 32px 36px;
+  box-shadow: 0 25px 70px rgba(0, 0, 0, 0.5),
+              0 0 0 1px rgba(255, 255, 255, 0.05);
+}
+
+  @media (max-width: 700px) {
+    .dashboard-backdrop { padding: 16px 8px; }
+    .dashboard-panel { padding: 18px 14px 24px; border-radius: 12px; }
+  }
+
+  /* ---- Fix for the action-button column collapsing/ballooning while
+     jobs are running (buttons disabled). Root cause: some rule in the
+     theme's own stylesheet distributes flexible/grow height across
+     .actions-col's buttons, and that math broke once the Karaoke/Lyric
+     buttons moved one level deeper (into .btn-pair) instead of being
+     direct children — most visibly once the buttons hit :disabled.
+     Fix: take explicit control of sizing so nothing can ever grow to
+     fill leftover space, regardless of nesting depth or disabled
+     state. Only layout properties are touched here — colors, fonts,
+     borders, and hover/disabled colors are untouched and still come
+     from your existing stylesheet. The descendant selector (space,
+     not >) below deliberately reaches buttons at ANY nesting depth,
+     including inside .btn-pair, so both stay governed by one rule. */
+  .actions-col {
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 8px !important;
+  }
+  .actions-col .btn,
+  .actions-col .btn-pair {
+    flex: 0 0 auto !important;
+    height: auto !important;
+    min-height: 0 !important;
+    max-height: none !important;
+  }
+  .actions-col .btn-pair {
+    display: flex !important;
+    gap: 6px !important;
+    width: 100% !important;
+  }
+  .actions-col .btn-pair .btn {
+    flex: 1 1 0 !important;
+    min-width: 0 !important;
+  }
+  .actions-middle {
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 8px !important;
+  }
+  .actions-middle .gear-decor {
+    flex: 0 0 auto !important;
+    height: auto !important;
+    max-height: none !important;
+  }
+
+  /* ---- Action-button status colors. Only the six job-triggering
+     buttons (Generate Subtitles, Karaoke, Lyric Video, Create Song,
+     Export Lyrics & Tab, Full Transcription) get these — Stop,
+     Clear, Browse and Edit don't have a "processing" lifecycle of
+     their own, so they keep the theme's normal button styling.
+     States are toggled by app.js: .btn-ready is the default/idle
+     look, .btn-processing while its job is running, .btn-done once
+     that job completes (until the button is used again or Clear is
+     pressed). !important overrides the theme's own .btn/.accent
+     colors so the status is always clearly visible. */
+  .btn-ready {
+    background: #b3261e !important;
+    border-color: #8c1d17 !important;
+    color: #ffffff !important;
+  }
+  .btn-ready:hover:not(:disabled) {
+    background: #c62d24 !important;
+  }
+  .btn-processing {
+    background: #e8b100 !important;
+    border-color: #b98900 !important;
+    color: #1a1a1a !important;
+  }
+  .btn-done {
+    background: #1e8e3e !important;
+    border-color: #14672d !important;
+    color: #ffffff !important;
+  }
+</style>
+
+<div class="dashboard-backdrop">
+  <div class="dashboard-panel">
+
+    <div class="app-shell">
+
+      <!-- ============ LEFT COLUMN ============ -->
+      <div class="left-col">
+
+        <!-- File Selection -->
+        <section class="lframe">
+          <div class="lframe-title">File Selection</div>
+          <div class="lframe-body">
+
+            <div class="row">
+              <label class="row-label">Input File:</label>
+              <input type="text" id="inputFilePath" class="row-input" readonly
+                     placeholder="Choose an MP3 / MP4 / WAV file...">
+              <input type="file" id="inputFilePicker" accept=".mp3,.mp4,.wav,.m4a,.flac,.ogg" hidden>
+              <button class="btn" onclick="document.getElementById('inputFilePicker').click()">Browse</button>
+            </div>
+
+            <div class="row">
+              <label class="row-label">Output File:</label>
+              <input type="text" id="outputFilePath" class="row-input" readonly
+                     placeholder="Saved automatically as .srt">
+              <button class="btn" onclick="copySrtPath()">Copy Path</button>
+            </div>
+
+            <div class="row">
+              <label class="row-label">Background<br>(image or video, optional):</label>
+              <input type="text" id="backgroundPath" class="row-input" readonly
+                     placeholder="Optional background for karaoke video">
+              <input type="file" id="backgroundPicker" accept=".png,.jpg,.jpeg,.bmp,.mp4,.mov,.mkv,.webm,.avi" hidden>
+              <button class="btn" onclick="document.getElementById('backgroundPicker').click()">Browse</button>
+            </div>
+
+          </div>
+        </section>
+
+        <!-- Settings -->
+        <section class="lframe">
+          <div class="lframe-title">Settings</div>
+          <div class="lframe-body settings-row">
+
+            <label class="inline-label">Language:
+              <select id="language">
+                <option value="auto">auto</option>
+                <option value="en">en</option>
+                <option value="ar">ar</option>
+                <option value="es">es</option>
+                <option value="fr">fr</option>
+                <option value="de">de</option>
+                <option value="it">it</option>
+                <option value="pt">pt</option>
+                <option value="ja">ja</option>
+                <option value="zh">zh</option>
+              </select>
+            </label>
+
+            <label class="inline-label">Model:
+              <select id="model">
+                <option>tiny</option>
+                <option>base</option>
+                <option>small</option>
+                <option>medium</option>
+                <option>large</option>
+                <option>large-v2</option>
+                <option selected>large-v3</option>
+              </select>
+            </label>
+
+            <label class="inline-label">Chords:
+              <select id="chordMethod">
+                <option value="basic">basic</option>
+                <option value="advanced" selected>advanced</option>
+                <option value="madmom">madmom</option>
+                <option value="hybrid">hybrid</option>
+              </select>
+            </label>
+
+            <label class="inline-check">
+              <input type="checkbox" id="useDemucs" checked> Extract Guitar
+            </label>
+
+          </div>
+        </section>
+
+        <!-- Status & Progress -->
+        <section class="lframe">
+          <div class="lframe-title">Status &amp; Progress</div>
+          <div class="lframe-body">
+
+            <div class="status-line">
+              <span id="statusText" class="status-text">Ready</span>
+              <span id="elapsedTime" class="status-time">00:00</span>
+            </div>
+
+            <div class="progress">
+              <div id="progressBar"></div>
+            </div>
+
+          </div>
+        </section>
+
+        <!-- Action Buttons Grid -->
+        <section class="actions-grid">
+
+          <!-- column 1 -->
+          <div class="actions-col">
+            <button class="btn accent btn-ready" id="btnSrt">Generate Subtitles</button>
+            <div class="btn-pair" style="display:flex; gap:6px;">
+              <button class="btn btn-ready" id="btnKaraoke" style="flex:1;" title="Karaoke video without vocals">Karaoke</button>
+              <button class="btn btn-ready" id="btnLyricVideo" style="flex:1;" title="Lyric video with vocals included">With Singer</button>
+            </div>
+            <div class="btn-pair" style="display:flex; gap:6px;">
+              <button class="btn btn-ready" id="btnAiLyrics" style="flex:1;" title="Write song lyrics with AI from a style and a short description">AI Lyrics</button>
+              <button class="btn btn-ready" id="btnCreateSong" style="flex:1;" title="Create a song (music and vocals) from your lyrics">AI Song</button>
+            </div>
+            <button class="btn btn-ready" id="btnLyricsTab">Lyrics, Guitar Tabs &amp; MP3</button>
+            <div class="btn-pair" style="display:flex; gap:6px;">
+              <button class="btn btn-ready" id="btnAudio_Editor" style="flex:1;" onclick="openAudio_Editor()" title="Open Audio_Editor (audio editor) on this computer">Audio Editor</button>
+              <button class="btn btn-ready" id="btnFull" style="flex:1;"> Transcription</button>
+            </div>
+          </div>
+
+          <!-- column 2 : Stop / Clear + gear illustration -->
+          <div class="actions-middle">
+            <div class="mini-row">
+              <button class="btn" id="btnStop" disabled>Stop</button>
+              <button class="btn" id="btnClear">Clear</button>
+            </div>
+            <video class="gear-decor" id="gearVideo"
+                   src="{{ url_for('static', filename='assets/Gear.mp4') }}"
+                   muted loop playsinline preload="auto"
+                   aria-label="gear animation"></video>
+          </div>
+
+          <!-- column 3 : browse buttons -->
+          <div class="actions-col">
+            <button class="btn btn-ready" id="browseSrtBtn" onclick="browseRemote('srt')">Browse SRT</button>
+            <button class="btn btn-ready" id="browseKaraokeBtn" onclick="browseRemote('karaoke')">Browse Karaoke</button>
+            <button class="btn btn-ready" id="browseSongsBtn" onclick="browseRemote('songs')">Browse Music</button>
+            <button class="btn btn-ready" id="browseLyricsTabBtn" onclick="browseRemote('lyrics_tab')">Browse Lyrics, Tab &amp; MP3</button>
+            <button class="btn btn-ready" id="browseTranscriptionBtn" onclick="browseRemote('transcription')">Browse Transcription</button>
+          </div>
+
+        </section>
+
+      </div>
+
+      <!-- ============ RIGHT COLUMN ============ -->
+      <div class="right-col">
+
+        <section class="lframe srt-frame">
+          <div class="lframe-title">SRT Preview</div>
+          <div class="lframe-body srt-body">
+            <pre id="srtPreview" class="preview">—</pre>
+          </div>
+        </section>
+
+        <div class="srt-actions">
+          <button class="btn" id="btnEdit">Edit</button>
+        </div>
+
+      </div>
+
+    </div>
+
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/app.js') }}"></script>
+<script>
+  // Open Audio_Editor on the computer running this program.
+  async function openAudio_Editor() {
+    var btn = document.getElementById('btnAudio_Editor');
+    if (btn) btn.disabled = true;
+    try {
+      var r = await fetch('/api/open_Audio_Editor', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({})
+      });
+      var d = await r.json().catch(function () { return {}; });
+      if (!r.ok) alert(d.error || 'Could not start Audio_Editor.');
+    } catch (e) {
+      alert('Could not reach the program: ' + e);
+    } finally {
+      if (btn) setTimeout(function () { btn.disabled = false; }, 1500);
+    }
+  }
+</script>
+<script>
+  // Clear button also empties the Input / Output / Background boxes
+  // (and resets the hidden file pickers so the same file can be re-chosen).
+  (function () {
+    var clearBtn = document.getElementById('btnClear');
+    if (!clearBtn) return;
+    clearBtn.addEventListener('click', function () {
+      ['inputFilePath', 'outputFilePath', 'backgroundPath',
+       'inputFilePicker', 'backgroundPicker'].forEach(function (id) {
+        var el = document.getElementById(id);
+        if (el) el.value = '';
+      });
+    });
+  })();
+</script>
+
+<style>
+  /* Text direction: boxes that contain Arabic start at the right margin and
+     read right-to-left; English stays left-to-right. Per line, from the
+     letters typed. (The Create Song lyrics box is controlled by its own
+     Language selector in app.js and is marked data-dir-fixed.) */
+  textarea, pre, .preview,
+  input[type="text"]:not([readonly]),
+  [contenteditable="true"] { text-align: start; }
+  textarea, pre, .preview { white-space: pre-wrap; }
+  [dir="auto"] { unicode-bidi: plaintext; }
+</style>
+<script>
+  (function () {
+    var AUTO = 'textarea, pre, .preview, input[type="text"]:not([readonly]), ' +
+               '[contenteditable="true"]';
+    function setDir(el) {
+      if (el.hasAttribute('data-dir-fixed')) return;     // managed by app.js
+      el.setAttribute('dir', 'auto');
+    }
+    function mark(node) {
+      if (!node || node.nodeType !== 1) return;
+      if (node.matches(AUTO)) setDir(node);
+      node.querySelectorAll(AUTO).forEach(setDir);
+    }
+    mark(document.body);
+    new MutationObserver(function (changes) {
+      changes.forEach(function (c) { c.addedNodes.forEach(mark); });
+    }).observe(document.body, { childList: true, subtree: true });
+  })();
+</script>
+{% endblock %}
