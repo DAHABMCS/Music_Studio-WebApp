@@ -17,7 +17,6 @@ from functools import wraps
 
 from flask import (Flask, render_template, request, jsonify,
                    send_from_directory, session, redirect, url_for)
-<<<<<<< HEAD
 import re as _re
 import unicodedata as _ud
 
@@ -40,9 +39,6 @@ def secure_filename(name):
     if name.split(".")[0].upper() in _WIN_RESERVED:
         name = "_" + name
     return name[:150]
-=======
-from werkzeug.utils import secure_filename
->>>>>>> 8d8f2974f9a335c664739db6340522fd15b773fa
 from werkzeug.security import generate_password_hash
 from subtitle_engine import SubtitleEngine
 from user_store import load_users as _load_users_enc, save_users as _save_users_enc
@@ -4418,7 +4414,6 @@ def open_output_folder():
 # ============================================================
 AUDIO_EDITOR = BASE_DIR / "studio_audio_editor.py"
 STUDIO_EDITOR_ENV_PATH = os.environ.get("STUDIO_EDITOR_PATH", "").strip()
-<<<<<<< HEAD
 STUDIO_EDITOR_EXE_ENV = os.environ.get("STUDIO_EDITOR_EXE", "").strip()
 
 
@@ -4442,8 +4437,6 @@ def _editor_exe():
         except OSError:
             pass
     return None
-=======
->>>>>>> 8d8f2974f9a335c664739db6340522fd15b773fa
 
 
 def _editor_script():
@@ -4481,7 +4474,6 @@ def open_editor():
         return jsonify(error="The audio editor can only be started from the "
                              "computer that is running this program."), 403
 
-<<<<<<< HEAD
     exe = _editor_exe()
     if exe is not None:
         script = exe                       # frozen editor: nothing to check in the venv
@@ -4498,20 +4490,6 @@ def open_editor():
                                  + ", ".join(missing)
                                  + ". Install with: pip install "
                                  + " ".join(p for p in missing if p != "tkinter")), 500
-=======
-    script = _editor_script()
-    if script is None:
-        return jsonify(error="studio_audio_editor.py was not found next to app.py. "
-                             "Put it in the same folder as the program, or set the "
-                             "STUDIO_EDITOR_PATH environment variable to its full path."), 404
-
-    missing = _missing_editor_deps()
-    if missing:
-        return jsonify(error="The audio editor needs these Python packages: "
-                             + ", ".join(missing)
-                             + ". Install with: pip install "
-                             + " ".join(p for p in missing if p != "tkinter")), 500
->>>>>>> 8d8f2974f9a335c664739db6340522fd15b773fa
 
     if sys.platform.startswith("linux"):
         if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
@@ -4521,11 +4499,7 @@ def open_editor():
     data = request.get_json(silent=True) or {}
     rel = (data.get("path") or "").strip()
 
-<<<<<<< HEAD
     cmd = [str(exe)] if exe is not None else [_python_for_gui(), str(script)]
-=======
-    cmd = [_python_for_gui(), str(script)]
->>>>>>> 8d8f2974f9a335c664739db6340522fd15b773fa
     target = None
     if rel:
         updir, outdir = user_dirs(session["user"])

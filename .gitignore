@@ -9,6 +9,7 @@ env/
 .buildenv/
 buildenv/
 .buildenv/
+.run/
 # Python
 __pycache__/
 *.py[cod]
